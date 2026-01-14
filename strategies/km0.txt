@@ -1,0 +1,20 @@
+Salut
+Ca fait 3 semaines que j'ai commencé à m'interesser à passivbot
+J'ai développé (aidé d'IA bien evidemment) une optimisation globale pour déterminer des configs adaptées quasi sur mesure au marché
+Je vais essayer de faire simple:
+On découpe toutes les données OHLCV 1min en fenetres de X jours (30 jours par exemple), avec un "pas" de fenetre de 10 jours par exemple.
+On calcule tous les pas de 10 jours 16 features permettant de caractériser le marché (volatilité, tendance, mean-reversion, volume, risque de queue, microstructure) sur des timeframes de 1h, 4h et 1j
+On crée des "clusters" de fenetres caractérisé par leur position dans les 16 dimensions des features, à l'aide d'une normalisation Z-score puis d'un clustering
+Puis pour chaque régime identifié on isole la fenetre de 30 jours immédiatement après, et on lance une optimisation passivbot dessus, on obtient la config optimisée pour cette fenetre
+On lance tout ca sur plusieurs crypto, on obtient une liste de 20 clusters (par exemple) qui contiennent toutes les fenetres ayant ce régime, avec pour chaque fenetre la config optimisée
+On sélectionne pour chaque régime une liste pertinente de config des fenetres du régime (meilleur sharpe par exemple, ou meilleur ratio gain/DDmoy, etc ...)
+On fait une validation croisée en testant ces configs sur l'ensemble des fenetres du régime pour vérifier sa fiabilité, on sélectionne celle qui a  le meilleur résultat et on la défini comme LA config de ce régime
+ 
+Ainsi par la suite, on a juste à définir tous les 10, 20 ou 30 jours le régime dans lequel on est, et on a la config la plus adaptée
+
+J'ai lancé cette optimisation sur 400 crypto sur 6 ans d'historique en RUST en multithreading sur 24 CPU à 100% d'utilisation chacun, il y a 65 000 fenetres, durée estimée 3-4 jours
+Chaque régime aura plusieurs centaines de fenetres au minimum donc si une config est isolée elle sera statistiquement très pertinente.
+
+Je pense que pour >90% des régimes ca n'arrivera pas à isoler une config qui passera la validation croisée, mais si ca y parvient même juste sur 5% ce sera des configs bétons sur ces régimes
+
+Je vous tiendrai au courant des résultats 
