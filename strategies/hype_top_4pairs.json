@@ -11,7 +11,7 @@
         "compress_cache": true,
         "end_date": "2025-12-22",
         "exchanges": [
-            "bybit"
+            "binance"
         ],
         "filter_by_min_effective_cost": false,
         "gap_tolerance_ohlcvs_minutes": 120,
@@ -26,7 +26,8 @@
                 "HYPEUSDT",
                 "BTCUSDT",
                 "ETHUSDT",
-                "SOLUSDT"
+                "SOLUSDT",
+                "XRPUSDT"
             ],
             "short": []
         },
@@ -127,7 +128,8 @@
                 "HYPEUSDT",
                 "BTCUSDT",
                 "ETHUSDT",
-                "SOLUSDT"
+                "SOLUSDT",
+                "XRPUSDT"
             ],
             "short": []
         },
