@@ -21,6 +21,15 @@
         "btc_collateral_ltv_cap": null,
         "max_warmup_minutes": 0.0,
         "coin_sources": {},
+        "coins": {
+            "long": [
+                "HYPEUSDT",
+                "BTCUSDT",
+                "ETHUSDT",
+                "SOLUSDT"
+            ],
+            "short": []
+        },
         "suite": {
             "enabled": false,
             "include_base_scenario": true,
@@ -466,7 +475,7 @@
         "mutation_probability": 0.4,
         "mutation_eta": 20,
         "mutation_indpb": 0.1,
-        "n_cpus": 32,
+        "n_cpus": 14,
         "offspring_multiplier": 2,
         "pareto_max_size": 250,
         "population_size": 2000,

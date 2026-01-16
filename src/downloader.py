@@ -363,9 +363,10 @@ def attempt_gap_fix_ohlcvs(df, symbol=None, verbose=True):
 
 async def fetch_url(session, url, retries=5, backoff=1.5):
     last_exc = None
+    timeout = aiohttp.ClientTimeout(total=60, connect=20, sock_connect=20, sock_read=60)
     for attempt in range(retries):
         try:
-            async with session.get(url) as response:
+            async with session.get(url, timeout=timeout) as response:
                 response.raise_for_status()
                 return await response.read()
         except Exception as e:
@@ -987,7 +988,9 @@ class OHLCVManager:
             f"{symbolf}{day}.csv.gz" for day in missing_days if f"{symbolf}{day}.csv.gz" in webpage
         ]
         # Download concurrently
-        async with aiohttp.ClientSession() as session:
+        # Limit concurrency to avoid timeouts/rate limits
+        connector = aiohttp.TCPConnector(limit=15)
+        async with aiohttp.ClientSession(connector=connector) as session:
             tasks = []
             for fn in filenames:
                 url = f"{base_url}{symbolf}/{fn}"
