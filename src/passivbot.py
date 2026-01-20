@@ -24,6 +24,11 @@ import logging
 import math
 from pathlib import Path
 from candlestick_manager import CandlestickManager, CANDLE_DTYPE
+from fill_events_manager import (
+    FillEventsManager,
+    _build_fetcher_for_bot,
+    _extract_symbol_pool,
+)
 from typing import Dict, Iterable, Tuple, List, Optional, Any
 from logging_setup import configure_logging, resolve_log_level
 from utils import (
@@ -502,6 +507,15 @@ class Passivbot:
             "long": "graceful_stop" if auto_gs else "manual",
             "short": "graceful_stop" if auto_gs else "manual",
         }
+
+        # FillEventsManager shadow mode: runs in parallel with legacy pnls, logs comparison
+        self._pnls_shadow_mode = bool(
+            get_optional_live_value(self.config, "pnls_manager_shadow_mode", False)
+        )
+        self._pnls_manager: Optional[FillEventsManager] = None
+        self._pnls_shadow_initialized = False
+        self._pnls_shadow_last_comparison_ts = 0
+        self._pnls_shadow_comparison_interval_ms = 60_000  # compare every 60 seconds
 
     def live_value(self, key: str):
         return require_live_value(self.config, key)
@@ -1080,10 +1094,30 @@ class Passivbot:
             return False
         if not balance_ok:
             return False
-        open_orders_ok, pnls_ok = await asyncio.gather(
+
+        # Build task list: always include open_orders and pnls
+        tasks = [
             self.update_open_orders(),
             self.update_pnls(),
-        )
+        ]
+        # If shadow mode is enabled, also run the FillEventsManager update in parallel
+        if self._pnls_shadow_mode:
+            tasks.append(self._update_pnls_shadow())
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Check results (first two are always open_orders and pnls)
+        open_orders_ok = results[0] is True
+        pnls_ok = results[1] is True
+
+        # Handle shadow mode result (just log errors, don't fail the bot)
+        if self._pnls_shadow_mode and len(results) > 2:
+            shadow_result = results[2]
+            if isinstance(shadow_result, Exception):
+                logging.warning("[shadow] Shadow update raised exception: %s", shadow_result)
+            # Run comparison after both updates complete
+            self._compare_pnls_shadow()
+
         if not open_orders_ok or not pnls_ok:
             return False
         if self.stop_signal_received:
@@ -1321,6 +1355,7 @@ class Passivbot:
         position_side = order.get("position_side", "?")
         price = _fmt(order.get("price", "?"))
         symbol = order.get("symbol", "?")
+        coin = symbol_to_coin(symbol, verbose=False) or symbol
         details = f"{side} {qty} {position_side}@{price}"
         extra_parts = []
         if context:
@@ -1337,7 +1372,7 @@ class Passivbot:
                 parts.append(f"qty {qo} -> {qn} ({delta.get('qty_pct_diff','?')}%)")
             if parts:
                 extra_parts.append("delta=" + "; ".join(parts))
-        msg = f"{action: >{self.action_str_max_len}} {symbol} | {details} | type={pb_order_type} | src={source}"
+        msg = f"[order] {action: >{self.action_str_max_len}} {coin} | {details} | type={pb_order_type} | src={source}"
         if extra_parts:
             msg += " | " + " ".join(extra_parts)
         logging.log(level, msg)
@@ -1393,7 +1428,8 @@ class Passivbot:
                 reason_str = " | reasons=" + ", ".join(
                     f"{reason}:{count}" for reason, count in sorted(reason_counts.items())
                 )
-            logging.info("%s %s | %s%s", action, symbol, display, reason_str)
+            coin = symbol_to_coin(symbol, verbose=False) or symbol
+            logging.info("[order] %6s %s | %s%s", action, coin, display, reason_str)
 
     def _resolve_pb_order_type(self, order) -> str:
         """Best-effort decoding of Passivbot order type for logging."""
@@ -1822,7 +1858,7 @@ class Passivbot:
         res = log_dict_changes(previous_PB_modes, self.PB_modes)
         for k, v in res.items():
             for elm in v:
-                logging.info(f"{k} {elm}")
+                logging.info(f"[mode] {k:7s} {elm}")
 
     async def get_filtered_coins(self, pside: str) -> List[str]:
         """Select ideal coins for a side using EMA-based volume and log-range filters.
@@ -2099,7 +2135,7 @@ class Passivbot:
             try:
                 equity = self.balance + (await self.calc_upnl_sum())
                 logging.info(
-                    f"balance changed: {self._previous_balance} -> {self.balance} equity: {equity:.4f} source: {source}"
+                    f"[balance] {self._previous_balance} -> {self.balance} equity: {equity:.4f} source: {source}"
                 )
             except Exception as e:
                 logging.error(f"error with handle_balance_update {e}")
@@ -2220,6 +2256,363 @@ class Passivbot:
             # no fills yet; avoid re-scanning entire lookback on the next cycle
             self._pnls_cursor_ts = max(self.get_exchange_time() - 1000, age_limit)
         return True
+
+    # -------------------------------------------------------------------------
+    # FillEventsManager Shadow Mode (dry run comparison with legacy pnls)
+    # -------------------------------------------------------------------------
+
+    async def _init_pnls_shadow_manager(self) -> bool:
+        """Initialize the FillEventsManager for shadow mode comparison.
+
+        Returns True if initialization succeeded, False otherwise.
+        Shadow mode runs the new FillEventsManager in parallel with legacy pnls,
+        caching data and logging comparisons, but not using it for bot decisions.
+        """
+        if not self._pnls_shadow_mode:
+            return False
+
+        if self._pnls_shadow_initialized:
+            return True
+
+        try:
+            logging.info(
+                "[shadow] Initializing FillEventsManager shadow mode for %s:%s",
+                self.exchange,
+                self.user,
+            )
+
+            # Extract symbol pool from config (same as legacy pnls uses)
+            symbol_pool = _extract_symbol_pool(self.config, None)
+
+            # Build the fetcher for this bot
+            fetcher = _build_fetcher_for_bot(self, symbol_pool)
+
+            # Create the FillEventsManager with its own cache path
+            cache_path = Path(f"caches/fill_events/{self.exchange}/{self.user}")
+
+            self._pnls_manager = FillEventsManager(
+                exchange=self.exchange,
+                user=self.user,
+                fetcher=fetcher,
+                cache_path=cache_path,
+            )
+
+            # Load cached events
+            await self._pnls_manager.ensure_loaded()
+
+            cached_count = len(self._pnls_manager._events)
+            logging.info(
+                "[shadow] FillEventsManager initialized: %d cached events loaded",
+                cached_count,
+            )
+
+            self._pnls_shadow_initialized = True
+            return True
+
+        except Exception as e:
+            logging.error("[shadow] Failed to initialize FillEventsManager: %s", e)
+            traceback.print_exc()
+            self._pnls_shadow_mode = False  # Disable shadow mode on init failure
+            return False
+
+    def _log_fill_event(self, event) -> str:
+        """Format a FillEvent for logging.
+
+        Format: [fill] BTC long entry +0.001 @ 100000.00
+        For closes: [fill] BTC long close -0.001 @ 100500.00, pnl=+5.50 USDT
+        For unknown orders: [fill] BTC long unknown -0.2 @ 2.05, pnl=-0.005 USDT (coid=abc123)
+        """
+        coin = symbol_to_coin(event.symbol, verbose=False) or event.symbol
+        pside = event.position_side.lower()
+        order_type = event.pb_order_type.lower() if event.pb_order_type else "fill"
+
+        # Format qty with sign (+ for buys, - for sells)
+        qty_sign = "+" if event.side.lower() == "buy" else "-"
+        qty_str = f"{qty_sign}{abs(event.qty):.6g}"
+
+        msg = f"[fill] {coin} {pside} {order_type} {qty_str} @ {event.price:.2f}"
+
+        # Add pnl for closes (use 3 significant digits)
+        if event.pnl != 0.0:
+            pnl_sign = "+" if event.pnl >= 0 else ""
+            msg += f", pnl={pnl_sign}{round_dynamic(event.pnl, 3)} USDT"
+
+        # Add client_order_id for unknown orders
+        if order_type == "unknown" and event.client_order_id:
+            msg += f" (coid={event.client_order_id})"
+
+        return msg
+
+    def _log_new_fill_events(self, new_events: list) -> None:
+        """Log new fill events. Truncates to summary if > 20 events."""
+        if not new_events:
+            return
+
+        if len(new_events) > 20:
+            # Truncate to summary
+            total_pnl = sum(ev.pnl for ev in new_events)
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            logging.info("[fill] %d fills, pnl=%s%s USDT", len(new_events), pnl_sign, round_dynamic(total_pnl, 3))
+        else:
+            # Log each event
+            for event in sorted(new_events, key=lambda e: e.timestamp):
+                logging.info(self._log_fill_event(event))
+
+    def _calc_unstuck_allowances_from_fill_events(self, allow_new_unstuck: bool) -> dict[str, float]:
+        """Calculate unstuck allowances using FillEventsManager data (shadow mode equivalent)."""
+        if not allow_new_unstuck or self._pnls_manager is None:
+            return {"long": 0.0, "short": 0.0}
+
+        events = self._pnls_manager.get_events()
+        if not events:
+            return {"long": 0.0, "short": 0.0}
+
+        pnls_cumsum = np.array([ev.pnl for ev in events]).cumsum()
+        pnls_cumsum_max, pnls_cumsum_last = pnls_cumsum.max(), pnls_cumsum[-1]
+
+        out = {}
+        for pside in ["long", "short"]:
+            pct = float(self.bot_value(pside, "unstuck_loss_allowance_pct") or 0.0)
+            if pct > 0.0:
+                out[pside] = float(
+                    pbr.calc_auto_unstuck_allowance(
+                        float(self.balance),
+                        pct * float(self.bot_value(pside, "total_wallet_exposure_limit") or 0.0),
+                        float(pnls_cumsum_max),
+                        float(pnls_cumsum_last),
+                    )
+                )
+            else:
+                out[pside] = 0.0
+        return out
+
+    def _get_last_position_changes_from_fill_events(self) -> dict:
+        """Get last position changes using FillEventsManager data (shadow mode equivalent)."""
+        last_position_changes = defaultdict(dict)
+        if self._pnls_manager is None:
+            return last_position_changes
+
+        events = self._pnls_manager.get_events()
+        for symbol in self.positions:
+            for pside in ["long", "short"]:
+                if self.has_position(pside, symbol) and self.is_trailing(symbol, pside):
+                    last_position_changes[symbol][pside] = utc_ms() - 1000 * 60 * 60 * 24 * 7
+                    for ev in reversed(events):
+                        try:
+                            if ev.symbol == symbol and ev.position_side == pside:
+                                last_position_changes[symbol][pside] = ev.timestamp
+                                break
+                        except Exception as e:
+                            logging.error(f"Error in _get_last_position_changes_from_fill_events: {e}")
+        return last_position_changes
+
+    async def _update_pnls_shadow(self) -> bool:
+        """Run the FillEventsManager refresh in shadow mode.
+
+        Returns True if update succeeded, False otherwise.
+        This runs in parallel with update_pnls() but results are only logged,
+        not used for bot decisions.
+        """
+        if not self._pnls_shadow_mode:
+            return False
+
+        if not self._pnls_shadow_initialized:
+            if not await self._init_pnls_shadow_manager():
+                return False
+
+        if self._pnls_manager is None:
+            return False
+
+        try:
+            # Use the same lookback window as legacy pnls
+            age_limit = self.get_exchange_time() - 1000 * 60 * 60 * 24 * float(
+                self.live_value("pnls_max_lookback_days")
+            )
+
+            # Get existing event IDs before refresh
+            existing_ids = set(ev.id for ev in self._pnls_manager.get_events())
+
+            # Check if we need a full refresh (cache empty or too old)
+            events = self._pnls_manager.get_events()
+            needs_full_refresh = not events
+            if events:
+                oldest_event_ts = events[0].timestamp
+                if oldest_event_ts > age_limit + 1000 * 60 * 60 * 24:  # > 1 day newer than limit
+                    needs_full_refresh = True
+                    logging.info(
+                        "[shadow] Cache oldest event (%s) is newer than lookback (%s), doing full refresh",
+                        ts_to_date(oldest_event_ts)[:19],
+                        ts_to_date(age_limit)[:19],
+                    )
+
+            if needs_full_refresh:
+                # Full refresh with proper lookback window
+                logging.info(
+                    "[shadow] Performing full refresh from %s",
+                    ts_to_date(age_limit)[:19],
+                )
+                await self._pnls_manager.refresh(start_ms=int(age_limit), end_ms=None)
+            else:
+                # Incremental refresh like legacy
+                await self._pnls_manager.refresh_latest(overlap=20)
+
+            # Find and log new events (those not in cache before refresh)
+            all_events = self._pnls_manager.get_events()
+            new_events = [ev for ev in all_events if ev.id not in existing_ids]
+            if new_events:
+                self._log_new_fill_events(new_events)
+
+            return True
+
+        except RateLimitExceeded:
+            logging.warning("[shadow] Rate limit while fetching fill events; retrying next cycle")
+            return False
+        except Exception as e:
+            logging.error("[shadow] Failed to update FillEventsManager: %s", e)
+            if self.logging_level >= 2:
+                traceback.print_exc()
+            return False
+
+    def _compare_pnls_shadow(self) -> None:
+        """Compare legacy pnls with FillEventsManager data and log differences.
+
+        This comparison is logged periodically to avoid spamming logs.
+        Differences are logged at DEBUG level normally, INFO level for significant discrepancies.
+        """
+        if not self._pnls_shadow_mode or self._pnls_manager is None:
+            return
+
+        now_ms = utc_ms()
+        if now_ms - self._pnls_shadow_last_comparison_ts < self._pnls_shadow_comparison_interval_ms:
+            return
+
+        self._pnls_shadow_last_comparison_ts = now_ms
+
+        try:
+            # Get lookback window
+            age_limit = self.get_exchange_time() - 1000 * 60 * 60 * 24 * float(
+                self.live_value("pnls_max_lookback_days")
+            )
+
+            # Legacy pnls data
+            legacy_events = [p for p in getattr(self, "pnls", []) if p.get("timestamp", 0) >= age_limit]
+            legacy_count = len(legacy_events)
+            legacy_pnl_sum = sum(p.get("pnl", 0.0) for p in legacy_events)
+            legacy_ids = set(p.get("id", "") for p in legacy_events)
+
+            # New FillEventsManager data
+            manager_events = self._pnls_manager.get_events(start_ms=int(age_limit))
+            manager_count = len(manager_events)
+            manager_pnl_sum = sum(ev.pnl for ev in manager_events)
+            manager_ids = set(ev.id for ev in manager_events)
+
+            # Calculate differences
+            count_diff = manager_count - legacy_count
+            pnl_diff = manager_pnl_sum - legacy_pnl_sum
+
+            # Find IDs only in one system
+            only_in_legacy = legacy_ids - manager_ids
+            only_in_manager = manager_ids - legacy_ids
+
+            # Latest timestamps
+            legacy_latest = max((p.get("timestamp", 0) for p in legacy_events), default=0)
+            manager_latest = max((ev.timestamp for ev in manager_events), default=0)
+
+            # Log comparison
+            log_level = logging.DEBUG
+            if abs(count_diff) > 10 or abs(pnl_diff) > 1.0:
+                log_level = logging.INFO  # Log more prominently if significant difference
+
+            logging.log(
+                log_level,
+                "[shadow] Comparison: legacy=%d events (pnl=%.4f), manager=%d events (pnl=%.4f), "
+                "diff=%+d events (pnl=%+.4f)",
+                legacy_count,
+                legacy_pnl_sum,
+                manager_count,
+                manager_pnl_sum,
+                count_diff,
+                pnl_diff,
+            )
+
+            if only_in_legacy:
+                logging.debug(
+                    "[shadow] IDs only in legacy (%d): %s",
+                    len(only_in_legacy),
+                    list(only_in_legacy)[:5],  # Show first 5
+                )
+
+            if only_in_manager:
+                logging.debug(
+                    "[shadow] IDs only in manager (%d): %s",
+                    len(only_in_manager),
+                    list(only_in_manager)[:5],  # Show first 5
+                )
+
+            # Log timestamp comparison
+            if legacy_latest > 0 and manager_latest > 0:
+                ts_diff_ms = manager_latest - legacy_latest
+                if abs(ts_diff_ms) > 60_000:  # More than 1 minute difference
+                    logging.info(
+                        "[shadow] Latest timestamp diff: legacy=%s, manager=%s (diff=%+.1fs)",
+                        ts_to_date(legacy_latest),
+                        ts_to_date(manager_latest),
+                        ts_diff_ms / 1000.0,
+                    )
+
+            # Compare unstuck allowances (always log at INFO for validation)
+            legacy_unstuck = self._calc_unstuck_allowances_live(allow_new_unstuck=True)
+            manager_unstuck = self._calc_unstuck_allowances_from_fill_events(allow_new_unstuck=True)
+            unstuck_diff_long = manager_unstuck["long"] - legacy_unstuck["long"]
+            unstuck_diff_short = manager_unstuck["short"] - legacy_unstuck["short"]
+            match_str = "MATCH" if abs(unstuck_diff_long) < 0.01 and abs(unstuck_diff_short) < 0.01 else "DIFF"
+            logging.info(
+                "[shadow] Unstuck allowances %s: legacy=(long=%.4f, short=%.4f), "
+                "manager=(long=%.4f, short=%.4f), diff=(long=%+.4f, short=%+.4f)",
+                match_str,
+                legacy_unstuck["long"],
+                legacy_unstuck["short"],
+                manager_unstuck["long"],
+                manager_unstuck["short"],
+                unstuck_diff_long,
+                unstuck_diff_short,
+            )
+
+            # Compare last position changes (timestamps for trailing logic)
+            legacy_lpc = self.get_last_position_changes()
+            manager_lpc = self._get_last_position_changes_from_fill_events()
+            all_symbols = set(legacy_lpc.keys()) | set(manager_lpc.keys())
+            for symbol in sorted(all_symbols):
+                coin = symbol_to_coin(symbol, verbose=False) or symbol
+                for pside in ["long", "short"]:
+                    legacy_ts = legacy_lpc.get(symbol, {}).get(pside)
+                    manager_ts = manager_lpc.get(symbol, {}).get(pside)
+                    if legacy_ts is None and manager_ts is None:
+                        continue
+                    legacy_dt = ts_to_date(legacy_ts) if legacy_ts else "N/A"
+                    manager_dt = ts_to_date(manager_ts) if manager_ts else "N/A"
+                    if legacy_ts != manager_ts:
+                        diff_s = ((manager_ts or 0) - (legacy_ts or 0)) / 1000.0 if legacy_ts and manager_ts else 0
+                        logging.info(
+                            "[shadow] Last position change %s %s DIFF: legacy=%s, manager=%s (diff=%+.1fs)",
+                            coin,
+                            pside,
+                            legacy_dt,
+                            manager_dt,
+                            diff_s,
+                        )
+                    else:
+                        logging.info(
+                            "[shadow] Last position change %s %s MATCH: %s",
+                            coin,
+                            pside,
+                            legacy_dt,
+                        )
+
+        except Exception as e:
+            logging.error("[shadow] Error during pnls comparison: %s", e)
+            if self.logging_level >= 2:
+                traceback.print_exc()
 
     async def init_fill_events(self):
         """Initialise in-memory fill events cache."""
@@ -3035,7 +3428,7 @@ class Passivbot:
                             order, "removed order", "fetch_open_orders", level=logging.DEBUG
                         )
             if len(added_orders) > 20:
-                logging.info(f"added {len(added_orders)} new orders")
+                logging.info(f"[order] added {len(added_orders)} new orders")
             else:
                 for order in added_orders:
                     self.log_order_action(
@@ -3114,15 +3507,15 @@ class Passivbot:
 
             # classify action ------------------------------------------------
             if old["size"] == 0.0 and new["size"] != 0.0:
-                action = "     new pos"
+                action = "    new"
             elif new["size"] == 0.0:
-                action = "  closed pos"
+                action = " closed"
             elif new["size"] > old["size"]:
-                action = "added to pos"
+                action = "  added"
             elif new["size"] < old["size"]:
-                action = " reduced pos"
+                action = "reduced"
             else:
-                action = "     unknown"
+                action = "unknown"
 
             # Compute metrics for new pos
             wallet_exposure = (
@@ -3161,10 +3554,11 @@ class Passivbot:
             except:
                 upnl = 0.0
 
+            coin = symbol_to_coin(symbol, verbose=False) or symbol
             table.add_row(
                 [
                     action + " ",
-                    symbol + " ",
+                    coin + " ",
                     pside + " ",
                     round_dynamic(old["size"], rd),
                     " @ ",
@@ -3184,23 +3578,23 @@ class Passivbot:
                 ]
             )
 
-        # Print aligned table
+        # Print aligned table with [pos] prefix
         for line in table.get_string().splitlines():
-            logging.info(line)
+            logging.info("[pos] %s", line)
 
     async def _fetch_and_apply_positions(self):
-        """Fetch raw positions, apply them to local state and return snapshots."""
+        """Fetch raw positions, apply them to local state and return snapshots.
+
+        Returns:
+            Tuple of (success: bool, old_positions, new_positions).
+
+        Raises:
+            Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
+        """
         if not hasattr(self, "positions"):
             self.positions = {}
-        try:
-            res = await self.fetch_positions()
-        except RateLimitExceeded:
-            logging.warning("rate limit while fetching positions; retrying next cycle")
-            return False
-        except NetworkError as e:
-            logging.error(f"network error fetching positions: {e}")
-            return False
-        if res is None or res is False:
+        res = await self.fetch_positions()
+        if res is None:
             return False, None, None
         positions_list_new = res
         fetched_positions_old = deepcopy(self.fetched_positions)
@@ -3237,7 +3631,14 @@ class Passivbot:
         return True
 
     async def update_balance(self):
-        """Fetch and apply the latest wallet balance."""
+        """Fetch and apply the latest wallet balance.
+
+        Returns:
+            bool: True on success, False if balance_override is used but invalid.
+
+        Raises:
+            Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
+        """
         if not hasattr(self, "balance_override"):
             self.balance_override = None
         if not hasattr(self, "_balance_override_logged"):
@@ -3246,48 +3647,37 @@ class Passivbot:
             self.previous_hysteresis_balance = None
         if not hasattr(self, "balance_hysteresis_snap_pct"):
             self.balance_hysteresis_snap_pct = 0.02
+
+        if self.balance_override is not None:
+            balance = float(self.balance_override)
+            if not self._balance_override_logged:
+                logging.info("Using balance override: %.6f", balance)
+                self._balance_override_logged = True
+        else:
+            if not hasattr(self, "fetch_balance"):
+                logging.debug("update_balance: no fetch_balance implemented")
+                return False
+            balance = await self.fetch_balance()
+
+        # Only accept numeric balances; keep previous value on failure
+        if balance is None:
+            logging.warning("balance fetch returned None; keeping previous balance")
+            return False
         try:
-            if self.balance_override is not None:
-                balance = float(self.balance_override)
-                if not self._balance_override_logged:
-                    logging.info("Using balance override: %.6f", balance)
-                    self._balance_override_logged = True
-            else:
-                if not hasattr(self, "fetch_balance"):
-                    logging.debug("update_balance: no fetch_balance implemented")
-                    return False
-                balance = await self.fetch_balance()
-            # Only accept numeric balances; keep previous value on failure
-            if balance is None or balance is False:
-                logging.warning("balance fetch failed; keeping previous balance")
-                return False
-            try:
-                balance = float(balance)
-            except (TypeError, ValueError):
-                logging.warning("non-numeric balance fetch result; keeping previous balance")
-                return False
-            if self.balance_override is None:
-                if self.previous_hysteresis_balance is None:
-                    self.previous_hysteresis_balance = balance
-                balance = pbr.hysteresis(
-                    balance, self.previous_hysteresis_balance, self.balance_hysteresis_snap_pct
-                )
+            balance = float(balance)
+        except (TypeError, ValueError):
+            logging.warning("non-numeric balance fetch result; keeping previous balance")
+            return False
+
+        if self.balance_override is None:
+            if self.previous_hysteresis_balance is None:
                 self.previous_hysteresis_balance = balance
-            self.balance = balance
-            return True
-        except RateLimitExceeded:
-            logging.warning("rate limit while fetching balance; retrying next cycle")
-            return False
-        except NetworkError as e:
-            logging.error(f"network error fetching balance: {e}")
-            return False
-        except NotImplementedError:
-            logging.debug("update_balance: fetch_balance not implemented")
-            return False
-        except Exception as e:
-            logging.error(f"error updating balance {e}")
-            traceback.print_exc()
-            return False
+            balance = pbr.hysteresis(
+                balance, self.previous_hysteresis_balance, self.balance_hysteresis_snap_pct
+            )
+            self.previous_hysteresis_balance = balance
+        self.balance = balance
+        return True
 
     async def update_positions_and_balance(self):
         """Convenience helper to refresh both positions and balance concurrently."""
@@ -4923,6 +5313,13 @@ async def main():
         default=False,
         help="Enable verbose (debug) logging. Equivalent to --log-level debug.",
     )
+    parser.add_argument(
+        "--shadow-mode",
+        dest="shadow_mode",
+        action="store_true",
+        default=False,
+        help="Enable FillEventsManager shadow mode for PnL comparison logging.",
+    )
 
     template_config = get_template_config()
     del template_config["optimize"]
@@ -4948,6 +5345,13 @@ async def main():
         logging_section = {}
     config["logging"] = logging_section
     logging_section["level"] = effective_log_level
+
+    # --shadow-mode flag enables FillEventsManager shadow mode
+    if args.shadow_mode:
+        if "live" not in config or not isinstance(config["live"], dict):
+            config["live"] = {}
+        config["live"]["pnls_manager_shadow_mode"] = True
+        logging.info("[shadow] Shadow mode enabled via CLI flag")
 
     custom_endpoints_cli = args.custom_endpoints
     live_section = config.get("live") if isinstance(config.get("live"), dict) else {}
