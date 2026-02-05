@@ -466,18 +466,18 @@
         "crossover_probability": 0.6,
         "crossover_eta": 20,
         "enable_overrides": [],
-        "iters": 200000,
+        "iters": 2000,
         "limits": [
             {
                 "metric": "gain_usd",
                 "penalize_if": "greater_than",
-                "value": 9.0
+                "value": 100.0
             }
         ],
         "mutation_probability": 0.4,
         "mutation_eta": 20,
         "mutation_indpb": 0.1,
-        "n_cpus": 14,
+        "n_cpus": 4,
         "offspring_multiplier": 2,
         "pareto_max_size": 250,
         "population_size": 2000,

@@ -19,63 +19,114 @@ fi
 
 # Default values for optional variables
 REMOTE_DIR="${REMOTE_DIR:-~/passivbot}"
-COMMAND="docker compose run --rm passivbot python src/backtest.py strategies/hype_top_4pairs.json"
+PASSIVBOT_ARGS="python src/optimize.py strategies/hype_top_4pairs.json"
+CONTAINER_NAME="passivbot_optimize"
 
-# --- Script ---
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}[1/3] Syncing local code to remote server...${NC}"
-# Using rsync to upload change. Excludes heavy/unnecessary folders.
-# Note: This requires Git Bash or WSL on Windows.
-rsync -avz -e "ssh -i \"$SSH_KEY_PATH\"" \
-    --exclude '.git' \
-    --exclude 'venv' \
-    --exclude '__pycache__' \
-    --exclude '*.pyc' \
-    --exclude 'backtests' \
-    --exclude 'caches' \
-    ./ "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR"
+# Determine mode: deploy (default) or check
+MODE="${1:-deploy}"
 
-echo -e "${GREEN}[2/3] Executing command on remote server...${NC}"
-ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" << EOF
-    set -e
-    cd $REMOTE_DIR
-    
-    # Optional: Activate virtual environment if necessary
-    # source venv/bin/activate
-    
-    echo "Running: $COMMAND"
-    $COMMAND
+if [ "$MODE" == "deploy" ]; then
+    echo -e "${GREEN}[1/3] Syncing local code to remote server...${NC}"
+    # Using rsync to upload changes.
+    rsync -avz -e "ssh -i \"$SSH_KEY_PATH\"" \
+        --exclude '.git' \
+        --exclude 'venv' \
+        --exclude '__pycache__' \
+        --exclude '*.pyc' \
+        --exclude 'backtests' \
+        --exclude 'caches' \
+        --exclude 'optimize_results' \
+        ./ "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR"
+
+    echo -e "${GREEN}[2/3] Starting optimization in background...${NC}"
+    ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" << EOF
+        set -e
+        cd $REMOTE_DIR
+        
+        # Check and remove old container if exists
+        if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+             docker rm -f ${CONTAINER_NAME} > /dev/null
+        fi
+        
+        # Initialize results dirs if not exist to ensure permissions/existence
+        mkdir -p optimize_results configs backtests
+        
+        echo "Starting container: ${CONTAINER_NAME}"
+        # Start detached
+        docker compose run -d --name ${CONTAINER_NAME} passivbot $PASSIVBOT_ARGS
 EOF
 
-echo -e "${GREEN}[3/3] Retrieving updated configs/results...${NC}"
-# Use zip/unzip approach with Windows-native copy for WSL compatibility
-ZIP_FILE="/tmp/passivbot_results_$$.zip"
-LINUX_TEMP_DIR="/tmp/passivbot_extract_$$"
-FILES_TO_RETRIEVE=("configs" "backtests")
+    echo -e "${GREEN}[3/3] Optimization started. Logs will follow for 30 seconds.${NC}"
+    echo -e "${YELLOW}Press Ctrl+C to stop watching logs (optimization will continue).${NC}"
+    
+    # Stream logs with timeout. The || true prevents script failure on meaningful exit codes from timeout/ssh
+    ssh -t -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "timeout 30s docker logs -f ${CONTAINER_NAME}" || true
+    
+    echo -e "\n${GREEN}Deployment complete. Optimization running in background.${NC}"
+    echo "Use './deploy.sh check' to check status and retrieve results."
 
-# Create zip on remote server and download
-ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR && zip -r /tmp/retrieved_files.zip ${FILES_TO_RETRIEVE[*]}"
-scp -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST:/tmp/retrieved_files.zip" "$ZIP_FILE"
+elif [ "$MODE" == "check" ]; then
+    echo -e "${GREEN}Checking optimization status...${NC}"
+    
+    # Check if running
+    IS_RUNNING=$(ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "docker ps --format '{{.Names}}' | grep -q '^${CONTAINER_NAME}$' && echo 'yes' || echo 'no'")
+    
+    if [ "$IS_RUNNING" == "yes" ]; then
+        echo -e "${YELLOW}Optimization '${CONTAINER_NAME}' is still running.${NC}"
+        echo "To view logs: ssh -i \"$SSH_KEY_PATH\" $REMOTE_USER@$REMOTE_HOST \"docker logs -f --tail 100 ${CONTAINER_NAME}\""
+    else
+        echo -e "${GREEN}Optimization finished. Downloading results...${NC}"
+        
+        ZIP_FILE="/tmp/passivbot_results_$$.zip"
+        LINUX_TEMP_DIR="/tmp/passivbot_extract_$$"
+        # Folders to retrieve
+        FILES_TO_RETRIEVE=("configs" "backtests" "optimize_results")
+        
+        # Create zip on remote
+        echo "Zipping remote files..."
+        ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR && zip -r /tmp/retrieved_results.zip ${FILES_TO_RETRIEVE[*]} -x \"*placeholder*\" || true"
+        
+        # SCP download
+        echo "Downloading..."
+        scp -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST:/tmp/retrieved_results.zip" "$ZIP_FILE"
+        
+        # Clean remote
+        ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "rm -f /tmp/retrieved_results.zip"
+        
+        # Unzip locally
+        echo "Extracting..."
+        mkdir -p "$LINUX_TEMP_DIR"
+        unzip -o "$ZIP_FILE" -d "$LINUX_TEMP_DIR"
+        
+        # Sync to workspace using robocopy logic from original script
+        echo "Merging files into workspace..."
+        
+        for ITEM in "${FILES_TO_RETRIEVE[@]}"; do
+            SRC="$LINUX_TEMP_DIR/$ITEM"
+            DEST="$(pwd)/$ITEM"
+            
+            if [ -d "$SRC" ]; then
+                # Convert to Windows path for robocopy (assumes WSL environment)
+                WIN_SRC=$(wslpath -w "$SRC")
+                WIN_DEST=$(wslpath -w "$DEST")
+                echo "Syncing $ITEM..."
+                cmd.exe /c "robocopy $WIN_SRC $WIN_DEST /E /NFL /NDL /NJH /NJS /NC /NS" || true
+            fi
+        done
+        
+        # Cleanup local
+        rm -rf "$LINUX_TEMP_DIR"
+        rm -f "$ZIP_FILE"
+        
+        echo -e "${GREEN}Done! Results updated in workspace.${NC}"
+    fi
 
-# Extract to Linux temp dir (always works)
-mkdir -p "$LINUX_TEMP_DIR"
-unzip -o "$ZIP_FILE" -d "$LINUX_TEMP_DIR"
-
-# Convert paths to Windows format
-WIN_TEMP_CONFIGS=$(wslpath -w "$LINUX_TEMP_DIR/configs")
-WIN_TEMP_BACKTESTS=$(wslpath -w "$LINUX_TEMP_DIR/backtests")
-WIN_DEST_CONFIGS=$(wslpath -w "$(pwd)/configs")
-WIN_DEST_BACKTESTS=$(wslpath -w "$(pwd)/backtests")
-
-# Use robocopy (more reliable than xcopy) for each folder
-cmd.exe /c "robocopy $WIN_TEMP_CONFIGS $WIN_DEST_CONFIGS /E /NFL /NDL /NJH /NJS /NC /NS" || true
-cmd.exe /c "robocopy $WIN_TEMP_BACKTESTS $WIN_DEST_BACKTESTS /E /NFL /NDL /NJH /NJS /NC /NS" || true
-
-rm -rf "$LINUX_TEMP_DIR"
-rm -f "$ZIP_FILE"
-# Cleanup remote temp file
-ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "rm -f /tmp/retrieved_files.zip"
-
-echo -e "${GREEN}Done!${NC}"
+else
+    echo "Usage: ./deploy.sh [deploy|check]"
+    echo "  deploy : Sync code, start optimization detached, watch logs briefly. (Default)"
+    echo "  check  : Check status. If finished, download results."
+fi

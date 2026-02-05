@@ -8,6 +8,9 @@ services:
     image: passivbot:latest
     container_name: passivbot
     restart: unless-stopped
+    shm_size: '2gb'
+    environment:
+      - PYTHONUNBUFFERED=1
     volumes:
       - ./:/app/
     working_dir: /app
