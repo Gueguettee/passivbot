@@ -384,3 +384,5 @@ Cargo.lock
 
 # Git worktrees
 .worktrees/
+
+**/.env

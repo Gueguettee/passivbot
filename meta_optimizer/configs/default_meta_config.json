@@ -1,0 +1,59 @@
+{
+  "meta_optimization": {
+    "base_config": "configs/template.json",
+    "output_dir": "meta_optimize_results",
+
+    "validation_scheme": {
+      "type": "combined",
+      "time_folds": {
+        "n_folds": 3,
+        "train_months": 18,
+        "val_months": 6,
+        "mode": "rolling",
+        "gap_months": 0
+      },
+      "coin_folds": {
+        "n_folds": 2,
+        "stratify_by": "market_cap",
+        "min_coins_per_fold": 5
+      }
+    },
+
+    "optimization_settings": {
+      "iters_per_fold": 20000,
+      "population_size": 150,
+      "n_cpus": null,
+      "early_stopping_patience": 5000,
+      "early_stopping_min_improvement": 0.001
+    },
+
+    "robustness_weights": {
+      "consistency": 0.4,
+      "degradation": 0.3,
+      "worst_case": 0.2,
+      "stability": 0.1
+    },
+
+    "robustness_thresholds": {
+      "min_profitable_folds_pct": 0.8,
+      "max_degradation_ratio": 0.5,
+      "max_cv_adg": 1.0,
+      "min_worst_fold_adg": 0.0
+    },
+
+    "output_settings": {
+      "top_n_configs": 10,
+      "export_all_pareto": true,
+      "generate_report": true,
+      "save_validation_details": true
+    },
+
+    "execution_settings": {
+      "n_parallel_backtests": 4,
+      "checkpoint_interval_minutes": 30,
+      "resume_from_checkpoint": true,
+      "verbose": true,
+      "log_level": "info"
+    }
+  }
+}
