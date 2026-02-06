@@ -104,35 +104,56 @@ class OptimizationRunner:
         logger.debug(f"Command: {' '.join(cmd)}")
 
         # Run optimizer
+        logger.info(f"Starting optimizer subprocess: {' '.join(cmd)}")
+        logger.info(f"Working directory: {PASSIVBOT_ROOT}")
+
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
             cwd=str(PASSIVBOT_ROOT),
         )
 
-        # Monitor and log output
+        # Monitor and log output from both streams
         iterations_completed = 0
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-            line_str = line.decode().strip()
-            if line_str:
-                logger.debug(f"[optimizer] {line_str}")
-                # Parse iteration count from output
-                if "gen" in line_str.lower() or "iter" in line_str.lower():
-                    try:
-                        # Try to extract iteration number
-                        parts = line_str.split()
-                        for i, part in enumerate(parts):
-                            if part.isdigit():
-                                iterations_completed = max(iterations_completed, int(part))
-                                break
-                    except:
-                        pass
+        output_lines = []
 
-        await process.wait()
+        async def read_stream(stream, prefix):
+            nonlocal iterations_completed
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                line_str = line.decode().strip()
+                if line_str:
+                    output_lines.append(f"{prefix}: {line_str}")
+                    logger.debug(f"[optimizer {prefix}] {line_str}")
+                    # Parse iteration count from output
+                    if "gen" in line_str.lower() or "iter" in line_str.lower():
+                        try:
+                            parts = line_str.split()
+                            for part in parts:
+                                if part.isdigit():
+                                    iterations_completed = max(iterations_completed, int(part))
+                                    break
+                        except:
+                            pass
+
+        # Read both stdout and stderr concurrently
+        await asyncio.gather(
+            read_stream(process.stdout, "stdout"),
+            read_stream(process.stderr, "stderr"),
+        )
+
+        return_code = await process.wait()
+
+        if return_code != 0:
+            logger.error(f"Optimizer process exited with code {return_code}")
+            logger.error(f"Last 20 lines of output:")
+            for line in output_lines[-20:]:
+                logger.error(f"  {line}")
+        else:
+            logger.info(f"Optimizer subprocess completed successfully")
 
         elapsed = time.time() - start_time
         logger.info(f"Fold {fold.fold_id} optimization completed in {elapsed:.1f}s")
@@ -201,7 +222,37 @@ class OptimizationRunner:
         pareto_members = []
         best_metrics = {}
 
-        # Find the optimizer results directory
+        # First check if results were already copied to fold output directory
+        fold_results_dir = output_dir / "optimization_results"
+        fold_pareto_dir = fold_results_dir / "pareto"
+
+        if fold_pareto_dir.exists() and fold_pareto_dir.is_dir():
+            # Load from already-copied results (resume scenario)
+            pareto_files = list(fold_pareto_dir.glob("*.json"))
+            if pareto_files:
+                logger.info(f"Found {len(pareto_files)} existing Pareto configs in {fold_pareto_dir}")
+                for pf in pareto_files:
+                    try:
+                        with open(pf) as f:
+                            config = json.load(f)
+                        pareto_members.append({
+                            "config": config,
+                            "config_hash": pf.stem,
+                        })
+                    except (json.JSONDecodeError, Exception) as e:
+                        logger.warning(f"Failed to load pareto config {pf}: {e}")
+                        continue
+
+                if pareto_members:
+                    logger.info(f"Loaded {len(pareto_members)} Pareto members from existing results")
+                    # Extract metrics from first member
+                    first = pareto_members[0]
+                    if "config" in first and isinstance(first["config"], dict):
+                        if "analysis" in first["config"]:
+                            best_metrics = first["config"]["analysis"]
+                    return pareto_members, best_metrics
+
+        # Find the optimizer results directory for fresh results
         # Passivbot creates directories like: optimize_results/YYYY-MM-DDTHH_MM_SS_...
         optimize_results_dir = PASSIVBOT_ROOT / "optimize_results"
         if not optimize_results_dir.exists():
@@ -217,37 +268,58 @@ class OptimizationRunner:
         latest_dir = result_dirs[0]
         logger.debug(f"Loading results from: {latest_dir}")
 
-        # Load Pareto file
-        pareto_file = latest_dir / "optimizer.pareto"
-        if pareto_file.exists():
-            with open(pareto_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            member = json.loads(line)
-                            pareto_members.append(member)
-                        except json.JSONDecodeError:
-                            continue
-
-            logger.info(f"Loaded {len(pareto_members)} Pareto members")
-
-            # Extract best metrics (from first Pareto member or average)
-            if pareto_members:
-                # Use first member's metrics as representative
-                first = pareto_members[0]
-                if "metrics" in first:
-                    best_metrics = first["metrics"]
-                elif "analysis" in first:
-                    best_metrics = first["analysis"]
-
-        # Copy results to fold output directory
+        # Copy results to fold output directory first
         fold_results_dir = output_dir / "optimization_results"
         if latest_dir.exists():
             try:
                 shutil.copytree(latest_dir, fold_results_dir, dirs_exist_ok=True)
             except Exception as e:
                 logger.warning(f"Failed to copy results: {e}")
+
+        # Try to load Pareto configs from pareto/ folder (new format)
+        pareto_folder = latest_dir / "pareto"
+        if pareto_folder.exists() and pareto_folder.is_dir():
+            pareto_files = list(pareto_folder.glob("*.json"))
+            logger.info(f"Found {len(pareto_files)} Pareto config files in {pareto_folder}")
+
+            for pf in pareto_files:
+                try:
+                    with open(pf) as f:
+                        config = json.load(f)
+                    # Wrap the config in a member dict for consistency
+                    pareto_members.append({
+                        "config": config,
+                        "config_hash": pf.stem,  # filename without extension
+                    })
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.warning(f"Failed to load pareto config {pf}: {e}")
+                    continue
+
+        # Fallback: try legacy optimizer.pareto file format
+        if not pareto_members:
+            pareto_file = latest_dir / "optimizer.pareto"
+            if pareto_file.exists():
+                with open(pareto_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                member = json.loads(line)
+                                pareto_members.append(member)
+                            except json.JSONDecodeError:
+                                continue
+
+        logger.info(f"Loaded {len(pareto_members)} Pareto members total")
+
+        # Extract best metrics (from first Pareto member if available)
+        if pareto_members:
+            first = pareto_members[0]
+            if "metrics" in first:
+                best_metrics = first["metrics"]
+            elif "analysis" in first:
+                best_metrics = first["analysis"]
+            elif "config" in first and "analysis" in first.get("config", {}):
+                best_metrics = first["config"]["analysis"]
 
         return pareto_members, best_metrics
 
@@ -260,14 +332,23 @@ def extract_configs_from_pareto(pareto_members: List[Dict[str, Any]]) -> List[Di
         pareto_members: List of Pareto member dictionaries
 
     Returns:
-        List of bot configuration dictionaries
+        List of bot configuration dictionaries (full configs, not just bot section)
     """
     configs = []
     for member in pareto_members:
         if "config" in member:
-            configs.append(member["config"])
+            config = member["config"]
+            # If config has full structure (backtest, bot, etc.), use it directly
+            if isinstance(config, dict) and ("bot" in config or "backtest" in config):
+                configs.append(config)
+            else:
+                configs.append(member["config"])
         elif "bot" in member:
+            # Legacy format - just bot section
             configs.append({"bot": member["bot"]})
+        elif "backtest" in member and "bot" in member:
+            # Full config stored directly in member
+            configs.append(member)
     return configs
 
 

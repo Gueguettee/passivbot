@@ -31,6 +31,7 @@ from meta_optimizer.runners.validation_runner import (
     compute_config_hash,
 )
 from meta_optimizer.scoring.robustness_scorer import RobustnessScorer, RobustnessScore
+from meta_optimizer.reporting.report_generator import ReportGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -357,8 +358,8 @@ class MetaOptimizer:
         scores = {}
 
         for config_hash, fold_metrics in validation_matrix.items():
-            # Convert fold metrics to list
-            validation_results = list(fold_metrics.values())
+            # Convert fold metrics to list, filtering out empty/failed folds
+            validation_results = [m for m in fold_metrics.values() if m]
 
             # Score
             score = self.scorer.score(
@@ -378,10 +379,10 @@ class MetaOptimizer:
         scores: Dict[str, RobustnessScore],
     ) -> List[RankedConfig]:
         """Rank configs by robustness score."""
-        # Sort by overall score (descending)
+        # Sort by overall score (descending), with mean_adg as tiebreaker
         sorted_hashes = sorted(
             scores.keys(),
-            key=lambda h: scores[h].overall_score,
+            key=lambda h: (scores[h].overall_score, scores[h].mean_adg),
             reverse=True,
         )
 
@@ -423,6 +424,24 @@ class MetaOptimizer:
             config_path = best_configs_dir / f"rank_{rc.rank}.json"
             with open(config_path, "w") as f:
                 json.dump(rc.config, f, indent=2)
+
+        # Generate reports
+        try:
+            ranked_dicts = [rc.to_dict() for rc in ranked_configs]
+            report_gen = ReportGenerator(self.output_dir)
+            report_gen.generate_summary_report(
+                ranked_dicts,
+                self.config.to_dict(),
+                result.elapsed_seconds,
+            )
+            text_summary = report_gen.generate_text_summary(ranked_dicts)
+            report_gen.save_text_report(text_summary)
+
+            # Print summary to stdout/logs
+            print("\n" + text_summary + "\n")
+            logger.info(f"Reports saved to {self.output_dir / 'reports'}")
+        except Exception as e:
+            logger.warning(f"Failed to generate reports: {e}")
 
         logger.info(f"Results saved to {self.output_dir}")
 

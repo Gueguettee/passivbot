@@ -83,11 +83,13 @@ class ValidationRunner:
         import time
         start_time = time.time()
 
-        # Create validation config
-        val_config = self._create_validation_config(config, fold)
+        # Create output directory first
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create validation config (with unique base_dir for backtest output)
+        val_config = self._create_validation_config(config, fold, output_dir)
 
         # Write config to file
-        output_dir.mkdir(parents=True, exist_ok=True)
         config_path = output_dir / f"val_config_{config_hash}_{fold.fold_id}.json"
         with open(config_path, "w") as f:
             json.dump(val_config, f, indent=2)
@@ -96,30 +98,42 @@ class ValidationRunner:
 
         # Build and run command
         cmd = self._build_command(config_path)
+        logger.info(f"Backtest cmd: {' '.join(cmd)}")
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
             cwd=str(PASSIVBOT_ROOT),
         )
 
-        # Read output
+        # Read output from both streams
         output_lines = []
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-            line_str = line.decode().strip()
-            if line_str:
-                output_lines.append(line_str)
-                logger.debug(f"[backtest] {line_str}")
 
-        await process.wait()
+        async def read_stream(stream, prefix):
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                line_str = line.decode().strip()
+                if line_str:
+                    output_lines.append(f"{prefix}: {line_str}")
+                    logger.debug(f"[backtest {prefix}] {line_str}")
 
+        await asyncio.gather(
+            read_stream(process.stdout, "stdout"),
+            read_stream(process.stderr, "stderr"),
+        )
+
+        return_code = await process.wait()
         elapsed = time.time() - start_time
 
-        # Load metrics from results
+        if return_code != 0:
+            logger.error(f"Backtest failed for config {config_hash[:8]} fold {fold.fold_id} (code {return_code})")
+            for line in output_lines[-10:]:
+                logger.error(f"  {line}")
+
+        # Load metrics from config-specific results directory
         metrics = self._load_metrics(output_dir)
 
         # Determine if profitable
@@ -192,6 +206,7 @@ class ValidationRunner:
         self,
         bot_config: Dict[str, Any],
         fold: Union[TimeFold, CoinFold, CombinedFold],
+        output_dir: Path,
     ) -> Dict[str, Any]:
         """Create config for validation backtest."""
         # Start with base config
@@ -202,6 +217,10 @@ class ValidationRunner:
             config["bot"] = bot_config["bot"]
         else:
             config["bot"] = bot_config
+
+        # Direct backtest output to this config's unique directory
+        # This prevents race conditions when running parallel backtests
+        config["backtest"]["base_dir"] = str(output_dir / "backtests")
 
         # Apply validation fold settings
         if isinstance(fold, TimeFold):
@@ -238,44 +257,35 @@ class ValidationRunner:
         return cmd
 
     def _load_metrics(self, output_dir: Path) -> Dict[str, float]:
-        """Load metrics from backtest output."""
-        # Find the backtest results directory
-        backtests_dir = PASSIVBOT_ROOT / "backtests"
+        """Load metrics from backtest output in the config-specific directory."""
+        # Search for analysis.json in the config's own backtests directory
+        backtests_dir = output_dir / "backtests"
 
-        # Find most recent results
         if not backtests_dir.exists():
-            logger.warning("No backtests directory found")
+            logger.warning(f"No backtests directory found at {backtests_dir}")
             return {}
 
-        # Search for analysis.json in recent directories
-        all_dirs = []
-        for exchange_dir in backtests_dir.iterdir():
-            if exchange_dir.is_dir() and not exchange_dir.name.startswith("."):
-                for result_dir in exchange_dir.iterdir():
-                    if result_dir.is_dir():
-                        all_dirs.append(result_dir)
+        # Recursively find all analysis.json files
+        analysis_files = list(backtests_dir.rglob("analysis.json"))
 
-        if not all_dirs:
-            logger.warning("No backtest result directories found")
+        if not analysis_files:
+            logger.warning(f"No analysis.json found under {backtests_dir}")
             return {}
 
-        # Get most recent
-        latest_dir = max(all_dirs, key=lambda p: p.stat().st_mtime)
+        # If multiple (shouldn't happen), take the most recent
+        if len(analysis_files) > 1:
+            latest = max(analysis_files, key=lambda p: p.stat().st_mtime)
+        else:
+            latest = analysis_files[0]
 
-        # Load analysis.json
-        analysis_file = latest_dir / "analysis.json"
-        if analysis_file.exists():
-            try:
-                with open(analysis_file) as f:
-                    metrics = json.load(f)
-                logger.debug(f"Loaded metrics from {analysis_file}")
-                return metrics
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse analysis.json: {e}")
-                return {}
-
-        logger.warning(f"No analysis.json found in {latest_dir}")
-        return {}
+        try:
+            with open(latest) as f:
+                metrics = json.load(f)
+            logger.info(f"Loaded {len(metrics)} metrics from {latest}")
+            return metrics
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Failed to parse {latest}: {e}")
+            return {}
 
 
 def compute_config_hash(config: Dict[str, Any]) -> str:

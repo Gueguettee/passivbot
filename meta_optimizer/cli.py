@@ -28,6 +28,7 @@ from meta_optimizer.config import (
     merge_configs,
 )
 from meta_optimizer.orchestrator import MetaOptimizer
+from meta_optimizer.reporting.report_generator import ReportGenerator
 
 
 def setup_logging(level: str = "info") -> None:
@@ -56,6 +57,7 @@ Examples:
   %(prog)s configs/template.json --meta-config meta_config.json
   %(prog)s configs/template.json --quick-test
   %(prog)s --resume meta_optimize_results/20250205_123456/
+  %(prog)s --analyze meta_optimize_results/20250205_123456/
         """,
     )
 
@@ -135,6 +137,11 @@ Examples:
         help="Show configuration and exit without running",
     )
 
+    parser.add_argument(
+        "--analyze", "-a",
+        help="Analyze results from a completed run directory",
+    )
+
     return parser.parse_args()
 
 
@@ -207,6 +214,33 @@ def validate_config(config: MetaOptimizerConfig) -> None:
 async def main() -> int:
     """Main entry point."""
     args = parse_args()
+
+    # Handle analyze mode
+    if args.analyze:
+        results_dir = Path(args.analyze)
+        ranked_path = results_dir / "all_ranked_configs.json"
+        if not ranked_path.exists():
+            print(f"Error: No results found at {ranked_path}")
+            return 1
+
+        with open(ranked_path) as f:
+            ranked_configs = json.load(f)
+
+        report_gen = ReportGenerator(results_dir)
+        text = report_gen.generate_text_summary(ranked_configs)
+        print(text)
+
+        # Also generate report files if they don't exist
+        reports_dir = results_dir / "reports"
+        if not (reports_dir / "summary.txt").exists():
+            report_gen.save_text_report(text)
+            print(f"\nReport saved to {reports_dir / 'summary.txt'}")
+
+        best_config = results_dir / "best_configs" / "rank_1.json"
+        if best_config.exists():
+            print(f"\nBest config: {best_config}")
+
+        return 0
 
     # Handle resume mode
     if args.resume:

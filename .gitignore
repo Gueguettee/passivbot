@@ -385,4 +385,7 @@ Cargo.lock
 # Git worktrees
 .worktrees/
 
+.env
 **/.env
+meta_optimizer/.env
+meta_results/

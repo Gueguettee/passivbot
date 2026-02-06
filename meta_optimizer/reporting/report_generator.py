@@ -3,6 +3,7 @@ Report generation utilities.
 """
 
 import json
+import statistics
 from pathlib import Path
 from typing import List, Dict, Any
 from datetime import datetime
@@ -110,28 +111,24 @@ class ReportGenerator:
         adgs = [c.get("mean_adg", 0) for c in ranked_configs]
         sharpes = [c.get("mean_sharpe", 0) for c in ranked_configs]
 
-        import numpy as np
+        def _dist(values):
+            """Compute distribution stats using stdlib."""
+            if not values:
+                return {}
+            mean = statistics.mean(values)
+            std = statistics.stdev(values) if len(values) > 1 else 0.0
+            return {
+                "mean": mean,
+                "std": std,
+                "min": min(values),
+                "max": max(values),
+                "median": statistics.median(values),
+            }
 
         return {
-            "score_distribution": {
-                "mean": float(np.mean(scores)),
-                "std": float(np.std(scores)),
-                "min": float(np.min(scores)),
-                "max": float(np.max(scores)),
-                "median": float(np.median(scores)),
-            },
-            "adg_distribution": {
-                "mean": float(np.mean(adgs)),
-                "std": float(np.std(adgs)),
-                "min": float(np.min(adgs)),
-                "max": float(np.max(adgs)),
-            },
-            "sharpe_distribution": {
-                "mean": float(np.mean(sharpes)),
-                "std": float(np.std(sharpes)),
-                "min": float(np.min(sharpes)),
-                "max": float(np.max(sharpes)),
-            },
+            "score_distribution": _dist(scores),
+            "adg_distribution": _dist(adgs),
+            "sharpe_distribution": _dist(sharpes),
         }
 
     def save_text_report(self, content: str, filename: str = "summary.txt") -> Path:
