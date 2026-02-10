@@ -601,6 +601,47 @@ except Exception as e:
     log_info "To download: ./meta_optimizer/deploy.sh download"
 }
 
+cmd_download_best() {
+    local output_dir="${OUTPUT_DIR:-./best_configs}"
+
+    log_info "Downloading best configs from $REMOTE_HOST"
+
+    # Find latest results directory
+    local latest_dir=$(remote_exec "ls -td $REMOTE_DIR/meta_optimize_results/*/ 2>/dev/null | head -1" | tr -d '[:space:]')
+
+    if [ -z "$latest_dir" ]; then
+        log_warn "No results found on remote"
+        return
+    fi
+
+    local dir_name=$(basename "$latest_dir")
+    log_info "Latest run: $dir_name"
+
+    # Create output directory
+    mkdir -p "$output_dir"
+
+    # Download best_configs folder
+    eval "$(scp_cmd) -r $REMOTE_HOST:$latest_dir/best_configs/* $output_dir/"
+
+    # Download summary files
+    eval "$(scp_cmd) $REMOTE_HOST:$latest_dir/summary.json $output_dir/" 2>/dev/null
+    eval "$(scp_cmd) $REMOTE_HOST:$latest_dir/reports/summary.txt $output_dir/" 2>/dev/null
+
+    log_success "Best configs downloaded to $output_dir"
+    echo ""
+
+    # Show summary
+    if [ -f "$output_dir/summary.txt" ]; then
+        cat "$output_dir/summary.txt"
+    fi
+
+    echo ""
+    echo "=== Downloaded Files ==="
+    ls -la "$output_dir"
+    echo ""
+    log_info "Use best config: python src/main.py $output_dir/rank_1.json"
+}
+
 cmd_all() {
     log_info "Running full deployment pipeline"
 
@@ -632,9 +673,10 @@ show_help() {
     echo "  logs        Tail logs from instance"
     echo "  status      Check instance status"
     echo "  stop        Stop running optimization"
-    echo "  results     Show results summary from latest run"
-    echo "  download    Download results from instance"
-    echo "  all         Deploy, test, and run"
+    echo "  results       Show results summary from latest run"
+    echo "  download      Download all results from instance"
+    echo "  download-best Download only best configs + summary"
+    echo "  all           Deploy, test, and run"
     echo ""
     echo "Options:"
     echo "  --config FILE     Passivbot config file (default: configs/template.json)"
@@ -659,7 +701,7 @@ show_help() {
 COMMAND=""
 while [[ $# -gt 0 ]]; do
     case $1 in
-        setup|deploy|test|run|monitor|logs|status|stop|results|download|all)
+        setup|deploy|test|run|monitor|logs|status|stop|results|download|download-best|all)
             COMMAND="$1"
             shift
             ;;
@@ -728,6 +770,9 @@ case $COMMAND in
         ;;
     download)
         cmd_download
+        ;;
+    download-best)
+        cmd_download_best
         ;;
     all)
         cmd_all

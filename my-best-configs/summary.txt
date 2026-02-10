@@ -1,0 +1,83 @@
+============================================================
+META-OPTIMIZATION RESULTS SUMMARY
+============================================================
+
+Total configurations evaluated: 500
+Configurations passing thresholds: 436
+
+TOP 10 ROBUST CONFIGURATIONS
+----------------------------------------
+
+Rank 1:
+  Hash: 9c825b4c75e99089...
+  Overall Score: 0.9135
+  Mean ADG: 0.002040
+  Mean Sharpe: 0.82
+  Passes Thresholds: True
+
+Rank 2:
+  Hash: 1504a62f3af8cd13...
+  Overall Score: 0.9078
+  Mean ADG: 0.002028
+  Mean Sharpe: 0.71
+  Passes Thresholds: True
+
+Rank 3:
+  Hash: 6d15509dcfecd599...
+  Overall Score: 0.9073
+  Mean ADG: 0.002250
+  Mean Sharpe: 0.70
+  Passes Thresholds: True
+
+Rank 4:
+  Hash: 585b007a7d63fdc2...
+  Overall Score: 0.9037
+  Mean ADG: 0.002624
+  Mean Sharpe: 0.63
+  Passes Thresholds: True
+
+Rank 5:
+  Hash: 43590e2102db8545...
+  Overall Score: 0.9034
+  Mean ADG: 0.002319
+  Mean Sharpe: 0.63
+  Passes Thresholds: True
+
+Rank 6:
+  Hash: 468981bd3b575973...
+  Overall Score: 0.9027
+  Mean ADG: 0.002112
+  Mean Sharpe: 0.61
+  Passes Thresholds: True
+
+Rank 7:
+  Hash: 302204b9552f1dab...
+  Overall Score: 0.8993
+  Mean ADG: 0.002603
+  Mean Sharpe: 0.55
+  Passes Thresholds: True
+
+Rank 8:
+  Hash: 20a7f3947773fe1a...
+  Overall Score: 0.8990
+  Mean ADG: 0.002112
+  Mean Sharpe: 0.54
+  Passes Thresholds: True
+
+Rank 9:
+  Hash: 733f26396a330dee...
+  Overall Score: 0.8989
+  Mean ADG: 0.002184
+  Mean Sharpe: 0.54
+  Passes Thresholds: True
+
+Rank 10:
+  Hash: df749c4b91e57276...
+  Overall Score: 0.8982
+  Mean ADG: 0.002785
+  Mean Sharpe: 0.53
+  Passes Thresholds: True
+
+============================================================
+END OF SUMMARY
+============================================================

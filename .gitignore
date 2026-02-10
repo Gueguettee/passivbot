@@ -376,7 +376,6 @@ Cargo.lock
 /backtests
 /historical_data
 /results*
-/configs
 /reports
 /api-keys.json
 /caches
@@ -389,3 +388,5 @@ Cargo.lock
 **/.env
 meta_optimizer/.env
 meta_results/
+
+nul
