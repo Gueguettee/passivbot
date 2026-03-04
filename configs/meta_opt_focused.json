@@ -6,7 +6,7 @@
     "btc_collateral_ltv_cap": null,
     "combine_ohlcvs": true,
     "compress_cache": true,
-    "end_date": "2026-02-06",
+    "end_date": "2026-02-11",
     "exchanges": [
       "binance"
     ],
@@ -14,7 +14,7 @@
     "gap_tolerance_ohlcvs_minutes": 120,
     "maker_fee_override": null,
     "max_warmup_minutes": 0,
-    "start_date": "2024-12-01",
+    "start_date": "2021-11-01",
     "starting_balance": 100000,
     "suite": {
       "aggregate": {
@@ -42,7 +42,6 @@
             "BTC",
             "DOGE",
             "ETH",
-            "HYPE",
             "LINK",
             "SOL",
             "TRX",
@@ -57,8 +56,6 @@
             "HBAR",
             "LTC",
             "SHIB",
-            "SUI",
-            "TON",
             "UNI",
             "XLM",
             "XMR",
@@ -71,7 +68,6 @@
             "AVAX",
             "BTC",
             "DOGE",
-            "HYPE",
             "LINK",
             "SHIB",
             "SOL",
@@ -91,8 +87,6 @@
             "ETH",
             "HBAR",
             "LTC",
-            "SUI",
-            "TON",
             "TRX",
             "XLM"
           ],
@@ -152,13 +146,10 @@
         "DOT",
         "ETH",
         "HBAR",
-        "HYPE",
         "LINK",
         "LTC",
         "SHIB",
         "SOL",
-        "SUI",
-        "TON",
         "TRX",
         "UNI",
         "XLM",
@@ -252,52 +243,46 @@
   "live": {
     "approved_coins": {
       "long": [
-        "BTC",
-        "ETH",
-        "XRP",
+        "ADA",
+        "AVAX",
+        "BCH",
         "BNB",
+        "BTC",
+        "DOGE",
+        "DOT",
+        "ETH",
+        "HBAR",
+        "LINK",
+        "LTC",
+        "SHIB",
         "SOL",
         "TRX",
-        "DOGE",
-        "ADA",
-        "HYPE",
-        "BCH",
-        "LINK",
-        "XLM",
-        "ZEC",
-        "LTC",
-        "XMR",
-        "HBAR",
-        "AVAX",
-        "SUI",
-        "SHIB",
-        "TON",
         "UNI",
-        "DOT"
+        "XLM",
+        "XMR",
+        "XRP",
+        "ZEC"
       ],
       "short": [
-        "BTC",
-        "ETH",
-        "XRP",
+        "ADA",
+        "AVAX",
+        "BCH",
         "BNB",
+        "BTC",
+        "DOGE",
+        "DOT",
+        "ETH",
+        "HBAR",
+        "LINK",
+        "LTC",
+        "SHIB",
         "SOL",
         "TRX",
-        "DOGE",
-        "ADA",
-        "HYPE",
-        "BCH",
-        "LINK",
-        "XLM",
-        "ZEC",
-        "LTC",
-        "XMR",
-        "HBAR",
-        "AVAX",
-        "SUI",
-        "SHIB",
-        "TON",
         "UNI",
-        "DOT"
+        "XLM",
+        "XMR",
+        "XRP",
+        "ZEC"
       ]
     },
     "auto_gs": true,
@@ -457,8 +442,8 @@
         2880
       ],
       "long_n_positions": [
-        12,
-        22,
+        8,
+        19,
         1
       ],
       "long_risk_twel_enforcer_threshold": [
@@ -654,38 +639,38 @@
       {
         "metric": "drawdown_worst_btc",
         "penalize_if": "greater_than",
-        "value": 0.9
+        "value": 0.85
       },
       {
         "metric": "drawdown_worst_usd",
         "penalize_if": "greater_than",
-        "value": 0.9
+        "value": 0.85
       },
       {
         "metric": "loss_profit_ratio",
         "penalize_if": "greater_than",
-        "value": 0.6
+        "value": 0.55
       },
       {
         "metric": "adg_pnl",
         "penalize_if": "less_than",
         "stat": "mean",
-        "value": 0.0007
+        "value": 0.0005
       },
       {
         "metric": "peak_recovery_hours_pnl",
         "penalize_if": "greater_than",
-        "value": 1344
+        "value": 2016
       },
       {
         "metric": "position_held_hours_max",
         "penalize_if": "greater_than",
-        "value": 1344
+        "value": 2016
       },
       {
         "metric": "position_unchanged_hours_max",
         "penalize_if": "greater_than",
-        "value": 840
+        "value": 1344
       }
     ],
     "mutation_eta": 20,

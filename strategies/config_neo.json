@@ -60,7 +60,7 @@
               "coins": {"combined": ["HYPE"]},
               "combine_ohlcvs": true,
               "compress_cache": true,
-              "end_date": "2026-01-13",
+              "end_date": "2026-03-03",
               "exchanges": ["bybit", "hyperliquid"],
               "gap_tolerance_ohlcvs_minutes": 120,
               "start_date": "2025-01-01",
