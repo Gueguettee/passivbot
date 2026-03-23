@@ -32,5 +32,20 @@ services:
       - ./configs/:/app/configs/
       - ./api-keys.json:/app/api-keys.json
     working_dir: /app
-    # command: python src/main.py configs/template.json
-    
+    command: ["python", "src/main.py", "configs/live_rank1_hype.json"]
+
+  passivbot-live-hl:
+    profiles:
+     - live-hl
+    build:
+      context: .
+      dockerfile: Dockerfile_live
+    image: passivbot-live:latest
+    container_name: passivbot-live-hl
+    restart: unless-stopped
+    volumes:
+      - ./configs/:/app/configs/
+      - ./api-keys.json:/app/api-keys.json
+    working_dir: /app
+    command: ["python", "src/main.py", "configs/live_rank1_hype_hl.json"]
+

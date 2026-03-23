@@ -1,10 +1,24 @@
 #!/bin/bash
+# Passivbot Live Deployment Script
+# Inspired by cBot-Project-Gueguette/deploy.sh
+#
+# Usage:
+#   ./deploy.sh deploy      Sync code, build Docker image, start live bot
+#   ./deploy.sh stop        Stop the live bot container
+#   ./deploy.sh restart     Stop then redeploy
+#   ./deploy.sh logs [-f]   View logs (use -f to follow, -n NUM for line count)
+#   ./deploy.sh status      Check container status and resource usage
+#   ./deploy.sh connect     SSH into the remote server
+#
+# Add --hl to any command to target Hyperliquid instead of Binance:
+#   ./deploy.sh deploy --hl
+#   ./deploy.sh logs -f --hl
+
+set -e
 
 # --- Configuration ---
-# Load environment variables from .env file
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/.env" ]; then
-    # Use sed to strip Windows carriage returns before sourcing
     source <(sed 's/\r$//' "$SCRIPT_DIR/.env")
 else
     echo "Error: .env file not found. Copy .env.example to .env and fill in your values."
@@ -13,120 +27,204 @@ fi
 
 # Validate required variables
 if [ -z "$REMOTE_USER" ] || [ -z "$REMOTE_HOST" ] || [ -z "$SSH_KEY_PATH" ]; then
-    echo "Error: Missing required environment variables. Check your .env file."
+    echo "Error: Missing required environment variables (REMOTE_USER, REMOTE_HOST, SSH_KEY_PATH)."
+    echo "Check your .env file."
     exit 1
 fi
 
-# Default values for optional variables
 REMOTE_DIR="${REMOTE_DIR:-~/passivbot}"
-PASSIVBOT_ARGS="python src/optimize.py strategies/hype_top_4pairs.json"
-CONTAINER_NAME="passivbot_optimize"
+SSH_OPTS="-o ServerAliveInterval=60 -o ServerAliveCountMax=120"
+
+# Exchange selection: pass --hl anywhere to target Hyperliquid
+EXCHANGE="binance"
+for arg in "$@"; do
+    if [ "$arg" == "--hl" ]; then
+        EXCHANGE="hyperliquid"
+    fi
+done
+
+if [ "$EXCHANGE" == "hyperliquid" ]; then
+    CONTAINER_NAME="passivbot-live-hl"
+    LIVE_CONFIG="configs/live_rank1_hype_hl.json"
+    DOCKER_PROFILE="live-hl"
+else
+    CONTAINER_NAME="passivbot-live"
+    LIVE_CONFIG="configs/live_rank1_hype.json"
+    DOCKER_PROFILE="live"
+fi
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'
+NC='\033[0m'
 
-# Determine mode: deploy (default) or check
-MODE="${1:-deploy}"
+# Resolve SSH key path (handle Windows Git Bash / WSL)
+resolve_ssh_key() {
+    local key="$SSH_KEY_PATH"
+    # Expand $HOME / ~ if present
+    key="${key/#\~/$HOME}"
+    # If on Windows Git Bash and path starts with /c/, try Windows path
+    if [ ! -f "$key" ] && [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
+        local win_key="$USERPROFILE/.ssh/$(basename "$key")"
+        win_key="${win_key//\\//}"
+        if [ -f "$win_key" ]; then
+            key="$win_key"
+        fi
+    fi
+    echo "$key"
+}
 
-if [ "$MODE" == "deploy" ]; then
-    echo -e "${GREEN}[1/3] Syncing local code to remote server...${NC}"
-    # Using rsync to upload changes.
-    rsync -avz -e "ssh -i \"$SSH_KEY_PATH\"" \
+SSH_KEY="$(resolve_ssh_key)"
+if [ ! -f "$SSH_KEY" ]; then
+    echo -e "${RED}Error: SSH key not found at $SSH_KEY${NC}"
+    exit 1
+fi
+
+ssh_cmd() {
+    ssh -i "$SSH_KEY" $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "$@"
+}
+
+# --- Commands ---
+
+sync_to_remote() {
+    echo -e "${GREEN}[sync] Syncing code to $REMOTE_HOST...${NC}"
+    rsync -avz --delete \
+        -e "ssh -i \"$SSH_KEY\"" \
         --exclude '.git' \
         --exclude 'venv' \
         --exclude '__pycache__' \
         --exclude '*.pyc' \
-        --exclude 'backtests' \
         --exclude 'caches' \
         --exclude 'optimize_results' \
-        ./ "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR"
+        --exclude 'backtests' \
+        --exclude 'backtests_*' \
+        --exclude 'optimization_results_*' \
+        --exclude 'meta_optimizer' \
+        --exclude 'to_launch' \
+        --exclude '.env' \
+        --exclude '*.log' \
+        --exclude 'node_modules' \
+        "$SCRIPT_DIR/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/"
+    echo -e "${GREEN}[sync] Done.${NC}"
+}
 
-    echo -e "${GREEN}[2/3] Starting optimization in background...${NC}"
-    ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" << EOF
-        set -e
-        cd $REMOTE_DIR
-        
-        # Check and remove old container if exists
-        if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-             docker rm -f ${CONTAINER_NAME} > /dev/null
-        fi
-        
-        # Initialize results dirs if not exist to ensure permissions/existence
-        mkdir -p optimize_results configs backtests
-        
-        echo "Starting container: ${CONTAINER_NAME}"
-        # Start detached
-        docker compose run -d --name ${CONTAINER_NAME} passivbot $PASSIVBOT_ARGS
-EOF
+do_deploy() {
+    sync_to_remote
 
-    echo -e "${GREEN}[3/3] Optimization started. Logs will follow for 30 seconds.${NC}"
-    echo -e "${YELLOW}Press Ctrl+C to stop watching logs (optimization will continue).${NC}"
-    
-    # Stream logs with timeout. The || true prevents script failure on meaningful exit codes from timeout/ssh
-    ssh -t -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "timeout 30s docker logs -f ${CONTAINER_NAME}" || true
-    
-    echo -e "\n${GREEN}Deployment complete. Optimization running in background.${NC}"
-    echo "Use './deploy.sh check' to check status and retrieve results."
+    echo -e "${GREEN}[build] Building Docker image on server...${NC}"
+    ssh_cmd -t "
+        cd \"$REMOTE_DIR\"
+        docker compose --profile $DOCKER_PROFILE build
+    "
 
-elif [ "$MODE" == "check" ]; then
-    echo -e "${GREEN}Checking optimization status...${NC}"
-    
-    # Check if running
-    IS_RUNNING=$(ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "docker ps --format '{{.Names}}' | grep -q '^${CONTAINER_NAME}$' && echo 'yes' || echo 'no'")
-    
-    if [ "$IS_RUNNING" == "yes" ]; then
-        echo -e "${YELLOW}Optimization '${CONTAINER_NAME}' is still running.${NC}"
-        echo "To view logs: ssh -i \"$SSH_KEY_PATH\" $REMOTE_USER@$REMOTE_HOST \"docker logs -f --tail 100 ${CONTAINER_NAME}\""
-    else
-        echo -e "${GREEN}Optimization finished. Downloading results...${NC}"
-        
-        ZIP_FILE="/tmp/passivbot_results_$$.zip"
-        LINUX_TEMP_DIR="/tmp/passivbot_extract_$$"
-        # Folders to retrieve
-        FILES_TO_RETRIEVE=("configs" "backtests" "optimize_results")
-        
-        # Create zip on remote
-        echo "Zipping remote files..."
-        ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR && zip -r /tmp/retrieved_results.zip ${FILES_TO_RETRIEVE[*]} -x \"*placeholder*\" || true"
-        
-        # SCP download
-        echo "Downloading..."
-        scp -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST:/tmp/retrieved_results.zip" "$ZIP_FILE"
-        
-        # Clean remote
-        ssh -i "$SSH_KEY_PATH" "$REMOTE_USER@$REMOTE_HOST" "rm -f /tmp/retrieved_results.zip"
-        
-        # Unzip locally
-        echo "Extracting..."
-        mkdir -p "$LINUX_TEMP_DIR"
-        unzip -o "$ZIP_FILE" -d "$LINUX_TEMP_DIR"
-        
-        # Sync to workspace using robocopy logic from original script
-        echo "Merging files into workspace..."
-        
-        for ITEM in "${FILES_TO_RETRIEVE[@]}"; do
-            SRC="$LINUX_TEMP_DIR/$ITEM"
-            DEST="$(pwd)/$ITEM"
-            
-            if [ -d "$SRC" ]; then
-                # Convert to Windows path for robocopy (assumes WSL environment)
-                WIN_SRC=$(wslpath -w "$SRC")
-                WIN_DEST=$(wslpath -w "$DEST")
-                echo "Syncing $ITEM..."
-                cmd.exe /c "robocopy $WIN_SRC $WIN_DEST /E /NFL /NDL /NJH /NJS /NC /NS" || true
-            fi
-        done
-        
-        # Cleanup local
-        rm -rf "$LINUX_TEMP_DIR"
-        rm -f "$ZIP_FILE"
-        
-        echo -e "${GREEN}Done! Results updated in workspace.${NC}"
-    fi
+    echo -e "${GREEN}[start] Starting live bot...${NC}"
+    ssh_cmd "
+        cd \"$REMOTE_DIR\"
+        # Stop existing container if running
+        docker compose --profile $DOCKER_PROFILE down --remove-orphans 2>/dev/null || true
+        docker compose --profile $DOCKER_PROFILE up -d
+    "
 
-else
-    echo "Usage: ./deploy.sh [deploy|check]"
-    echo "  deploy : Sync code, start optimization detached, watch logs briefly. (Default)"
-    echo "  check  : Check status. If finished, download results."
-fi
+    echo -e "${GREEN}[logs] Showing initial logs (30s)...${NC}"
+    echo -e "${YELLOW}Press Ctrl+C to stop watching (bot continues running).${NC}"
+    ssh_cmd -t "timeout 30s docker logs -f $CONTAINER_NAME 2>&1" || true
+
+    echo ""
+    echo -e "${GREEN}Deployment complete. Bot running in background.${NC}"
+    echo "  ./deploy.sh logs -f    Follow logs"
+    echo "  ./deploy.sh status     Check status"
+    echo "  ./deploy.sh stop       Stop bot"
+}
+
+do_stop() {
+    echo -e "${YELLOW}[stop] Stopping live bot...${NC}"
+    ssh_cmd "
+        cd \"$REMOTE_DIR\"
+        docker compose --profile $DOCKER_PROFILE down --remove-orphans
+    "
+    echo -e "${GREEN}Bot stopped.${NC}"
+}
+
+do_restart() {
+    do_stop
+    do_deploy
+}
+
+do_logs() {
+    shift  # remove 'logs' from args
+    local follow=""
+    local lines="100"
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--follow) follow="-f"; shift ;;
+            -n|--lines) lines="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    echo -e "${GREEN}[logs] Fetching logs from $REMOTE_HOST...${NC}"
+    ssh_cmd -t "docker logs --tail=$lines $follow $CONTAINER_NAME 2>&1" || true
+}
+
+do_status() {
+    echo -e "${GREEN}[status] Checking live bot on $REMOTE_HOST...${NC}"
+    ssh_cmd "
+        cd \"$REMOTE_DIR\"
+        echo ''
+        echo '=== Docker Containers ==='
+        docker compose --profile $DOCKER_PROFILE ps
+        echo ''
+        echo '=== Resource Usage ==='
+        docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' 2>/dev/null || echo '(no running containers)'
+        echo ''
+        echo '=== Config ==='
+        echo 'Config: $LIVE_CONFIG'
+        echo ''
+        echo '=== Disk Usage ==='
+        df -h / | tail -1
+    "
+}
+
+do_connect() {
+    echo -e "${GREEN}[connect] Connecting to $REMOTE_HOST...${NC}"
+    ssh -i "$SSH_KEY" -t "$REMOTE_USER@$REMOTE_HOST" "cd \"$REMOTE_DIR\" && exec \$SHELL -l"
+}
+
+# --- Main ---
+MODE="${1:-help}"
+
+case "$MODE" in
+    deploy)
+        do_deploy
+        ;;
+    stop)
+        do_stop
+        ;;
+    restart)
+        do_restart
+        ;;
+    logs)
+        do_logs "$@"
+        ;;
+    status)
+        do_status
+        ;;
+    connect)
+        do_connect
+        ;;
+    *)
+        echo "Passivbot Live Deployment"
+        echo ""
+        echo "Usage: $0 <command> [options]"
+        echo ""
+        echo "Commands:"
+        echo "  deploy       Sync code, build Docker image, start live bot"
+        echo "  stop         Stop the live bot container"
+        echo "  restart      Stop then redeploy"
+        echo "  logs [-f]    View logs (use -f to follow, -n NUM for line count)"
+        echo "  status       Check container status and resource usage"
+        echo "  connect      SSH into the remote server"
+        echo ""
+        echo "Options:"
+        echo "  --hl         Target Hyperliquid instead of Binance"
+        ;;
+esac

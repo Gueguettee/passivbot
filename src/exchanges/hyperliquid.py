@@ -296,6 +296,31 @@ class HyperliquidBot(CCXTBot):
         balance = float(info["info"]["marginSummary"]["accountValue"]) - sum(
             [float(x["position"]["unrealizedPnl"]) for x in info["info"]["assetPositions"]]
         )
+        # Unified Account mode: perps accountValue may be 0 while funds are in spot.
+        # Fall back to spot USDC balance if perps balance is zero.
+        if balance == 0.0:
+            try:
+                import aiohttp
+
+                url = self._hl_info_url()
+                payload = {
+                    "type": "spotClearinghouseState",
+                    "user": self.user_info["wallet_address"],
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload) as resp:
+                        spot_data = await resp.json()
+                for b in spot_data.get("balances", []):
+                    if b.get("coin") == "USDC":
+                        spot_balance = float(b.get("total", 0))
+                        if spot_balance > 0:
+                            logging.info(
+                                f"[balance] Unified Account: using spot USDC balance: {spot_balance}"
+                            )
+                            balance = spot_balance
+                        break
+            except Exception as e:
+                logging.warning(f"[balance] Failed to fetch spot balance fallback: {e}")
         return list(positions.values()), balance
 
     async def _get_positions_and_balance_cached(self, my_gen: int = 0):

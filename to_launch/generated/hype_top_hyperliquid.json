@@ -9,13 +9,13 @@
         "base_dir": "backtests/opt_hype_top_hyperliquid",
         "combine_ohlcvs": true,
         "compress_cache": true,
-        "end_date": "2026-03-11",
+        "end_date": "2026-03-23",
         "exchanges": [
             "hyperliquid"
         ],
         "filter_by_min_effective_cost": false,
         "gap_tolerance_ohlcvs_minutes": 120,
-        "start_date": "2021-01-01",
+        "start_date": "2024-12-05",
         "starting_balance": 1000,
         "btc_collateral_cap": 0.0,
         "btc_collateral_ltv_cap": null,
