@@ -140,6 +140,66 @@ def test_save_shard_writes_index_and_shard(tmp_path):
     assert date_key in idx_1h["shards"]
 
 
+def test_rebuild_index_for_range_updates_and_prunes(tmp_path):
+    cm = CandlestickManager(exchange=None, exchange_name="ex", cache_dir=str(tmp_path / "caches"))
+    symbol = "REBUILD/USDT"
+    base = 1725590400000  # 2024-09-06 00:00:00 UTC
+    date_key0 = cm._date_key(base)
+    date_key1 = cm._date_key(base + 24 * 60 * 60 * 1000)
+    day0_start, day0_end = cm._date_range_of_key(date_key0)
+    day1_start, day1_end = cm._date_range_of_key(date_key1)
+
+    # Create a real shard for day0 with minimal data
+    arr = np.array(
+        [
+            (day0_start, 1.0, 2.0, 0.5, 1.5, 0.1),
+            (day0_start + ONE_MIN_MS, 1.1, 2.1, 0.6, 1.6, 0.2),
+        ],
+        dtype=CANDLE_DTYPE,
+    )
+    shard_path0 = cm._shard_path(symbol, date_key0)
+    os.makedirs(os.path.dirname(shard_path0), exist_ok=True)
+    np.save(shard_path0, arr)
+
+    # Write a corrupted index: wrong metadata + a missing shard entry + future last_refresh
+    idx_path = cm._index_path(symbol, timeframe="1m")
+    os.makedirs(os.path.dirname(idx_path), exist_ok=True)
+    future_refresh = int(time.time() * 1000) + 10 * ONE_MIN_MS
+    bad_idx = {
+        "shards": {
+            date_key0: {
+                "path": shard_path0,
+                "min_ts": 0,
+                "max_ts": 0,
+                "count": 0,
+                "crc32": 0,
+            },
+            date_key1: {
+                "path": cm._shard_path(symbol, date_key1),
+                "min_ts": 0,
+                "max_ts": 0,
+                "count": 0,
+                "crc32": 0,
+            },
+        },
+        "meta": {"last_refresh_ms": future_refresh},
+    }
+    with open(idx_path, "w", encoding="utf-8") as f:
+        json.dump(bad_idx, f)
+
+    res = cm.rebuild_index_for_range(symbol, day0_start, day1_end, timeframe="1m", log_level="debug")
+    idx = cm._ensure_symbol_index(symbol, tf="1m")
+
+    assert date_key0 in idx["shards"]
+    assert date_key1 not in idx["shards"]
+    info = idx["shards"][date_key0]
+    assert info["count"] == int(arr.shape[0])
+    assert info["min_ts"] == int(arr[0]["ts"])
+    assert info["max_ts"] == int(arr[-1]["ts"])
+    assert idx["meta"]["last_refresh_ms"] == 0
+    assert res["updated"] >= 1
+
+
 @pytest.mark.asyncio
 async def test_zero_candles_not_persisted(tmp_path):
     cm = CandlestickManager(exchange=None, exchange_name="ex", cache_dir=str(tmp_path / "caches"))
@@ -229,7 +289,16 @@ async def test_get_latest_ema_metrics_calls_get_candles_once_and_caches(monkeypa
     calls = {"n": 0}
 
     async def fake_get_candles(
-        symbol_, *, start_ts=None, end_ts=None, max_age_ms=None, strict=False, timeframe=None, tf=None, fill_leading_gaps=False
+        symbol_,
+        *,
+        start_ts=None,
+        end_ts=None,
+        max_age_ms=None,
+        strict=False,
+        timeframe=None,
+        tf=None,
+        fill_leading_gaps=False,
+        max_lookback_candles=None,
     ):
         calls["n"] += 1
         return arr
@@ -492,8 +561,12 @@ async def test_get_current_close_primes_ttl_for_candles(monkeypatch, tmp_path):
 
     # Return a single current-minute candle via low-level OHLCV fetch used by get_current_close
     async def fake_once(symbol_, since_ms, limit, end_exclusive_ms=None, timeframe=None):
-        ts = int((fixed_now_ms // ONE_MIN_MS) * ONE_MIN_MS)
-        return [[ts, 1.0, 1.0, 1.0, 1.23, 1.0]]
+        end_current = int((fixed_now_ms // ONE_MIN_MS) * ONE_MIN_MS)
+        start = end_current - ONE_MIN_MS * 11
+        rows = []
+        for ts in range(start, end_current, ONE_MIN_MS):
+            rows.append([ts, 1.0, 1.0, 1.0, 1.23, 1.0])
+        return rows
 
     monkeypatch.setattr(cm, "_fetch_ohlcv_paginated", fake_paginated)
     monkeypatch.setattr(cm, "_ccxt_fetch_ohlcv_once", fake_once)
@@ -501,13 +574,14 @@ async def test_get_current_close_primes_ttl_for_candles(monkeypatch, tmp_path):
     # 1) Call get_current_close: this should fetch/merge current-minute candle and update last_refresh_ms
     p = await cm.get_current_close(symbol, max_age_ms=60_000)
     assert p == pytest.approx(1.23)
+    baseline_calls = calls["paginated"]
 
     # 2) Call get_candles ending at latest finalized minute with TTL: should NOT call _fetch_ohlcv_paginated
     end_finalized = (fixed_now_ms // ONE_MIN_MS) * ONE_MIN_MS - ONE_MIN_MS
     start_ts = end_finalized - ONE_MIN_MS * 10
     out = await cm.get_candles(symbol, start_ts=start_ts, end_ts=end_finalized, max_age_ms=60_000)
     assert isinstance(out, np.ndarray)
-    assert calls["paginated"] == 0
+    assert calls["paginated"] == baseline_calls
 
     # No additional network calls expected here; TTL should prevent refresh
 
@@ -576,6 +650,113 @@ async def test_get_current_close_tail_fetch_merges_and_primes(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_get_candles_materializes_runtime_synthetic_after_long_no_fill_gap(
+    monkeypatch, tmp_path
+):
+    fixed_now_ms = 1725590400000  # 2024-09-06 00:00:00 UTC
+    monkeypatch.setattr("time.time", lambda: fixed_now_ms / 1000.0)
+
+    class _Ex:
+        id = "okx"
+
+    cm = CandlestickManager(exchange=_Ex(), exchange_name="okx", cache_dir=str(tmp_path / "caches"))
+    symbol = "KBONK/USDC:USDC"
+    end_finalized = _floor_minute(fixed_now_ms) - ONE_MIN_MS
+    old_ts = end_finalized - 6 * 60 * ONE_MIN_MS
+    old_close = 0.1234
+
+    seed = np.array([(old_ts, old_close, old_close, old_close, old_close, 1.0)], dtype=CANDLE_DTYPE)
+    cm._persist_batch(symbol, seed, timeframe="1m", merge_cache=True)
+    cm._cache.pop(symbol, None)  # simulate process restart (seed only on disk)
+
+    async def fake_fetch(symbol_, since_ms, end_exclusive_ms, *, timeframe=None, on_batch=None):
+        return np.empty((0,), dtype=CANDLE_DTYPE)
+
+    monkeypatch.setattr(cm, "_fetch_ohlcv_paginated", fake_fetch)
+
+    start_ts = end_finalized - 5 * ONE_MIN_MS
+    out = await cm.get_candles(
+        symbol,
+        start_ts=start_ts,
+        end_ts=end_finalized,
+        max_age_ms=30_000,
+        strict=False,
+    )
+
+    assert out.size == 6
+    assert list(out["ts"]) == [start_ts + i * ONE_MIN_MS for i in range(6)]
+    assert np.allclose(np.asarray(out["c"], dtype=np.float64), old_close)
+    assert np.allclose(np.asarray(out["bv"], dtype=np.float64), 0.0)
+
+    # Runtime synthetic candles must remain memory-only: shard still has only the original seed.
+    day_key = cm._date_key(old_ts)
+    shard = cm._load_shard(cm._shard_path(symbol, day_key, timeframe="1m"))
+    assert shard.size == 1
+
+
+def test_real_batch_overrides_runtime_synthetic_and_invalidates_ema_cache(tmp_path):
+    cm = CandlestickManager(exchange=None, exchange_name="ex", cache_dir=str(tmp_path / "caches"))
+    symbol = "ILLQ/USDT:USDT"
+    base_ts = _floor_minute(int(time.time() * 1000)) - 5 * ONE_MIN_MS
+    base_close = 11.0
+
+    seed = np.array(
+        [(base_ts, base_close, base_close, base_close, base_close, 1.0)], dtype=CANDLE_DTYPE
+    )
+    cm._cache[symbol] = seed
+    synthesized = cm._materialize_runtime_synthetic_gap(symbol, base_ts + 2 * ONE_MIN_MS)
+    assert synthesized == 2
+
+    cm._ema_cache[symbol] = {("close", 5.0, str(ONE_MIN_MS)): (base_close, base_ts, base_ts)}
+
+    real_ts = base_ts + ONE_MIN_MS
+    assert real_ts in cm._synthetic_timestamps.get(symbol, set())
+    real = np.array([(real_ts, 12.0, 12.5, 11.5, 12.2, 9.0)], dtype=CANDLE_DTYPE)
+    cm._persist_batch(symbol, real, timeframe="1m", merge_cache=True, last_refresh_ms=base_ts + 3_000)
+
+    arr = np.sort(cm._cache[symbol], order="ts")
+    i = int(np.where(arr["ts"] == real_ts)[0][0])
+    assert float(arr[i]["c"]) == pytest.approx(12.2)
+    assert float(arr[i]["bv"]) == pytest.approx(9.0)
+
+    assert symbol not in cm._ema_cache
+    assert real_ts not in cm._synthetic_timestamps.get(symbol, set())
+
+
+def test_materialize_runtime_synthetic_gap_caps_at_max_synth(tmp_path):
+    """Gap larger than 24*60 minutes should only synthesize the most recent 1440 candles."""
+    cm = CandlestickManager(exchange=None, exchange_name="ex", cache_dir=str(tmp_path / "caches"))
+    symbol = "DEAD/USDT:USDT"
+    # Place a seed candle 3 days (4320 minutes) before through_ts.
+    through_ts = _floor_minute(int(time.time() * 1000)) - 5 * ONE_MIN_MS
+    gap_minutes = 3 * 24 * 60  # 4320 minutes
+    seed_ts = through_ts - gap_minutes * ONE_MIN_MS
+    seed_close = 42.0
+
+    seed = np.array(
+        [(seed_ts, seed_close, seed_close, seed_close, seed_close, 1.0)], dtype=CANDLE_DTYPE
+    )
+    cm._cache[symbol] = seed
+
+    synthesized = cm._materialize_runtime_synthetic_gap(symbol, through_ts)
+
+    # max_synth caps at min(max_memory_candles_per_symbol, 24*60) = 1440
+    max_synth = min(cm.max_memory_candles_per_symbol, 24 * 60)
+    assert synthesized == max_synth
+
+    arr = np.sort(cm._cache[symbol], order="ts")
+    synth_only = arr[arr["ts"] > seed_ts]
+    assert synth_only.shape[0] == max_synth
+    # First synthetic candle should start at through_ts - (max_synth - 1) * ONE_MIN_MS
+    expected_first = through_ts - (max_synth - 1) * ONE_MIN_MS
+    assert int(synth_only[0]["ts"]) == expected_first
+    assert int(synth_only[-1]["ts"]) == through_ts
+    # All synthetic candles carry the seed close and zero volume
+    assert np.allclose(np.asarray(synth_only["c"], dtype=np.float64), seed_close)
+    assert np.allclose(np.asarray(synth_only["bv"], dtype=np.float64), 0.0)
+
+
+@pytest.mark.asyncio
 async def test_refresh_bounds_disk_load_range(monkeypatch, tmp_path):
     fixed_now_ms = 1725590400000  # 2024-09-06 00:00:00 UTC
     monkeypatch.setattr("time.time", lambda: fixed_now_ms / 1000.0)
@@ -612,8 +793,9 @@ async def test_refresh_bounds_disk_load_range(monkeypatch, tmp_path):
     disk_since = max(0, end_exclusive - lookback_candles * ONE_MIN_MS)
 
     assert calls
-    assert all(end == end_exclusive for _, end, _ in calls)
-    assert all(start >= disk_since for start, _, _ in calls)
+    refresh_window_calls = [(start, end, tf) for (start, end, tf) in calls if end == end_exclusive]
+    assert refresh_window_calls
+    assert all(start >= disk_since for start, _, _ in refresh_window_calls)
 
 
 # ----- Enhanced Gap Metadata Tests -----
@@ -767,10 +949,9 @@ async def test_force_refetch_gaps_clears_gaps(tmp_path):
 
     # Pre-populate cache to avoid network fetch
     base = 1000000
-    arr = np.array([
-        (base + i * ONE_MIN_MS, 1.0, 1.0, 1.0, 1.0, 1.0)
-        for i in range(20)
-    ], dtype=CANDLE_DTYPE)
+    arr = np.array(
+        [(base + i * ONE_MIN_MS, 1.0, 1.0, 1.0, 1.0, 1.0) for i in range(20)], dtype=CANDLE_DTYPE
+    )
     cm._cache[symbol] = arr
 
     # Call get_candles with force_refetch_gaps

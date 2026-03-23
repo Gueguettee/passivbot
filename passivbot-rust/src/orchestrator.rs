@@ -37,8 +37,8 @@ mod core {
         StateParams, TrailingPriceBundle,
     };
     use crate::utils::{
-        calc_new_psize_pprice, calc_order_price_diff_ask, calc_order_price_diff_bid,
-        calc_pside_price_diff_int, calc_wallet_exposure, round_, round_dn,
+        calc_new_psize_pprice, calc_order_price_diff_ask, calc_order_price_diff_bid, calc_pnl_long,
+        calc_pnl_short, calc_pside_price_diff_int, calc_wallet_exposure, round_, round_dn,
     };
     use serde::{Deserialize, Serialize};
 
@@ -93,6 +93,22 @@ mod core {
         },
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct LossGateBlock {
+        pub symbol_idx: usize,
+        pub pside: PositionSide,
+        pub order_type: OrderType,
+        pub qty: f64,
+        pub price: f64,
+        pub projected_pnl: f64,
+        pub balance_before: f64,
+        pub projected_balance_after: f64,
+        pub balance_peak: f64,
+        pub balance_floor: f64,
+        pub max_realized_loss_pct: f64,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case", deny_unknown_fields)]
     pub enum OrchestratorError {
@@ -117,6 +133,8 @@ mod core {
     #[serde(deny_unknown_fields)]
     pub struct OrchestratorDiagnostics {
         pub warnings: Vec<OrchestratorWarning>,
+        #[serde(default)]
+        pub loss_gate_blocks: Vec<LossGateBlock>,
     }
 
     #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -152,6 +170,16 @@ mod core {
         pub filter_by_min_effective_cost: bool,
         pub unstuck_allowance_long: f64,
         pub unstuck_allowance_short: f64,
+        /// Fraction of peak balance that may be realized as drawdown before lossy closes are blocked.
+        /// <=0 blocks all lossy closes; >=1 disables gating.
+        #[serde(default = "default_max_realized_loss_pct")]
+        pub max_realized_loss_pct: f64,
+        /// Gross realized pnl cumsum peak from fill history (statelessly reconstructed).
+        #[serde(default)]
+        pub realized_pnl_cumsum_max: f64,
+        /// Gross realized pnl cumsum current value from fill history.
+        #[serde(default)]
+        pub realized_pnl_cumsum_last: f64,
         /// If true, output orders are globally sorted by the canonical (live-bot) distance metric.
         /// Backtest does not require this global ordering and may disable it for performance.
         pub sort_global: bool,
@@ -165,6 +193,10 @@ mod core {
 
     fn default_hedge_mode() -> bool {
         true
+    }
+
+    fn default_max_realized_loss_pct() -> f64 {
+        1.0
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,11 +238,27 @@ mod core {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct OrchestratorInput {
+        /// Hysteresis-snapped balance used for sizing/order-shaping logic.
         pub balance: f64,
+        /// True/raw balance used for risk/accounting gates.
+        #[serde(default = "default_balance_raw")]
+        pub balance_raw: f64,
         pub global: OrchestratorGlobal,
         pub symbols: Vec<SymbolInput>,
         /// Backtest-only performance hint: allow next-only vs full-grid expansion.
         pub peek_hints: Option<super::EntryPeekHints>,
+    }
+
+    fn default_balance_raw() -> f64 {
+        f64::NAN
+    }
+
+    fn input_balance_raw(input: &OrchestratorInput) -> f64 {
+        if input.balance_raw.is_finite() {
+            input.balance_raw
+        } else {
+            input.balance
+        }
     }
 
     pub fn is_close_order_type(order_type: OrderType) -> bool {
@@ -229,6 +277,13 @@ mod core {
                 | CloseAutoReduceTwelShort
                 | ClosePanicShort
                 | CloseAutoReduceWelShort
+        )
+    }
+
+    fn is_panic_close_order_type(order_type: OrderType) -> bool {
+        matches!(
+            order_type,
+            OrderType::ClosePanicLong | OrderType::ClosePanicShort
         )
     }
 
@@ -590,6 +645,165 @@ mod core {
         }
         *closes = trimmed;
         enforce_no_dust_remainder(closes);
+    }
+
+    fn projected_close_pnl(
+        order: &IdealOrder,
+        pos: &Position,
+        exchange: &ExchangeParams,
+    ) -> Option<f64> {
+        const EPS: f64 = 1e-12;
+        if !order.price.is_finite() || order.price <= 0.0 {
+            return None;
+        }
+        if !pos.price.is_finite() || pos.price <= 0.0 {
+            return None;
+        }
+        if !exchange.c_mult.is_finite() || exchange.c_mult <= 0.0 {
+            return None;
+        }
+        match order.pside {
+            PositionSide::Long => {
+                let size_abs = pos.size.max(0.0);
+                if size_abs <= EPS || order.qty >= 0.0 {
+                    return None;
+                }
+                let close_qty = order.qty.abs().min(size_abs);
+                if close_qty <= EPS {
+                    return None;
+                }
+                Some(calc_pnl_long(
+                    pos.price,
+                    order.price,
+                    close_qty,
+                    exchange.c_mult,
+                ))
+            }
+            PositionSide::Short => {
+                let size_abs = pos.size.abs();
+                if size_abs <= EPS || order.qty <= 0.0 {
+                    return None;
+                }
+                let close_qty = order.qty.min(size_abs);
+                if close_qty <= EPS {
+                    return None;
+                }
+                Some(calc_pnl_short(
+                    pos.price,
+                    order.price,
+                    close_qty,
+                    exchange.c_mult,
+                ))
+            }
+        }
+    }
+
+    fn gate_lossy_closes_by_peak_balance(
+        input: &OrchestratorInput,
+        per_long: &mut [Option<PerSymbolOrders>],
+        per_short: &mut [Option<PerSymbolOrders>],
+        diagnostics: &mut OrchestratorDiagnostics,
+    ) {
+        let max_loss_pct = input.global.max_realized_loss_pct;
+        if !max_loss_pct.is_finite() || max_loss_pct >= 1.0 {
+            return;
+        }
+        let pct = max_loss_pct.max(0.0);
+        let balance_raw = input_balance_raw(input);
+        if !balance_raw.is_finite() || balance_raw <= 0.0 {
+            return;
+        }
+        let pnl_max = input.global.realized_pnl_cumsum_max;
+        let pnl_last = input.global.realized_pnl_cumsum_last;
+        if !pnl_max.is_finite() || !pnl_last.is_finite() {
+            return;
+        }
+        let balance_peak = balance_raw + (pnl_max - pnl_last);
+        if !balance_peak.is_finite() || balance_peak <= 0.0 {
+            return;
+        }
+        let balance_floor = balance_peak * (1.0 - pct);
+        if !balance_floor.is_finite() {
+            return;
+        }
+
+        for s in per_long.iter_mut().filter_map(|v| v.as_mut()) {
+            let exchange = match input.symbols.get(s.symbol_idx) {
+                Some(sym) => &sym.exchange,
+                None => continue,
+            };
+            let mut kept: Vec<IdealOrder> = Vec::with_capacity(s.closes.len());
+            for order in s.closes.drain(..) {
+                if !is_close_order_type(order.order_type)
+                    || is_panic_close_order_type(order.order_type)
+                {
+                    kept.push(order);
+                    continue;
+                }
+                let Some(projected_pnl) = projected_close_pnl(&order, &s.pos, exchange) else {
+                    kept.push(order);
+                    continue;
+                };
+                let projected_balance_after = balance_raw + projected_pnl;
+                if projected_pnl < 0.0 && projected_balance_after < balance_floor - 1e-12 {
+                    diagnostics.loss_gate_blocks.push(LossGateBlock {
+                        symbol_idx: order.symbol_idx,
+                        pside: order.pside,
+                        order_type: order.order_type,
+                        qty: order.qty,
+                        price: order.price,
+                        projected_pnl,
+                        balance_before: balance_raw,
+                        projected_balance_after,
+                        balance_peak,
+                        balance_floor,
+                        max_realized_loss_pct: pct,
+                    });
+                    continue;
+                }
+                kept.push(order);
+            }
+            s.closes = kept;
+        }
+
+        for s in per_short.iter_mut().filter_map(|v| v.as_mut()) {
+            let exchange = match input.symbols.get(s.symbol_idx) {
+                Some(sym) => &sym.exchange,
+                None => continue,
+            };
+            let mut kept: Vec<IdealOrder> = Vec::with_capacity(s.closes.len());
+            for order in s.closes.drain(..) {
+                if !is_close_order_type(order.order_type)
+                    || is_panic_close_order_type(order.order_type)
+                {
+                    kept.push(order);
+                    continue;
+                }
+                let Some(projected_pnl) = projected_close_pnl(&order, &s.pos, exchange) else {
+                    kept.push(order);
+                    continue;
+                };
+                let projected_balance_after = balance_raw + projected_pnl;
+                if projected_pnl < 0.0 && projected_balance_after < balance_floor - 1e-12 {
+                    diagnostics.loss_gate_blocks.push(LossGateBlock {
+                        symbol_idx: order.symbol_idx,
+                        pside: order.pside,
+                        order_type: order.order_type,
+                        qty: order.qty,
+                        price: order.price,
+                        projected_pnl,
+                        balance_before: balance_raw,
+                        projected_balance_after,
+                        balance_peak,
+                        balance_floor,
+                        max_realized_loss_pct: pct,
+                    });
+                    continue;
+                }
+                kept.push(order);
+            }
+            s.closes = kept;
+        }
     }
 
     fn compute_effective_n_positions(
@@ -1044,6 +1258,12 @@ mod core {
         if !input.balance.is_finite() {
             return Err(OrchestratorError::NonFiniteInput {
                 field: "balance",
+                symbol_idx: None,
+            });
+        }
+        if input.balance_raw.is_infinite() {
+            return Err(OrchestratorError::NonFiniteInput {
+                field: "balance_raw",
                 symbol_idx: None,
             });
         }
@@ -1936,7 +2156,7 @@ mod core {
             });
         }
         if let Some((idx, side, order)) = calc_unstucking_action(
-            input.balance,
+            input_balance_raw(input),
             input.global.unstuck_allowance_long,
             input.global.unstuck_allowance_short,
             &workspace.unstuck_inputs,
@@ -2008,7 +2228,7 @@ mod core {
                     .long
                     .total_wallet_exposure_limit,
                 enp_long,
-                input.balance,
+                input_balance_raw(input),
                 &workspace.twel_positions,
                 None,
             );
@@ -2064,7 +2284,7 @@ mod core {
                     .short
                     .total_wallet_exposure_limit,
                 enp_short,
-                input.balance,
+                input_balance_raw(input),
                 &workspace.twel_positions,
                 None,
             );
@@ -2103,6 +2323,9 @@ mod core {
             );
         }
 
+        // Global realized-loss gate for close orders (all close types except panic).
+        gate_lossy_closes_by_peak_balance(input, per_long, per_short, &mut diagnostics);
+
         // Portfolio TWEL gating of entries per pside (reuse workspace buffers).
         workspace.gate_positions_long.clear();
         workspace.gate_positions_short.clear();
@@ -2132,7 +2355,7 @@ mod core {
             }
             gate_entries_by_twel_deterministic(
                 PositionSide::Long,
-                input.balance,
+                input_balance_raw(input),
                 input
                     .global
                     .global_bot_params
@@ -2166,7 +2389,7 @@ mod core {
             }
             gate_entries_by_twel_deterministic(
                 PositionSide::Short,
-                input.balance,
+                input_balance_raw(input),
                 input
                     .global
                     .global_bot_params
@@ -2355,10 +2578,14 @@ mod core {
 
             let input = OrchestratorInput {
                 balance: 1000.0,
+                balance_raw: 1000.0,
                 global: OrchestratorGlobal {
                     filter_by_min_effective_cost: false,
                     unstuck_allowance_long: 0.0,
                     unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
                     sort_global: true,
                     global_bot_params: {
                         let mut pair = BotParamsPair::default();
@@ -2441,10 +2668,14 @@ mod core {
 
             let input = OrchestratorInput {
                 balance: 1000.0,
+                balance_raw: 1000.0,
                 global: OrchestratorGlobal {
                     filter_by_min_effective_cost: false,
                     unstuck_allowance_long: 0.0,
                     unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
                     sort_global: true,
                     global_bot_params: global_bp,
                     hedge_mode: true,
@@ -2469,10 +2700,14 @@ mod core {
 
             let input = OrchestratorInput {
                 balance: 1000.0,
+                balance_raw: 1000.0,
                 global: OrchestratorGlobal {
                     filter_by_min_effective_cost: false,
                     unstuck_allowance_long: 0.0,
                     unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
                     sort_global: true,
                     global_bot_params: global_bp,
                     hedge_mode: false,
@@ -2506,10 +2741,14 @@ mod core {
 
             let input = OrchestratorInput {
                 balance: 1000.0,
+                balance_raw: 1000.0,
                 global: OrchestratorGlobal {
                     filter_by_min_effective_cost: false,
                     unstuck_allowance_long: 0.0,
                     unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
                     sort_global: true,
                     global_bot_params: global_bp,
                     hedge_mode: false,
@@ -2533,7 +2772,7 @@ mod core {
 
         #[test]
         fn non_contiguous_symbol_idx_is_rejected() {
-            let mut sym0 = make_basic_symbol(0);
+            let sym0 = make_basic_symbol(0);
             let mut sym1 = make_basic_symbol(0);
             sym1.order_book = OrderBook {
                 bid: 101.0,
@@ -2548,10 +2787,14 @@ mod core {
 
             let input = OrchestratorInput {
                 balance: 1000.0,
+                balance_raw: 1000.0,
                 global: OrchestratorGlobal {
                     filter_by_min_effective_cost: false,
                     unstuck_allowance_long: 0.0,
                     unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
                     sort_global: true,
                     global_bot_params: global_bp,
                     hedge_mode: true,
@@ -2652,10 +2895,14 @@ mod core {
 
             let input = OrchestratorInput {
                 balance: 1_000_000.0,
+                balance_raw: 1_000_000.0,
                 global: OrchestratorGlobal {
                     filter_by_min_effective_cost: false,
                     unstuck_allowance_long: 0.0,
                     unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
                     sort_global: true,
                     global_bot_params: global_bp,
                     hedge_mode: true,
@@ -2837,6 +3084,343 @@ mod core {
         }
 
         #[test]
+        fn realized_loss_gate_blocks_auto_reduce_orders() {
+            let mut sym = make_basic_symbol(0);
+            sym.long.position = Position {
+                size: 10.0,
+                price: 100.0,
+            };
+            sym.order_book = OrderBook {
+                bid: 80.0,
+                ask: 80.0,
+            };
+            sym.long.bot_params.wallet_exposure_limit = 0.5;
+            sym.long.bot_params.risk_wel_enforcer_threshold = 1.0;
+            sym.long.bot_params.total_wallet_exposure_limit = 1.0;
+            sym.long.bot_params.n_positions = 1;
+
+            let mut global_bp = BotParamsPair::default();
+            global_bp.long.total_wallet_exposure_limit = 1.0;
+            global_bp.long.n_positions = 1;
+
+            let input_open = OrchestratorInput {
+                balance: 1000.0,
+                balance_raw: 1000.0,
+                global: OrchestratorGlobal {
+                    filter_by_min_effective_cost: false,
+                    unstuck_allowance_long: 0.0,
+                    unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
+                    sort_global: true,
+                    global_bot_params: global_bp.clone(),
+                    hedge_mode: true,
+                },
+                symbols: vec![sym.clone()],
+                peek_hints: None,
+            };
+            let out_open = compute_ideal_orders(&input_open).unwrap();
+            assert!(
+                out_open
+                    .orders
+                    .iter()
+                    .any(|o| o.order_type == OrderType::CloseAutoReduceWelLong),
+                "expected WEL auto-reduce order when gate is disabled"
+            );
+
+            let mut input_blocked = input_open.clone();
+            input_blocked.global.max_realized_loss_pct = 0.01;
+            let out_blocked = compute_ideal_orders(&input_blocked).unwrap();
+            assert!(
+                out_blocked
+                    .orders
+                    .iter()
+                    .all(|o| o.order_type != OrderType::CloseAutoReduceWelLong),
+                "expected WEL auto-reduce order to be blocked by realized-loss gate"
+            );
+            assert!(
+                out_blocked
+                    .diagnostics
+                    .loss_gate_blocks
+                    .iter()
+                    .any(|b| b.order_type == OrderType::CloseAutoReduceWelLong),
+                "expected loss-gate diagnostic for blocked auto-reduce order"
+            );
+        }
+
+        #[test]
+        fn realized_loss_gate_missing_balance_raw_falls_back_to_balance() {
+            let mut sym = make_basic_symbol(0);
+            sym.long.position = Position {
+                size: 10.0,
+                price: 100.0,
+            };
+            sym.order_book = OrderBook {
+                bid: 80.0,
+                ask: 80.0,
+            };
+            sym.long.bot_params.wallet_exposure_limit = 0.5;
+            sym.long.bot_params.risk_wel_enforcer_threshold = 1.0;
+            sym.long.bot_params.total_wallet_exposure_limit = 1.0;
+            sym.long.bot_params.n_positions = 1;
+
+            let mut global_bp = BotParamsPair::default();
+            global_bp.long.total_wallet_exposure_limit = 1.0;
+            global_bp.long.n_positions = 1;
+
+            let input = OrchestratorInput {
+                balance: 1000.0,
+                // Missing from JSON deserialization path defaults to NaN.
+                balance_raw: f64::NAN,
+                global: OrchestratorGlobal {
+                    filter_by_min_effective_cost: false,
+                    unstuck_allowance_long: 0.0,
+                    unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 0.01,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
+                    sort_global: true,
+                    global_bot_params: global_bp,
+                    hedge_mode: true,
+                },
+                symbols: vec![sym],
+                peek_hints: None,
+            };
+            let out = compute_ideal_orders(&input).unwrap();
+            assert!(
+                out.orders
+                    .iter()
+                    .all(|o| o.order_type != OrderType::CloseAutoReduceWelLong),
+                "expected missing balance_raw to fall back to snapped balance and gate closes"
+            );
+            assert!(
+                out.diagnostics
+                    .loss_gate_blocks
+                    .iter()
+                    .any(|b| b.order_type == OrderType::CloseAutoReduceWelLong
+                        && (b.balance_before - 1000.0).abs() < 1e-9),
+                "expected diagnostics to reflect snapped-balance fallback as balance_before"
+            );
+        }
+
+        #[test]
+        fn realized_loss_gate_non_positive_balance_raw_returns_early() {
+            for raw_balance in [0.0, -1.0] {
+                let mut sym = make_basic_symbol(0);
+                sym.long.position = Position {
+                    size: 10.0,
+                    price: 100.0,
+                };
+                sym.order_book = OrderBook {
+                    bid: 80.0,
+                    ask: 80.0,
+                };
+                sym.long.bot_params.wallet_exposure_limit = 0.5;
+                sym.long.bot_params.risk_wel_enforcer_threshold = 1.0;
+                sym.long.bot_params.total_wallet_exposure_limit = 1.0;
+                sym.long.bot_params.n_positions = 1;
+
+                let mut global_bp = BotParamsPair::default();
+                global_bp.long.total_wallet_exposure_limit = 1.0;
+                global_bp.long.n_positions = 1;
+
+                let input = OrchestratorInput {
+                    balance: 1000.0,
+                    balance_raw: raw_balance,
+                    global: OrchestratorGlobal {
+                        filter_by_min_effective_cost: false,
+                        unstuck_allowance_long: 0.0,
+                        unstuck_allowance_short: 0.0,
+                        max_realized_loss_pct: 0.01,
+                        realized_pnl_cumsum_max: 0.0,
+                        realized_pnl_cumsum_last: 0.0,
+                        sort_global: true,
+                        global_bot_params: global_bp,
+                        hedge_mode: true,
+                    },
+                    symbols: vec![sym],
+                    peek_hints: None,
+                };
+                let out = compute_ideal_orders(&input).unwrap();
+                assert!(
+                    out.orders
+                        .iter()
+                        .any(|o| o.order_type == OrderType::CloseAutoReduceWelLong),
+                    "expected non-positive balance_raw={} to early-return and keep close order",
+                    raw_balance
+                );
+                assert!(
+                    out.diagnostics.loss_gate_blocks.is_empty(),
+                    "expected non-positive balance_raw={} to skip loss-gate diagnostics",
+                    raw_balance
+                );
+            }
+        }
+
+        #[test]
+        fn twel_enforcer_uses_balance_raw_not_snapped() {
+            // Scenario: position has 500 cost, snapped balance = 1000 (WE = 0.5),
+            // raw balance = 800 (WE = 0.625). TWEL = 0.6, threshold = 1.0.
+            // With snapped: WE(0.5) < limit(0.6) → no auto-reduce.
+            // With raw:     WE(0.625) > limit(0.6) → triggers auto-reduce.
+            let mut sym = make_basic_symbol(0);
+            sym.long.position = Position {
+                size: 5.0,
+                price: 100.0,
+            };
+            sym.order_book = OrderBook {
+                bid: 100.0,
+                ask: 100.0,
+            };
+            // Keep WEL reducer inactive while leaving enough reducible size for TWEL reducer.
+            sym.long.bot_params.wallet_exposure_limit = 0.4;
+            sym.long.bot_params.risk_wel_enforcer_threshold = 2.0;
+            sym.long.bot_params.total_wallet_exposure_limit = 0.6;
+            sym.long.bot_params.n_positions = 1;
+
+            let mut global_bp = BotParamsPair::default();
+            global_bp.long.total_wallet_exposure_limit = 0.6;
+            global_bp.long.risk_twel_enforcer_threshold = 1.0;
+            global_bp.long.n_positions = 1;
+
+            let input = OrchestratorInput {
+                balance: 1000.0,    // snapped: WE = 500/1000 = 0.5 (under limit)
+                balance_raw: 800.0, // raw: WE = 500/800 = 0.625 (over limit)
+                global: OrchestratorGlobal {
+                    filter_by_min_effective_cost: false,
+                    unstuck_allowance_long: 0.0,
+                    unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
+                    sort_global: true,
+                    global_bot_params: global_bp,
+                    hedge_mode: true,
+                },
+                symbols: vec![sym],
+                peek_hints: None,
+            };
+            let out = compute_ideal_orders(&input).unwrap();
+            assert!(
+                out.orders
+                    .iter()
+                    .any(|o| o.order_type == OrderType::CloseAutoReduceTwelLong),
+                "TWEL enforcer should trigger using raw balance (WE=0.625 > 0.6), \
+                 not snapped balance (WE=0.5 < 0.6). Orders: {:?}",
+                out.orders.iter().map(|o| &o.order_type).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn twel_entry_gate_uses_balance_raw_not_snapped() {
+            // Scenario: no position, TWEL = 0.01 ($10 budget), entry qty*price = $20.
+            // With snapped balance = 1000: budget = $10, entry $20 gets trimmed/gated.
+            // With raw balance = 500: budget = $5, entry $20 gets trimmed even more.
+            // Verify the gating uses raw by checking the resulting entry qty.
+            let mut sym = make_basic_symbol(0);
+            sym.order_book = OrderBook {
+                bid: 100.0,
+                ask: 100.0,
+            };
+            sym.long.bot_params.wallet_exposure_limit = 1.0;
+            sym.long.bot_params.total_wallet_exposure_limit = 0.01;
+            sym.long.bot_params.n_positions = 1;
+            sym.long.bot_params.entry_initial_qty_pct = 1.0;
+            sym.exchange.qty_step = 0.001;
+            sym.exchange.min_qty = 0.001;
+
+            let mut global_bp = BotParamsPair::default();
+            global_bp.long.total_wallet_exposure_limit = 0.01;
+            global_bp.long.n_positions = 1;
+
+            // With raw balance 500: TWEL budget = 500*0.01 = $5, so max qty = 5/100 = 0.05
+            // With snapped balance 1000: TWEL budget = 1000*0.01 = $10, so max qty = 10/100 = 0.1
+            let input = OrchestratorInput {
+                balance: 1000.0,
+                balance_raw: 500.0,
+                global: OrchestratorGlobal {
+                    filter_by_min_effective_cost: false,
+                    unstuck_allowance_long: 0.0,
+                    unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
+                    sort_global: true,
+                    global_bot_params: global_bp,
+                    hedge_mode: true,
+                },
+                symbols: vec![sym],
+                peek_hints: None,
+            };
+            let out = compute_ideal_orders(&input).unwrap();
+            let entry_orders: Vec<_> = out
+                .orders
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o.order_type,
+                        OrderType::EntryGridNormalLong
+                            | OrderType::EntryInitialNormalLong
+                            | OrderType::EntryInitialPartialLong
+                    )
+                })
+                .collect();
+            if !entry_orders.is_empty() {
+                // If entries exist, their total cost must fit within raw balance budget ($5)
+                let total_cost: f64 = entry_orders.iter().map(|o| o.qty * o.price).sum();
+                assert!(
+                    total_cost <= 500.0 * 0.01 + 1e-6,
+                    "Entry cost {:.4} should be gated by raw balance budget (500*0.01=5), not snapped (1000*0.01=10)",
+                    total_cost
+                );
+            }
+        }
+
+        #[test]
+        fn realized_loss_gate_does_not_block_panic_orders() {
+            let mut sym = make_basic_symbol(0);
+            sym.long.mode = Some(TradingMode::Panic);
+            sym.long.position = Position {
+                size: 2.0,
+                price: 100.0,
+            };
+            sym.order_book = OrderBook {
+                bid: 50.0,
+                ask: 50.0,
+            };
+
+            let mut global_bp = BotParamsPair::default();
+            global_bp.long.total_wallet_exposure_limit = 1.0;
+            global_bp.long.n_positions = 1;
+
+            let input = OrchestratorInput {
+                balance: 1000.0,
+                balance_raw: 1000.0,
+                global: OrchestratorGlobal {
+                    filter_by_min_effective_cost: false,
+                    unstuck_allowance_long: 0.0,
+                    unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 0.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
+                    sort_global: true,
+                    global_bot_params: global_bp,
+                    hedge_mode: true,
+                },
+                symbols: vec![sym],
+                peek_hints: None,
+            };
+            let out = compute_ideal_orders(&input).unwrap();
+            assert_eq!(out.orders.len(), 1);
+            assert_eq!(out.orders[0].order_type, OrderType::ClosePanicLong);
+            assert!(
+                out.diagnostics.loss_gate_blocks.is_empty(),
+                "panic orders should bypass realized-loss gate"
+            );
+        }
+
+        #[test]
         fn panic_emits_single_close_only() {
             let mut sym = make_basic_symbol(0);
             sym.long.mode = Some(TradingMode::Panic);
@@ -2855,10 +3439,14 @@ mod core {
 
             let input = OrchestratorInput {
                 balance: 1000.0,
+                balance_raw: 1000.0,
                 global: OrchestratorGlobal {
                     filter_by_min_effective_cost: false,
                     unstuck_allowance_long: 1000.0,
                     unstuck_allowance_short: 1000.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
                     sort_global: true,
                     global_bot_params: global_bp,
                     hedge_mode: true,

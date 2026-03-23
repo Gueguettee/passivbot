@@ -55,7 +55,6 @@ from utils import (  # noqa: E402
 from metrics_schema import build_scenario_metrics, flatten_metric_stats  # noqa: E402
 from limit_utils import expand_limit_checks, compute_limit_violation  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Constants mirroring optimizer scoring preferences
 # ---------------------------------------------------------------------------
@@ -70,6 +69,10 @@ SHARED_METRIC_WEIGHTS = {
     "volume_pct_per_day_avg": -1.0,
     "volume_pct_per_day_avg_w": -1.0,
     "peak_recovery_hours_pnl": 1.0,
+    "high_exposure_hours_mean_long": 1.0,
+    "high_exposure_hours_max_long": 1.0,
+    "high_exposure_hours_mean_short": 1.0,
+    "high_exposure_hours_max_short": 1.0,
 }
 
 CURRENCY_METRIC_WEIGHTS = {

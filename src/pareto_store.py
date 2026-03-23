@@ -72,7 +72,21 @@ def _resolve_limit_value(
     return stats_flat.get(key)
 
 
-def _suite_metrics_to_stats(entry: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, float]]:
+def _resolve_aggregate_mode(metric: str, aggregate_cfg: Optional[Dict[str, str]]) -> str:
+    """Return the aggregate mode for *metric* given an aggregate config dict."""
+    if not aggregate_cfg:
+        return "mean"
+    mode = aggregate_cfg.get(metric)
+    if mode is None and "_" in metric:
+        base = metric.rsplit("_", 1)[0]
+        mode = aggregate_cfg.get(base)
+    return str(mode or aggregate_cfg.get("default", "mean")).lower()
+
+
+def _suite_metrics_to_stats(
+    entry: Dict[str, Any],
+    aggregate_cfg: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
     aggregated_values: Dict[str, float] = {}
     stats_flat: Dict[str, float] = {}
     suite_metrics = entry.get("suite_metrics") or {}
@@ -83,13 +97,20 @@ def _suite_metrics_to_stats(entry: Dict[str, Any]) -> Tuple[Dict[str, float], Di
                 stats_flat.update(flatten_metric_stats({metric: stats}))
             agg = payload.get("aggregated")
             if agg is None and stats:
-                agg = stats.get("mean")
+                mode = _resolve_aggregate_mode(metric, aggregate_cfg)
+                agg = stats.get(mode, stats.get("mean"))
             if agg is not None:
                 aggregated_values[metric] = agg
     elif "aggregate" in suite_metrics:
         aggregate = suite_metrics.get("aggregate") or {}
         agg_stats = aggregate.get("stats") or {}
         aggregated_values = aggregate.get("aggregated") or {}
+        if not aggregated_values and agg_stats and aggregate_cfg:
+            for metric, metric_stats in agg_stats.items():
+                mode = _resolve_aggregate_mode(metric, aggregate_cfg)
+                val = metric_stats.get(mode, metric_stats.get("mean"))
+                if val is not None:
+                    aggregated_values[metric] = val
         stats_flat = flatten_metric_stats(agg_stats)
     return stats_flat, aggregated_values
 
@@ -574,13 +595,17 @@ def main():
                 metric_names = entry.get("optimize", {}).get("scoring", [])
                 metric_name_map = {f"w_{i}": name for i, name in enumerate(metric_names)}
             metrics_block = entry.get("metrics", {}) or {}
-            objectives = metrics_block.get("objectives", metrics_block)
+            objectives = dict(metrics_block.get("objectives", metrics_block))
+            aggregate_cfg = entry.get("backtest", {}).get("aggregate")
             stats_flat: Dict[str, float] = {}
             aggregated_values: Dict[str, float] = {}
             if "stats" in metrics_block:
                 stats_flat = flatten_metric_stats(metrics_block["stats"])
             if "suite_metrics" in entry:
-                stats_flat_suite, aggregated_values_suite = _suite_metrics_to_stats(entry)
+                stats_flat_suite, aggregated_values_suite = _suite_metrics_to_stats(
+                    entry,
+                    aggregate_cfg=aggregate_cfg,
+                )
                 stats_flat.update(stats_flat_suite)
                 aggregated_values.update(aggregated_values_suite)
             if not w_keys:

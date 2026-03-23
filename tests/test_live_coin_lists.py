@@ -17,7 +17,7 @@ def test_add_to_coins_lists_skips_symbols_not_in_eligible_markets(caplog):
 
     bot.coin_to_symbol = fake_coin_to_symbol.__get__(bot, Passivbot)
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         bot.add_to_coins_lists(
             {"long": ["AAA", "BBB"], "short": []},
             "approved_coins",
@@ -32,8 +32,6 @@ def test_add_to_coins_lists_skips_symbols_not_in_eligible_markets(caplog):
     assert bot.approved_coins["long"] == {"AAA/USDT:USDT"}
     assert bot.approved_coins["short"] == set()
     warnings = [
-        rec.message
-        for rec in caplog.records
-        if rec.levelno >= logging.WARNING and "Skipping unsupported markets" in rec.message
+        rec.message for rec in caplog.records if "skipping unsupported markets" in rec.message.lower()
     ]
     assert len(warnings) == 1

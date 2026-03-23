@@ -7,45 +7,51 @@ This document provides an overview of the parameters found in `config/template.j
 - **base_dir**: Location to save backtest results.
 - **compress_cache**: Set to `true` to save disk space. Set to `false` for faster loading.
 - **end_date**: End date of backtest, e.g., `2024-06-23`. Set to `'now'` to use today's date as the end date.
-- **exchanges**: Exchanges from which to fetch 1m OHLCV data for backtesting and optimizing. The template ships with `['binance', 'bybit']`; additional exchanges can be wired up manually if you maintain your own archives.
-- **combine_ohlcvs**: When `true`, build a single “combined” dataset by taking the best-quality feed for each coin across all configured exchanges. When `false`, the backtester/optimizer runs each exchange independently.
-- **coin_sources**: Optional mapping of `coin -> exchange` used to override the automatic selection performed when `combine_ohlcvs` is `true`. Scenarios may add more overrides; conflicting assignments raise an error.
+- **exchanges**: Exchanges from which to fetch 1m OHLCV data for backtesting and optimizing. Supported exchanges: `binance`, `bybit`, `gateio`. The template ships with `['binance', 'bybit', 'gateio']`.  
+  **GateIO note:** If you have existing `caches/ohlcv/gateio` data from older builds, delete it so fresh data (normalized to base volume) is fetched.
+- **coin_sources**: Optional mapping of `coin -> exchange` used to override the automatic exchange selection when multiple exchanges are configured. Scenarios may add more overrides; conflicting assignments raise an error.
+- **ohlcv_source_dir**: Optional path to a pre-populated OHLCV directory to use before hitting exchange archives. Expected structure: `<dir>/<exchange>/1m/<coin_or_symbol>/YYYY-MM-DD.npz` or `.npy`. Coin keys are normalized to base coins, but CCXT-style symbol folder names are accepted (e.g., `ETH_USDC:USDC`).
+- **volume_normalization**: When `true` (default), normalize volume data across exchanges to make combined datasets comparable.
 - **start_date**: Start date of backtest.
 - **starting_balance**: Starting balance in USD at the beginning of the backtest.
 - **filter_by_min_effective_cost**: When `true`, skip coins whose projected initial entry
   (balance × wallet_exposure_limit × entry_initial_qty_pct, including WE excess allowance)
   would fall below the exchange’s effective minimum cost.
+- **dynamic_wel_by_tradability**: Backtest-only WEL denominator mode.  
+  - `true` (default): `wallet_exposure_limit = total_wallet_exposure_limit / min(n_positions, n_tradable_max)` where `n_tradable_max` is the highest number of coins that have had real candles at any timestep so far (non-shrinking).  
+  - `false`: fixed denominator, same as live: `wallet_exposure_limit = total_wallet_exposure_limit / n_positions`.
 - **maker_fee_override**: Optional maker fee override (part-per-one; use `0.0002` for 0.02%). Leave `null` to use the exchange-derived maker fees.
 - **balance_sample_divider**: Minutes per bucket when sampling balances/equity for
   `balance_and_equity.csv` and related plots. `1` keeps full per-minute resolution; higher values
   thin out the series (e.g., `15` stores one point every 15 minutes) to reduce file sizes.
 - **btc_collateral_cap**: Target (and ceiling) share of account equity to hold in BTC collateral. `0` keeps the account fully in USD; `1.0` mirrors the legacy 100% BTC mode; values `>1` allow leveraged BTC collateral, accepting negative USD balances.
 - **btc_collateral_ltv_cap**: Optional loan-to-value ceiling (`USD debt ÷ equity`) enforced when topping up BTC. Leave `null` (default) to allow unlimited debt, or set to a float (e.g., `0.6`) to stop buying BTC once leverage exceeds that threshold.
+
 ### Suite Scenarios
 
-- **backtest.suite.enabled**: Master switch for suite runs (`--suite [y/n]` overrides it at runtime).
-- **backtest.suite.include_base_scenario** / **base_label**: Optionally prepend a scenario that mirrors the base config.
-- **backtest.suite.aggregate**: Dict of metric-specific aggregation modes (default `mean`). Keys fall back to the `default` entry if unspecified.
-- **backtest.suite.scenarios**: List of scenario dicts. Supported per-scenario keys:
+Suite configuration uses a flattened structure directly under `backtest`:
+
+- **backtest.suite_enabled**: Master switch for suite runs (`--suite [y/n]` overrides it at runtime).
+- **backtest.scenarios**: List of scenario dicts. Supported per-scenario keys:
   - `label`: Directory name under `backtests/suite_runs/<timestamp>/`.
   - `start_date`, `end_date`: Override the global date window.
   - `coins`, `ignored_coins`: Restrict or skip symbols.
   - `exchanges`: Limit which exchanges can contribute data to this scenario.
   - `coin_sources`: Scenario-specific overrides for `coin_sources`.
+  - `overrides`: Arbitrary config path overrides (e.g., `{"bot.long.total_wallet_exposure_limit": 2}`).
+- **backtest.aggregate**: Dict of metric-specific aggregation modes (default `mean`). Keys fall back to the `default` entry if unspecified.
 
-Refer to `configs/examples/suite_example.json` for a practical template.
+See `docs/suite_examples.md` for comprehensive examples and use cases.
 
 Example per-metric aggregation:
 
 ```json
 "backtest": {
-  "suite": {
-    "aggregate": {
-      "default": "mean",
-      "mdg_usd": "median",
-      "sharpe_ratio": "std",
-      "drawdown_worst_usd": "max"
-    }
+  "aggregate": {
+    "default": "mean",
+    "mdg_usd": "median",
+    "sharpe_ratio": "std",
+    "drawdown_worst_usd": "max"
   }
 }
 ```
@@ -75,7 +81,8 @@ Example per-metric aggregation:
 - **total_wallet_exposure_limit**: Maximum exposure allowed.
   - Example: `total_wallet_exposure_limit = 0.75` means 75% of (unleveraged) wallet balance is used.
   - Example: `total_wallet_exposure_limit = 1.6` means 160% of (unleveraged) wallet balance is used.
-  - Each position is given an equal share: `wallet_exposure_limit = total_wallet_exposure_limit / n_positions`.
+  - Live denominator is fixed: `wallet_exposure_limit = total_wallet_exposure_limit / n_positions`.
+  - Backtest denominator is controlled by `backtest.dynamic_wel_by_tradability`.
   - See more: `docs/risk_management.md`.
 - **enforce_exposure_limit**: If `true`, enforces exposure limits for each position.
   - Example: If a position's exposure exceeds 1% of the limit, reduce the position at market price to the exposure limit.
@@ -274,6 +281,10 @@ Coins selected for trading are filtered by volume and log range. First, filter c
 - **risk_wel_enforcer_threshold**: Per-symbol multiplier that triggers the WEL enforcer. When a position’s exposure exceeds `wallet_exposure_limit * (1 + risk_we_excess_allowance_pct) * risk_wel_enforcer_threshold` the bot emits a reduce-only order to bring it back under control. Set <1.0 for continual trimming, `1.0` for a hard cap, or ≤0 to disable.
 - **risk_twel_enforcer_threshold**: Fraction of the configured `total_wallet_exposure_limit` that triggers the TWEL enforcer. When aggregate exposure exceeds this threshold the bot queues reduction orders instead of new entries. Set >1.0 to allow a grace margin, `1.0` for strict enforcement, or ≤0 to disable.
 - **risk_we_excess_allowance_pct**: Per-symbol allowance above the configured wallet exposure limit that the enforcer tolerates before trimming. Useful for smoothing reductions; leave at `0.0` for a hard cap.
+- **max_realized_loss_pct**: Global realized-loss gate for close orders, anchored to peak realized balance from fill history. For each close order, if projected realized PnL would push balance below `peak_balance * (1 - max_realized_loss_pct)`, the order is blocked. Applies to all close order types (including WEL/TWEL auto-reduce and unstuck) except panic closes.
+  - `<= 0.0`: block all lossy closes.
+  - `>= 1.0`: disable the gate.
+  - Example: with peak balance `$10,000` and `max_realized_loss_pct = 0.05`, lossy closes are blocked once projected balance would fall below `$9,500`.
 - **max_warmup_minutes**: Hard ceiling applied to the historical warm-up window for both backtests and live warm-ups. Use `0` to disable the cap; otherwise values above `0` clamp the per-symbol warmup calculated from EMA spans.
 - **warmup_ratio**: Multiplier applied to the longest EMA or log-range span (in minutes) across long/short settings to decide how much 1m history to prefetch before trading. A value of `0.2`, for example, warmups ~20% of the deepest lookback, capped by `max_warmup_minutes`.
 - **warmup_minutes**: Per-coin warm-up window (in minutes) derived from `warmup_ratio`, indicator spans, and the optional `max_warmup_minutes` ceiling. This value is used by the backtester and CandlestickManager to skip the earliest candles until indicators are fully primed; adjust `warmup_ratio` or the spans themselves to change it.
@@ -362,14 +373,13 @@ In this example:
 
 ### Optimizer Suites
 
-The optimizer uses `backtest.suite` as its canonical suite configuration when `--suite [y/n]` is enabled.
+The optimizer reuses the backtest suite configuration when `--suite [y/n]` is enabled.
 
-- **backtest.suite.enabled**: Can be toggled for optimizer runs via `--suite [y/n]` on `src/optimize.py`.
-- **backtest.suite.include_base_scenario** / **base_label**: Include the base scenario alongside the configured scenarios.
-- **backtest.suite.aggregate**: Per-metric aggregation rules applied to scenario results before feeding into `optimize.scoring` and `optimize.limits`.
-- **backtest.suite.scenarios**: Scenario dictionaries. Each one may override `coins`, `ignored_coins`, `start_date`, `end_date`, `exchanges`, and `coin_sources`.
+- **backtest.suite_enabled**: Can be toggled for optimizer runs via `--suite [y/n]` on `src/optimize.py`.
+- **backtest.aggregate**: Per-metric aggregation rules applied to scenario results before feeding into `optimize.scoring` and `optimize.limits`.
+- **backtest.scenarios**: Scenario dictionaries. Each one may override `coins`, `ignored_coins`, `start_date`, `end_date`, `exchanges`, `coin_sources`, and `overrides` (arbitrary config path overrides).
 
-Use `--suite-config path/to/file.json` to layer a different `backtest.suite` definition at runtime.
+Use `--suite-config path/to/file.json` to layer additional scenario definitions at runtime.
 
 ### Optimization Limits
 

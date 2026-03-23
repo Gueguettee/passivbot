@@ -20,10 +20,11 @@ from config_transform import ConfigTransformTracker, record_transform
 
 
 def _log_config(verbose: bool, level: int, message: str, *args) -> None:
+    prefixed_message = "[config] " + message
     if verbose or level >= logging.WARNING:
-        logging.log(level, message, *args)
+        logging.log(level, prefixed_message, *args)
     else:
-        logging.debug(message, *args)
+        logging.debug(prefixed_message, *args)
 
 
 CURRENCY_METRICS = {
@@ -80,6 +81,10 @@ SHARED_METRICS = {
     "loss_profit_ratio",
     "loss_profit_ratio_w",
     "peak_recovery_hours_pnl",
+    "high_exposure_hours_mean_long",
+    "high_exposure_hours_max_long",
+    "high_exposure_hours_mean_short",
+    "high_exposure_hours_max_short",
     "adg_pnl",
     "adg_pnl_w",
     "mdg_pnl",
@@ -730,6 +735,103 @@ def _apply_backward_compatibility_renames(
                 )
 
 
+def _migrate_suite_to_scenarios(
+    result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
+) -> None:
+    """Migrate legacy backtest.suite structure to flattened scenarios structure.
+
+    Old format:
+        backtest.suite.enabled, backtest.suite.scenarios, backtest.suite.aggregate,
+        backtest.suite.include_base_scenario, backtest.suite.base_label, backtest.combine_ohlcvs
+
+    New format:
+        backtest.scenarios, backtest.aggregate, backtest.volume_normalization
+        (behavior derived from scenario exchange count - single = one exchange, multiple = best-per-coin)
+    """
+    backtest = result.setdefault("backtest", {})
+
+    # Migrate suite.scenarios -> scenarios, suite.aggregate -> aggregate
+    suite = backtest.pop("suite", None)
+    if suite and isinstance(suite, dict):
+        old_scenarios = suite.get("scenarios", [])
+        aggregate = suite.get("aggregate", {"default": "mean"})
+        include_base = suite.get("include_base_scenario", False)
+        base_label = suite.get("base_label", "base")
+        suite_enabled = suite.get("enabled", False)
+
+        # Only migrate if suite was actually in use (enabled or has scenarios)
+        if suite_enabled or old_scenarios:
+            # Move aggregate up (merge with existing, suite values take precedence)
+            existing_aggregate = backtest.get("aggregate", {})
+            merged_aggregate = {**existing_aggregate, **aggregate}
+            backtest["aggregate"] = merged_aggregate
+            _log_config(
+                verbose,
+                logging.INFO,
+                "migrated backtest.suite.aggregate -> backtest.aggregate",
+            )
+            if tracker is not None:
+                tracker.rename(
+                    ["backtest", "suite", "aggregate"],
+                    ["backtest", "aggregate"],
+                    merged_aggregate,
+                )
+
+            # Move scenarios up
+            new_scenarios = list(old_scenarios)
+
+            # If include_base_scenario was True, prepend implicit base scenario
+            # even when no explicit scenarios were provided.
+            if include_base:
+                base_scenario = {"label": base_label}
+                new_scenarios = [base_scenario] + new_scenarios
+                _log_config(
+                    verbose,
+                    logging.INFO,
+                    "prepended base scenario '%s' (from include_base_scenario=True)",
+                    base_label,
+                )
+
+            if "scenarios" not in backtest or not backtest["scenarios"]:
+                backtest["scenarios"] = new_scenarios
+                _log_config(
+                    verbose,
+                    logging.INFO,
+                    "migrated backtest.suite.scenarios -> backtest.scenarios (%d scenarios)",
+                    len(new_scenarios),
+                )
+                if tracker is not None:
+                    tracker.rename(
+                        ["backtest", "suite", "scenarios"],
+                        ["backtest", "scenarios"],
+                        new_scenarios,
+                    )
+        else:
+            # Suite existed but was disabled with no scenarios - just remove it
+            if tracker is not None:
+                tracker.remove(["backtest", "suite"], suite)
+
+    # Migrate combine_ohlcvs (just remove it, behavior is now derived from exchange count)
+    if "combine_ohlcvs" in backtest:
+        old_value = backtest.pop("combine_ohlcvs")
+        _log_config(
+            verbose,
+            logging.INFO,
+            "removed backtest.combine_ohlcvs=%s (behavior now derived from scenario exchange count)",
+            old_value,
+        )
+        if tracker is not None:
+            tracker.remove(["backtest", "combine_ohlcvs"], old_value)
+
+    # Ensure new defaults exist
+    if "aggregate" not in backtest:
+        backtest["aggregate"] = {"default": "mean"}
+    if "scenarios" not in backtest:
+        backtest["scenarios"] = []
+    if "volume_normalization" not in backtest:
+        backtest["volume_normalization"] = True
+
+
 def _migrate_btc_collateral_settings(
     result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
 ) -> None:
@@ -843,6 +945,7 @@ def _ensure_bot_defaults_and_bounds(
     result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
 ) -> None:
     """Ensure required bot defaults and optimize bounds exist for each position side."""
+    bounds = result["optimize"]["bounds"]
     for pside in ("long", "short"):
         for k0, v_bt, v_opt in [
             ("close_trailing_qty_pct", 1.0, [0.05, 1.0]),
@@ -877,12 +980,12 @@ def _ensure_bot_defaults_and_bounds(
                 "close_grid_markup_start",
                 result["bot"][pside].get("close_grid_min_markup", 0.001)
                 + result["bot"][pside].get("close_grid_markup_range", 0.001),
-                result["optimize"]["bounds"].get(f"{pside}_min_markup", [0.001, 0.03]),
+                bounds.get(f"{pside}_min_markup", [0.001, 0.03]),
             ),
             (
                 "close_grid_markup_end",
                 result["bot"][pside].get("close_grid_min_markup", 0.001),
-                result["optimize"]["bounds"].get(f"{pside}_close_grid_min_markup", [0.001, 0.03]),
+                bounds.get(f"{pside}_close_grid_min_markup", [0.001, 0.03]),
             ),
             (
                 "filter_volume_drop_pct",
@@ -908,8 +1011,8 @@ def _ensure_bot_defaults_and_bounds(
                 if tracker is not None:
                     tracker.add(["bot", pside, k0], v_bt)
             opt_key = f"{pside}_{k0}"
-            if opt_key not in result["optimize"]["bounds"]:
-                result["optimize"]["bounds"][opt_key] = v_opt
+            if opt_key not in bounds:
+                bounds[opt_key] = v_opt
                 _log_config(
                     verbose,
                     logging.INFO,
@@ -963,8 +1066,7 @@ def _sync_with_template(
     verbose: bool = True,
     tracker: Optional[ConfigTransformTracker] = None,
 ) -> None:
-    """Synchronize the config with the template structure and prune unused keys."""
-    add_missing_keys_recursively(template, result, verbose=verbose, tracker=tracker)
+    """Prune unused keys and enforce final template-aligned structure."""
     existing_base = result["live"].get("base_config_path") if "live" in result else None
     had_key = "live" in result and "base_config_path" in result["live"]
     if base_config_path or "base_config_path" not in result["live"]:
@@ -984,6 +1086,8 @@ def _sync_with_template(
             ("coin_overrides",),
             ("backtest", "suite", "aggregate"),
             ("backtest", "suite", "scenarios"),
+            ("backtest", "aggregate"),  # Preserve per-metric aggregation settings
+            ("backtest", "market_settings_sources"),  # Preserve per-coin market settings
         ],
         tracker=tracker,
     )
@@ -1000,6 +1104,37 @@ def _sync_with_template(
         verbose=verbose,
         tracker=tracker,
     )
+
+
+def _hydrate_missing_template_fields(
+    template: dict,
+    result: dict,
+    *,
+    verbose: bool = True,
+    tracker: Optional[ConfigTransformTracker] = None,
+) -> None:
+    """Centralized schema hydration: add all missing template keys before downstream consumers."""
+    add_missing_keys_recursively(template, result, verbose=verbose, tracker=tracker)
+
+
+def _seed_missing_compatibility_sections(
+    template: dict,
+    result: dict,
+    *,
+    tracker: Optional[ConfigTransformTracker] = None,
+) -> None:
+    """Seed missing structural sections without pre-filling legacy-derived leaf values."""
+    for pside in ("long", "short"):
+        if pside not in result["bot"]:
+            seeded = deepcopy(template["bot"][pside])
+            result["bot"][pside] = seeded
+            if tracker is not None:
+                tracker.add(["bot", pside], seeded)
+    if "bounds" not in result["optimize"]:
+        seeded_bounds = deepcopy(template["optimize"]["bounds"])
+        result["optimize"]["bounds"] = seeded_bounds
+        if tracker is not None:
+            tracker.add(["optimize", "bounds"], seeded_bounds)
 
 
 def _normalize_position_counts(
@@ -1114,9 +1249,16 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
     template = get_template_config()
     flavor = detect_flavor(config, template)
     result = build_base_config_from_flavor(config, template, flavor, verbose)
+    for path in ("backtest", "bot", "live", "optimize"):
+        require_config_dict(result, path)
     _apply_backward_compatibility_renames(result, verbose=verbose, tracker=tracker)
     _migrate_btc_collateral_settings(result, verbose=verbose, tracker=tracker)
+    _migrate_suite_to_scenarios(result, verbose=verbose, tracker=tracker)
+    _seed_missing_compatibility_sections(template, result, tracker=tracker)
+    for path in ("bot.long", "bot.short", "optimize.bounds"):
+        require_config_dict(result, path)
     _ensure_bot_defaults_and_bounds(result, verbose=verbose, tracker=tracker)
+    _hydrate_missing_template_fields(template, result, verbose=verbose, tracker=tracker)
     result["bot"] = sort_dict_keys(result["bot"])
 
     _rename_config_keys(result, verbose=verbose, tracker=tracker)
@@ -1130,10 +1272,10 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
 
     if optimize_suite_defined:
         logging.warning(
-            "Config contains optimize.suite, but suite configuration is now canonical under "
-            "backtest.suite only. optimize.suite will be ignored and deleted; backtest.suite will "
-            "be used. If you need different suite definitions, pass --suite-config with a file "
-            "containing backtest.suite."
+            "Config contains optimize.suite, but suite configuration is now defined via "
+            "backtest.scenarios. optimize.suite will be ignored and deleted; backtest.scenarios "
+            "will be used. If you need different suite definitions, pass --suite-config with a "
+            "file containing backtest.scenarios."
         )
         if isinstance(result.get("optimize"), dict) and "suite" in result["optimize"]:
             del result["optimize"]["suite"]
@@ -1604,7 +1746,12 @@ def comma_separated_values_float(x):
 
 
 def comma_separated_values(x):
-    return x.split(",")
+    # Preserve JSON/HJSON-like strings (used for approved/ignored coin dicts)
+    if isinstance(x, str):
+        raw = x.strip()
+        if raw and raw[0] in "[{" and raw[-1] in "]}":
+            return [x]
+    return [item.strip() for item in x.split(",")]
 
 
 def optional_float(x):
@@ -1699,16 +1846,108 @@ def create_acronym(full_name, acronyms=set()):
     return acronym
 
 
-def add_arguments_recursively(parser, config, prefix="", acronyms=set()):
+# Hard-coded CLI shortcuts for backwards compatibility
+# Format: config_key -> (acronym, [extra_aliases], type_converter, help_text)
+RESERVED_CLI_ARGS = {
+    "live.approved_coins": (
+        "s",
+        ["--symbols"],
+        comma_separated_values,
+        "Override live.approved_coins: comma_separated_values",
+    ),
+    "optimize.iters": (
+        "i",
+        ["--iters"],
+        int,
+        "Override optimize.iters: int",
+    ),
+    "optimize.n_cpus": (
+        "c",
+        ["--cpus"],
+        int,
+        "Override optimize.n_cpus: int",
+    ),
+    "optimize.scoring": (
+        "os",
+        ["--scoring"],
+        comma_separated_values,
+        "Override optimize.scoring: comma_separated_values",
+    ),
+}
+
+
+def add_reserved_arguments(parser) -> Tuple[set, set]:
+    """Add hard-coded CLI arguments for backwards compatibility.
+
+    Returns the set of reserved acronyms and config keys that should be
+    skipped by add_arguments_recursively().
+    """
+    reserved_acronyms = set()
+    reserved_keys = set()
+
+    for config_key, (acronym, aliases, type_conv, help_text) in RESERVED_CLI_ARGS.items():
+        arg_names = [
+            f"--{config_key}",
+            f"--{config_key.replace('.', '_')}",
+            f"-{acronym}",
+        ] + aliases
+
+        parser.add_argument(
+            *arg_names,
+            type=type_conv,
+            dest=config_key,
+            required=False,
+            default=None,
+            metavar="",
+            help=help_text,
+        )
+        reserved_acronyms.add(acronym)
+        reserved_keys.add(config_key)
+
+    return reserved_acronyms, reserved_keys
+
+
+def add_config_arguments(parser, config):
+    """Add all CLI arguments for config parameters.
+
+    This is the main entry point for adding config-based arguments.
+    It first adds hard-coded reserved arguments (for backwards compat),
+    then recursively adds remaining config parameters.
+
+    Args:
+        parser: argparse.ArgumentParser
+        config: Config dict (typically from get_template_config())
+    """
+    reserved_acronyms, reserved_keys = add_reserved_arguments(parser)
+    add_arguments_recursively(parser, config, acronyms=reserved_acronyms, skip_keys=reserved_keys)
+
+
+def add_arguments_recursively(parser, config, prefix="", acronyms=None, skip_keys=None):
+    """Recursively add CLI arguments for config parameters.
+
+    Args:
+        parser: argparse.ArgumentParser
+        config: Config dict to process
+        prefix: Current key prefix (e.g., "live.")
+        acronyms: Set of already-used acronyms to avoid collisions
+        skip_keys: Set of full config keys to skip (already added by reserved args)
+    """
+    if acronyms is None:
+        acronyms = set()
+    if skip_keys is None:
+        skip_keys = set()
 
     for key, value in config.items():
         full_name = f"{prefix}{key}"
 
+        # Skip if this key was already added as a reserved argument
+        if full_name in skip_keys:
+            continue
+
         if isinstance(value, dict):
             if any(full_name.endswith(x) for x in ["approved_coins", "ignored_coins"]):
-                acronym = "s" if full_name.endswith("approved_coins") else "i"
-                if acronym in acronyms:
-                    acronym = create_acronym(full_name, acronyms)
+                # Handle coin dict configs as comma-separated values
+                acronym = create_acronym(full_name, acronyms)
                 parser.add_argument(
                     f"--{full_name}",
                     f"--{full_name.replace('.', '_')}",
@@ -1722,7 +1961,9 @@ def add_arguments_recursively(parser, config, prefix="", acronyms=set()):
                 )
                 acronyms.add(acronym)
                 continue
-            add_arguments_recursively(parser, value, f"{full_name}.", acronyms=acronyms)
+            add_arguments_recursively(
+                parser, value, f"{full_name}.", acronyms=acronyms, skip_keys=skip_keys
+            )
             continue
         else:
             acronym = create_acronym(full_name, acronyms)
@@ -1733,20 +1974,12 @@ def add_arguments_recursively(parser, config, prefix="", acronyms=set()):
             if "limits" in full_name:
                 type_ = str
                 appendix = 'Example: "--loss_profit_ratio 0.5 --drawdown_worst 0.3333"'
-            elif "approved_coins" in full_name:
-                acronym = "s"
-                type_ = comma_separated_values
-            elif any([x in full_name for x in ["ignored_coins", "exchanges"]]):
+            elif any([x in full_name for x in ["approved_coins", "ignored_coins", "exchanges"]]):
                 type_ = comma_separated_values
                 appendix = "item1,item2,item3,..."
             elif "scoring" in full_name:
                 type_ = comma_separated_values
-                acronym = "os"
                 appendix = "Examples: adg,sharpe_ratio; mdg,sortino_ratio; ..."
-            elif "cpus" in full_name:
-                acronym = "c"
-            elif "iters" in full_name:
-                acronym = "i"
             elif value is None:
                 if full_name == "backtest.btc_collateral_ltv_cap":
                     type_ = optional_float
@@ -1859,6 +2092,13 @@ def require_config_value(config: dict, dotted_path: str):
     return current
 
 
+def require_config_dict(config: dict, dotted_path: str) -> dict:
+    value = require_config_value(config, dotted_path)
+    if not isinstance(value, dict):
+        raise TypeError(f"config.{dotted_path} must be a dict; got {type(value).__name__}")
+    return value
+
+
 def get_optional_config_value(config: dict, dotted_path: str, default=None):
     parts = dotted_path.split(".")
     if not parts:
@@ -1882,28 +2122,28 @@ def get_optional_live_value(config: dict, key: str, default=None):
 def get_template_config():
     return {
         "backtest": {
+            "aggregate": {"default": "mean"},
             "balance_sample_divider": 60,
             "base_dir": "backtests",
             "btc_collateral_cap": 1.0,
             "btc_collateral_ltv_cap": None,
-            "combine_ohlcvs": True,
             "compress_cache": True,
             "coin_sources": {},
+            "ohlcv_source_dir": None,
+            "market_settings_sources": {},
             "end_date": "now",
             "exchanges": ["binance", "bybit", "gateio", "bitget"],
             "filter_by_min_effective_cost": None,
+            "dynamic_wel_by_tradability": True,
+            "candle_interval_minutes": 1,
             "gap_tolerance_ohlcvs_minutes": 120.0,
             "maker_fee_override": None,
             "max_warmup_minutes": 0.0,
+            "scenarios": [],
             "start_date": "2021-04-01",
             "starting_balance": 100000.0,
-            "suite": {
-                "aggregate": {"default": "mean"},
-                "base_label": "base",
-                "enabled": False,
-                "include_base_scenario": False,
-                "scenarios": [],
-            },
+            "suite_enabled": True,
+            "volume_normalization": True,
         },
         "bot": {
             "long": {
@@ -1993,6 +2233,7 @@ def get_template_config():
             "balance_override": None,
             "candle_lock_timeout_seconds": 10.0,
             "empty_means_all_approved": False,
+            "enable_archive_candle_fetch": False,
             "execution_delay_seconds": 2.0,
             "filter_by_min_effective_cost": True,
             "forced_mode_long": "",
@@ -2007,17 +2248,19 @@ def get_template_config():
             "max_n_cancellations_per_batch": 5,
             "max_n_creations_per_batch": 3,
             "max_n_restarts_per_day": 10,
+            "max_ohlcv_fetches_per_minute": 30,
+            "max_realized_loss_pct": 1.0,
             "max_warmup_minutes": 0.0,
             "minimum_coin_age_days": 7.0,
             "order_match_tolerance_pct": 0.0002,
             "pnls_max_lookback_days": 30.0,
-            "pnls_manager_shadow_mode": False,
             "price_distance_threshold": 0.002,
             "recv_window_ms": 5000,
             "time_in_force": "good_till_cancelled",
             "user": "bybit_01",
             "warmup_jitter_seconds": 30.0,
             "warmup_ratio": 0.2,
+            "warmup_concurrency": 0,
             "max_concurrent_api_requests": None,
         },
         "logging": {

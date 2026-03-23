@@ -17,14 +17,15 @@ import pytest
 # Import module under test
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from warmup_utils import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes
-
 
 # ============================================================================
 # Test Fixtures
 # ============================================================================
+
 
 @pytest.fixture
 def base_config():
@@ -96,6 +97,7 @@ def config_with_bounds(base_config):
 # ============================================================================
 # Test Class: Basic Warmup Calculation
 # ============================================================================
+
 
 class TestWarmupCalculation:
     """Test warmup minute calculation."""
@@ -193,6 +195,7 @@ class TestWarmupCalculation:
 # Test Class: Per-Coin Warmup Calculation
 # ============================================================================
 
+
 class TestPerCoinWarmupCalculation:
     """Test per-coin warmup minute calculation."""
 
@@ -266,6 +269,7 @@ class TestPerCoinWarmupCalculation:
 # Test Class: EMA Span Extraction
 # ============================================================================
 
+
 class TestEMASpanExtraction:
     """Test EMA span extraction from config."""
 
@@ -326,6 +330,7 @@ class TestEMASpanExtraction:
 # ============================================================================
 # Test Class: Edge Cases
 # ============================================================================
+
 
 class TestWarmupEdgeCases:
     """Test edge cases and error conditions."""

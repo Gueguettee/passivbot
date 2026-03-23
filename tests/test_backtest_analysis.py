@@ -1,6 +1,6 @@
 import numpy as np
 
-from backtest import expand_analysis
+from backtest import expand_analysis, process_forager_fills
 
 
 def _make_analysis_entry(value):
@@ -23,6 +23,10 @@ def _make_analysis_entry(value):
         "total_wallet_exposure_max",
         "total_wallet_exposure_mean",
         "total_wallet_exposure_median",
+        "high_exposure_hours_mean_long",
+        "high_exposure_hours_max_long",
+        "high_exposure_hours_mean_short",
+        "high_exposure_hours_max_short",
         "entry_initial_balance_pct_long",
         "entry_initial_balance_pct_short",
     ]
@@ -75,3 +79,43 @@ def test_expand_analysis_includes_entry_balance_pct():
     assert "entry_initial_balance_pct_short" in result
     assert result["entry_initial_balance_pct_long"] == 0.123
     assert result["entry_initial_balance_pct_short"] == 0.123
+
+
+def test_expand_analysis_includes_high_exposure_hours():
+    analysis_usd = _make_analysis_entry(0.5)
+    analysis_btc = _make_analysis_entry(0.5)
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+    for side in ("long", "short"):
+        assert f"high_exposure_hours_mean_{side}" in result
+        assert f"high_exposure_hours_max_{side}" in result
+        assert result[f"high_exposure_hours_mean_{side}"] == 0.5
+        assert result[f"high_exposure_hours_max_{side}"] == 0.5
+
+
+def test_process_forager_fills_handles_zero_pnl_division():
+    """Zero-PnL inputs should not raise and should return stable neutral ratios."""
+    equities_array = np.array([[1704067200000, 1000.0, 0.02]], dtype=np.float64)
+
+    _fdf, analysis_appendix, _bal_eq = process_forager_fills(
+        fills=[],
+        coins=[],
+        hlcvs=np.empty((0, 0), dtype=np.float64),
+        equities_array=equities_array,
+        balance_sample_divider=1,
+    )
+
+    assert analysis_appendix["loss_profit_ratio_long"] == 1.0
+    assert analysis_appendix["loss_profit_ratio_short"] == 1.0
+    assert analysis_appendix["pnl_ratio_long_short"] == 0.5

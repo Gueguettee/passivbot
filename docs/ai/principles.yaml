@@ -1,0 +1,48 @@
+passivbot_agent_principles:
+  architecture:
+    - Rust is the source of truth for order logic, risk, unstuck, and backtesting behavior.
+    - Backtester and live bot must use equivalent Rust behavior.
+    - Python is orchestration, exchange I/O, config, and data plumbing.
+
+  statelessness:
+    - Trading behavior must be reproducible after restart from exchange state + config.
+    - Do not add local state that changes behavior and cannot be rederived.
+    - Performance caches are acceptable only if they do not change decisions.
+
+  terminology:
+    - Position direction uses [position_side, pos_side, pside] = long/short.
+    - Order direction uses [side, order_side] = buy/sell.
+    - qty and pos_size are signed internally; abs(qty) is only for exchange payloads when required.
+
+  indicators:
+    - EMA spans are floats; do not round derived spans.
+
+  order_constraints:
+    - Entries must observe effective min qty.
+    - Closes should observe effective min cost; exception: if pos size is below effective min qty, close qty may equal pos size.
+
+  config_hierarchy:
+    rule: Parameters shared by live + backtest belong in config.live.
+    sections:
+      - name: config.live
+        used_by: [live_bot, backtester, optimizer]
+      - name: config.backtest
+        used_by: [backtester, optimizer]
+      - name: config.optimize
+        used_by: [optimizer]
+
+  error_handling:
+    - Fail loudly in trading-critical paths.
+    - Exchange fetch methods must not catch exceptions; let caller policy handle retries/restarts.
+    - Fallbacks are exception-only and must follow docs/ai/error_contract.md.
+
+  implementation_scope:
+    - Avoid scope creep and premature abstraction.
+    - Keep changes tightly aligned with the requested task.
+
+  testing:
+    - Add targeted tests for changed behavior, edge cases, and regressions.
+    - Any new fallback behavior requires explicit fallback coverage.
+
+  changelog:
+    - Add user-facing behavior changes to top-level CHANGELOG.md under Unreleased.

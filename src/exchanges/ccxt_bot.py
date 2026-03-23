@@ -32,6 +32,7 @@ To customize behavior for a new exchange:
 """
 
 import asyncio
+import math
 import time
 import traceback
 
@@ -42,6 +43,48 @@ from procedures import assert_correct_ccxt_version
 from config_utils import require_live_value
 
 assert_correct_ccxt_version(ccxt=ccxt_async)
+
+
+def format_exchange_config_response(res: dict) -> str:
+    """Format exchange config API response (leverage, margin mode) concisely.
+
+    Instead of logging full JSON like:
+        {'symbol': 'ADAUSDT', 'leverage': '10', 'maxNotionalValue': '10000000'}
+    Returns:
+        'ok' or 'leverage=10x' or error message
+    """
+    if not isinstance(res, dict):
+        return str(res)[:50]
+
+    # Check for success indicators
+    code = res.get("code") or res.get("retCode")
+    msg = res.get("msg") or res.get("retMsg") or res.get("message", "")
+    status = res.get("status", "")
+
+    # Success cases
+    if code in (0, "0", "200000", 200000):
+        return "ok"
+    if status == "ok":
+        return "ok"
+
+    # "No need to change" is success
+    if "no need" in str(msg).lower():
+        return "ok (unchanged)"
+
+    # Extract useful info
+    leverage = res.get("leverage") or res.get("lever")
+    if leverage:
+        return f"leverage={leverage}x"
+
+    # Error cases - show code and message
+    if code and msg:
+        return f"code={code}: {msg[:40]}"
+    if msg:
+        return msg[:50]
+
+    # Fallback: truncated string
+    s = str(res)
+    return s[:60] + "..." if len(s) > 60 else s
 
 
 class CCXTBot(Passivbot):
@@ -163,13 +206,22 @@ class CCXTBot(Passivbot):
             "passphrase": "password",
             "wallet_address": "walletAddress",
         }
+        deprecated_fields = []  # Collect for aggregated logging
         for old_name, new_name in legacy_mappings.items():
             if old_name in config and new_name not in config:
-                logging.warning(
-                    f"{self.exchange}: '{old_name}' in api-keys.json is deprecated, "
-                    f"use '{new_name}' instead (CCXT-native field name)"
-                )
+                deprecated_fields.append(f"{old_name}->{new_name}")
                 config[new_name] = config.pop(old_name)
+
+        # Log all deprecated fields in a single message (once per exchange)
+        if deprecated_fields:
+            cache_key = f"_deprecated_keys_warned_{self.exchange}"
+            if not getattr(self, cache_key, False):
+                setattr(self, cache_key, True)
+                logging.info(
+                    "[config] %s: deprecated api-keys.json fields remapped: %s (use CCXT-native names)",
+                    self.exchange,
+                    ", ".join(deprecated_fields),
+                )
 
         return config
 
@@ -217,9 +269,7 @@ class CCXTBot(Passivbot):
         if self.ccp.has.get("watchOrders"):
             logging.info(f"{self.exchange}: watchOrders support confirmed")
         else:
-            logging.info(
-                f"{self.exchange}: watchOrders not supported in CCXT, using REST polling"
-            )
+            logging.info(f"{self.exchange}: watchOrders not supported in CCXT, using REST polling")
 
     async def determine_utc_offset(self, verbose=True):
         """Derive the exchange server time offset using CCXT's fetch_time().
@@ -230,13 +280,12 @@ class CCXTBot(Passivbot):
 
         try:
             server_time = await self.cca.fetch_time()
-            self.utc_offset = round((server_time - utc_ms()) / (1000 * 60 * 60)) * (
-                1000 * 60 * 60
-            )
+            self.utc_offset = round((server_time - utc_ms()) / (1000 * 60 * 60)) * (1000 * 60 * 60)
             if verbose:
                 logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
         except Exception as e:
-            logging.warning(f"Could not fetch server time: {e}, using 0 offset")
+            # Log once per session to avoid hourly noise (e.g., Hyperliquid doesn't support fetchTime)
+            self.log_once(f"Could not fetch server time: {e}, using 0 offset")
             self.utc_offset = 0
 
     async def fetch_balance(self) -> float:
@@ -303,7 +352,9 @@ class CCXTBot(Passivbot):
         t0 = time.time()
         result = await self.cca.fetch_positions()
         elapsed_ms = (time.time() - t0) * 1000
-        logging.debug(f"{self.exchange}: fetch_positions completed in {elapsed_ms:.1f}ms, {len(result)} raw positions")
+        logging.debug(
+            f"{self.exchange}: fetch_positions completed in {elapsed_ms:.1f}ms, {len(result)} raw positions"
+        )
         return result
 
     def _normalize_positions(self, fetched: list) -> list:
@@ -316,12 +367,14 @@ class CCXTBot(Passivbot):
         for elm in fetched:
             contracts = float(elm.get("contracts", 0))
             if contracts != 0:
-                positions.append({
-                    "symbol": elm["symbol"],
-                    "position_side": self._get_position_side(elm),
-                    "size": contracts,
-                    "price": float(elm.get("entryPrice", 0)),
-                })
+                positions.append(
+                    {
+                        "symbol": elm["symbol"],
+                        "position_side": self._get_position_side(elm),
+                        "size": contracts,
+                        "price": float(elm.get("entryPrice", 0)),
+                    }
+                )
         return positions
 
     def _get_position_side(self, elm: dict) -> str:
@@ -349,7 +402,9 @@ class CCXTBot(Passivbot):
         t0 = time.time()
         fetched = await self.cca.fetch_open_orders(symbol=symbol)
         elapsed_ms = (time.time() - t0) * 1000
-        logging.debug(f"{self.exchange}: fetch_open_orders completed in {elapsed_ms:.1f}ms, {len(fetched)} orders")
+        logging.debug(
+            f"{self.exchange}: fetch_open_orders completed in {elapsed_ms:.1f}ms, {len(fetched)} orders"
+        )
         for elm in fetched:
             elm["position_side"] = self._get_position_side_for_order(elm)
             elm["qty"] = elm["amount"]
@@ -378,9 +433,17 @@ class CCXTBot(Passivbot):
                 normalized = [self._normalize_order_update(o) for o in raw_orders]
                 self.handle_order_update(normalized)
             except Exception as e:
-                logging.error(f"[ws] exception in watch_orders: {e}")
-                traceback.print_exc()
+                self._health_ws_reconnects += 1
+                logging.warning(
+                    "[ws] %s: connection lost (reconnect #%d), retrying in 1s: %s",
+                    self.exchange,
+                    self._health_ws_reconnects,
+                    type(e).__name__,
+                )
+                logging.debug("[ws] %s: full exception: %s", self.exchange, e)
+                logging.debug("".join(traceback.format_exc()))
                 await asyncio.sleep(1)
+                logging.info("[ws] %s: reconnecting...", self.exchange)
 
     async def update_exchange_config(self):
         """Set exchange to hedge mode if supported.
@@ -392,15 +455,18 @@ class CCXTBot(Passivbot):
             Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
         """
         if not self.cca.has.get("setPositionMode"):
-            logging.info(f"{self.exchange} does not support setPositionMode, skipping")
+            logging.debug("[config] %s does not support setPositionMode, skipping", self.exchange)
             return
 
-        logging.debug(f"{self.exchange}: setting position mode to hedge via CCXT set_position_mode(True)")
+        logging.debug(
+            "[config] %s: setting position mode to hedge via CCXT set_position_mode(True)",
+            self.exchange,
+        )
         t0 = time.time()
         res = await self.cca.set_position_mode(True)
         elapsed_ms = (time.time() - t0) * 1000
-        logging.debug(f"{self.exchange}: set_position_mode completed in {elapsed_ms:.1f}ms")
-        logging.info(f"Set hedge mode: {res}")
+        logging.debug("[config] %s: set_position_mode completed in %.1fms", self.exchange, elapsed_ms)
+        logging.debug("[config] set hedge mode response: %s", res)
 
     def _should_set_margin_mode(self, symbol: str) -> bool:
         """Hook: Should we call set_margin_mode for this symbol?
@@ -410,8 +476,107 @@ class CCXTBot(Passivbot):
         """
         return self.cca.has.get("setMarginMode", False)
 
+    def _requires_isolated_margin(self, symbol: str) -> bool:
+        """Check if a symbol requires isolated margin mode.
+
+        Override in subclasses to detect exchange-specific isolated-only markets.
+        Examples: HIP-3 stock perps on Hyperliquid, certain leveraged tokens.
+
+        Args:
+            symbol: CCXT-style symbol
+
+        Returns:
+            True if this symbol requires isolated margin mode
+        """
+        # Default: check market info for common isolated-only flags
+        market = getattr(self, "markets_dict", {}).get(symbol, {})
+        info = market.get("info", {})
+
+        # Check common flags across exchanges
+        if info.get("onlyIsolated", False):
+            return True
+        if info.get("marginMode") == "isolated":
+            return True
+        if info.get("isolatedOnly", False):
+            return True
+
+        return False
+
+    def _get_margin_mode_for_symbol(self, symbol: str) -> str:
+        """Get the appropriate margin mode for a symbol.
+
+        Args:
+            symbol: CCXT-style symbol
+
+        Returns:
+            "isolated" or "cross"
+        """
+        if self._requires_isolated_margin(symbol):
+            return "isolated"
+        return "cross"
+
+    def _calc_min_isolated_leverage(self) -> int:
+        """Calculate minimum leverage required for isolated margin positions.
+
+        For isolated margin, margin_required = exposure / leverage.
+        To ensure margin requirements never exceed balance:
+            margin_required <= balance
+            (TWEL * balance) / leverage <= balance
+            leverage >= TWEL
+
+        Returns:
+            Minimum leverage (ceiling of max TWEL across both sides)
+        """
+        long_twel = float(self.bot_value("long", "total_wallet_exposure_limit") or 0.0)
+        short_twel = float(self.bot_value("short", "total_wallet_exposure_limit") or 0.0)
+        max_twel = max(long_twel, short_twel)
+
+        if max_twel <= 0:
+            return 1
+
+        # Ceiling ensures we always have enough margin
+        return max(1, math.ceil(max_twel))
+
+    def _calc_leverage_for_symbol(self, symbol: str) -> int:
+        """Calculate the appropriate leverage for a symbol.
+
+        For isolated margin symbols, ensures leverage is high enough to meet
+        margin requirements given the configured TWEL.
+
+        Args:
+            symbol: CCXT-style symbol
+
+        Returns:
+            Leverage to use (capped by max_leverage for the symbol)
+        """
+        configured = int(self.config_get(["live", "leverage"], symbol=symbol))
+        max_lev = getattr(self, "max_leverage", {}).get(symbol, configured)
+
+        if self._requires_isolated_margin(symbol):
+            min_lev = self._calc_min_isolated_leverage()
+            leverage = max(configured, min_lev)
+
+            if min_lev > max_lev:
+                logging.warning(
+                    f"{symbol}: TWEL requires {min_lev}x leverage for isolated margin, "
+                    f"but max is {max_lev}x. Risk of insufficient margin errors."
+                )
+
+            leverage = min(leverage, max_lev)
+            if leverage != configured:
+                logging.info(
+                    f"{symbol}: isolated margin requires min {min_lev}x leverage "
+                    f"(configured: {configured}x, using: {leverage}x)"
+                )
+            return leverage
+
+        return min(configured, max_lev)
+
     async def update_exchange_config_by_symbols(self, symbols: list):
         """Set leverage and margin mode for each symbol.
+
+        For isolated margin symbols, leverage is automatically adjusted to ensure
+        margin requirements can be met given the configured TWEL.
 
         Args:
             symbols: List of symbols to configure.
@@ -423,7 +588,7 @@ class CCXTBot(Passivbot):
 
         for symbol in symbols:
             if can_set_leverage:
-                leverage = int(self.config_get(["live", "leverage"], symbol=symbol))
+                leverage = self._calc_leverage_for_symbol(symbol)
                 logging.debug(f"{self.exchange}: setting leverage for {symbol} to {leverage}x")
                 t0 = time.time()
                 await self.cca.set_leverage(leverage, symbol=symbol)
@@ -432,12 +597,13 @@ class CCXTBot(Passivbot):
                 logging.info(f"{symbol}: set leverage to {leverage}x")
 
             if self._should_set_margin_mode(symbol):
-                logging.debug(f"{self.exchange}: setting margin mode for {symbol} to cross")
+                margin_mode = self._get_margin_mode_for_symbol(symbol)
+                logging.debug(f"{self.exchange}: setting margin mode for {symbol} to {margin_mode}")
                 t0 = time.time()
-                await self.cca.set_margin_mode("cross", symbol=symbol)
+                await self.cca.set_margin_mode(margin_mode, symbol=symbol)
                 elapsed_ms = (time.time() - t0) * 1000
                 logging.debug(f"{self.exchange}: set_margin_mode completed in {elapsed_ms:.1f}ms")
-                logging.info(f"{symbol}: set cross margin mode")
+                logging.info(f"{symbol}: set {margin_mode} margin mode")
 
     def set_market_specific_settings(self):
         """Extract market-specific settings from CCXT market info.
@@ -484,7 +650,9 @@ class CCXTBot(Passivbot):
         t0 = time.time()
         result = await self.cca.fetch_tickers()
         elapsed_ms = (time.time() - t0) * 1000
-        logging.debug(f"{self.exchange}: fetch_tickers completed in {elapsed_ms:.1f}ms, {len(result)} tickers")
+        logging.debug(
+            f"{self.exchange}: fetch_tickers completed in {elapsed_ms:.1f}ms, {len(result)} tickers"
+        )
         return result
 
     def _normalize_tickers(self, fetched: dict) -> dict:
@@ -520,7 +688,9 @@ class CCXTBot(Passivbot):
         t0 = time.time()
         result = await self.cca.fetch_ohlcv(symbol, timeframe=timeframe, limit=1000)
         elapsed_ms = (time.time() - t0) * 1000
-        logging.debug(f"{self.exchange}: fetch_ohlcv completed in {elapsed_ms:.1f}ms, {len(result)} candles")
+        logging.debug(
+            f"{self.exchange}: fetch_ohlcv completed in {elapsed_ms:.1f}ms, {len(result)} candles"
+        )
         return result
 
     async def fetch_ohlcvs_1m(self, symbol: str, since: float = None, limit: int = None) -> list:
@@ -538,22 +708,24 @@ class CCXTBot(Passivbot):
             Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
         """
         n_limit = limit or 1000
-        logging.debug(f"{self.exchange}: fetching 1m OHLCV for {symbol}, since={since}, limit={n_limit}")
+        logging.debug(
+            f"{self.exchange}: fetching 1m OHLCV for {symbol}, since={since}, limit={n_limit}"
+        )
         t0 = time.time()
 
         if since is None:
             result = await self.cca.fetch_ohlcv(symbol, timeframe="1m", limit=n_limit)
             elapsed_ms = (time.time() - t0) * 1000
-            logging.debug(f"{self.exchange}: fetch_ohlcvs_1m completed in {elapsed_ms:.1f}ms, {len(result)} candles")
+            logging.debug(
+                f"{self.exchange}: fetch_ohlcvs_1m completed in {elapsed_ms:.1f}ms, {len(result)} candles"
+            )
             return result
 
         since = int(since // 60000 * 60000)  # Round to minute
         all_candles = {}
         page_count = 0
         for _ in range(5):  # Max 5 paginated requests
-            fetched = await self.cca.fetch_ohlcv(
-                symbol, timeframe="1m", since=since, limit=n_limit
-            )
+            fetched = await self.cca.fetch_ohlcv(symbol, timeframe="1m", since=since, limit=n_limit)
             page_count += 1
             if not fetched:
                 break
@@ -564,7 +736,9 @@ class CCXTBot(Passivbot):
             since = fetched[-1][0]
 
         elapsed_ms = (time.time() - t0) * 1000
-        logging.debug(f"{self.exchange}: fetch_ohlcvs_1m completed in {elapsed_ms:.1f}ms, {len(all_candles)} candles ({page_count} pages)")
+        logging.debug(
+            f"{self.exchange}: fetch_ohlcvs_1m completed in {elapsed_ms:.1f}ms, {len(all_candles)} candles ({page_count} pages)"
+        )
         return sorted(all_candles.values(), key=lambda x: x[0])
 
     async def fetch_pnls(self, start_time=None, end_time=None, limit=None) -> list:

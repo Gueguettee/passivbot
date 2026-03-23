@@ -1,12 +1,14 @@
 import asyncio
 import json
+import random
 import traceback
 
 import ccxt.pro as ccxt_pro
 import ccxt.async_support as ccxt_async
 import passivbot_rust as pbr
+from ccxt.base.errors import RateLimitExceeded
 
-from exchanges.ccxt_bot import CCXTBot
+from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
 from passivbot import logging
 from utils import ts_to_date, utc_ms
 from config_utils import require_live_value
@@ -22,6 +24,12 @@ assert_correct_ccxt_version(ccxt=ccxt_async)
 
 
 class HyperliquidBot(CCXTBot):
+    # HIP-3 stock perps have a max leverage of 10x
+    HIP3_MAX_LEVERAGE = 10
+    # HIP-3 symbols use "xyz:" prefix (TradeXYZ builder)
+    HIP3_PREFIX = "xyz:"
+    HIP3_ALT_PREFIXES = ("XYZ-", "XYZ:")
+
     def __init__(self, config: dict):
         super().__init__(config)
         self.quote = "USDC"
@@ -34,28 +42,44 @@ class HyperliquidBot(CCXTBot):
             self.user_info["is_vault"] = False
         self.max_n_concurrent_ohlcvs_1m_updates = 2
         self.custom_id_max_length = 34
+        self._hl_fetch_lock = asyncio.Lock()
+        self._hl_cache_generation = 0
+
+    def _hl_info_url(self) -> str:
+        """Derive the Hyperliquid /info endpoint from the CCXT session URL config."""
+        base = self.cca.urls.get("api", {}).get("public", "https://api.hyperliquid.xyz")
+        hostname = getattr(self.cca, "hostname", "hyperliquid.xyz")
+        return base.replace("{hostname}", hostname).rstrip("/") + "/info"
 
     def create_ccxt_sessions(self):
         creds = {
             "walletAddress": self.user_info["wallet_address"],
             "privateKey": self.user_info["private_key"],
         }
+        # Configure fetchMarkets to include HIP-3 stock perps from TradeXYZ
+        fetch_markets_config = {
+            "types": ["swap", "hip3"],  # Include HIP-3 markets
+            "hip3": {
+                "dex": ["xyz"],  # TradeXYZ DEX for stock perps (TSLA, NVDA, etc.)
+            },
+        }
         if self.ws_enabled:
             self.ccp = getattr(ccxt_pro, self.exchange)(creds)
             self.ccp.options.update(self._build_ccxt_options())
             self.ccp.options["defaultType"] = "swap"
-            self.ccp.options["fetchMarkets"]["types"] = ["swap"]
+            self.ccp.options["fetchMarkets"] = fetch_markets_config
             self._apply_endpoint_override(self.ccp)
         elif self.endpoint_override:
             logging.info("Skipping Hyperliquid websocket session due to custom endpoint override.")
         self.cca = getattr(ccxt_async, self.exchange)(creds)
         self.cca.options.update(self._build_ccxt_options())
         self.cca.options["defaultType"] = "swap"
-        self.cca.options["fetchMarkets"]["types"] = ["swap"]
+        self.cca.options["fetchMarkets"] = fetch_markets_config
         self._apply_endpoint_override(self.cca)
 
     def set_market_specific_settings(self):
         super().set_market_specific_settings()
+        isolated_count = 0
         for symbol in self.markets_dict:
             elm = self.markets_dict[symbol]
             self.symbol_ids[symbol] = elm["id"]
@@ -71,27 +95,136 @@ class HyperliquidBot(CCXTBot):
             )
             self.price_steps[symbol] = elm["precision"]["price"]
             self.c_mults[symbol] = elm["contractSize"]
-            self.max_leverage[symbol] = (
-                int(elm["info"]["maxLeverage"]) if "maxLeverage" in elm["info"] else 0
-            )
+
+            # For isolated-only markets (HIP-3), cap at 10x leverage
+            if self._requires_isolated_margin(symbol):
+                isolated_count += 1
+                self.max_leverage[symbol] = min(
+                    self.HIP3_MAX_LEVERAGE,
+                    (
+                        int(elm["info"]["maxLeverage"])
+                        if "maxLeverage" in elm["info"]
+                        else self.HIP3_MAX_LEVERAGE
+                    ),
+                )
+            else:
+                self.max_leverage[symbol] = (
+                    int(elm["info"]["maxLeverage"]) if "maxLeverage" in elm["info"] else 0
+                )
         self.n_decimal_places = 6
         self.n_significant_figures = 5
+        if isolated_count:
+            logging.info(
+                f"Detected {isolated_count} isolated-margin-only symbols (HIP-3/stock perps)"
+            )
+
+    def _requires_isolated_margin(self, symbol: str) -> bool:
+        """Check if a symbol requires isolated margin mode.
+
+        On Hyperliquid, this includes:
+        1. Symbols with HIP-3 prefixes (TradeXYZ stock perps)
+        2. Markets with onlyIsolated=True flag
+
+        Args:
+            symbol: CCXT-style symbol (e.g., "xyz:TSLA/USDC:USDC")
+
+        Returns:
+            True if this symbol requires isolated margin mode
+        """
+        # CCXT can expose HIP-3 symbols as either xyz:TSLA/... or XYZ-TSLA/...
+        prefixes = (self.HIP3_PREFIX,) + tuple(self.HIP3_ALT_PREFIXES)
+        if symbol.startswith(prefixes):
+            return True
+        base = symbol.split("/")[0] if "/" in symbol else symbol
+        if base.startswith(prefixes):
+            return True
+
+        # Fall back to base class check (onlyIsolated flag, etc.)
+        return super()._requires_isolated_margin(symbol)
+
+    def _get_hl_dex_for_symbol(self, symbol: str) -> str | None:
+        """Return HIP-3 dex name for a symbol if available."""
+        market = getattr(self, "markets_dict", {}).get(symbol, {})
+        base_name = market.get("baseName") or market.get("info", {}).get("baseName", "")
+        if isinstance(base_name, str) and ":" in base_name:
+            dex_name = base_name.split(":", 1)[0]
+            if dex_name:
+                return dex_name
+        return None
+
+    def _get_hl_hip3_state_symbols(self) -> list[str]:
+        """Return tracked HIP-3 symbols that need dex-scoped state queries."""
+        tracked = set(getattr(self, "active_symbols", []) or [])
+        tracked.update(getattr(self, "open_orders", {}).keys())
+        tracked.update(getattr(self, "positions", {}).keys())
+        return sorted(
+            symbol
+            for symbol in tracked
+            if symbol in getattr(self, "markets_dict", {}) and self._get_hl_dex_for_symbol(symbol)
+        )
+
+    def _normalize_ccxt_position(self, position: dict) -> dict:
+        side = position.get("side")
+        contracts = float(position.get("contracts") or 0.0)
+        if side == "short":
+            contracts = -contracts
+        return {
+            "symbol": position["symbol"],
+            "position_side": side,
+            "size": contracts,
+            "price": float(position.get("entryPrice") or 0.0),
+        }
+
+    async def _fetch_hip3_positions(self) -> list[dict]:
+        """Fetch HIP-3 positions via dex-scoped CCXT routes."""
+        positions_by_key = {}
+        for symbol in self._get_hl_hip3_state_symbols():
+            fetched = await self.cca.fetch_positions(symbols=[symbol])
+            for position in fetched:
+                normalized = self._normalize_ccxt_position(position)
+                key = (normalized["symbol"], normalized["position_side"])
+                positions_by_key[key] = normalized
+        return list(positions_by_key.values())
 
     async def watch_orders(self):
         res = None
+        _ws_consecutive_rate_limits = 0
         while True:
             try:
                 if self.stop_websocket:
                     break
                 res = await self.ccp.watch_orders()
+                _ws_consecutive_rate_limits = 0  # reset on success
                 for i in range(len(res)):
                     res[i]["position_side"] = self.determine_pos_side(res[i])
                     res[i]["qty"] = res[i]["amount"]
                 self.handle_order_update(res)
+            except RateLimitExceeded:
+                self._health_ws_reconnects += 1
+                self._health_rate_limits += 1
+                _ws_consecutive_rate_limits += 1
+                backoff = min(30, 2 ** _ws_consecutive_rate_limits) + random.uniform(0, 1)
+                logging.warning(
+                    "[ws] %s: rate limited (reconnect #%d), backing off %.0fs...",
+                    self.exchange,
+                    self._health_ws_reconnects,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                logging.info("[ws] %s: reconnecting after rate limit...", self.exchange)
             except Exception as e:
-                logging.error(f"exception watch_orders {res} {e}")
-                traceback.print_exc()
+                self._health_ws_reconnects += 1
+                _ws_consecutive_rate_limits = 0
+                logging.warning(
+                    "[ws] %s: connection lost (reconnect #%d), retrying in 1s: %s",
+                    self.exchange,
+                    self._health_ws_reconnects,
+                    type(e).__name__,
+                )
+                logging.debug("[ws] %s: full exception: %s", self.exchange, e)
+                logging.debug("".join(traceback.format_exc()))
                 await asyncio.sleep(1)
+                logging.info("[ws] %s: reconnecting...", self.exchange)
 
     def determine_pos_side(self, order):
         # hyperliquid is not hedge mode
@@ -115,7 +248,32 @@ class HyperliquidBot(CCXTBot):
         return self.determine_pos_side(order)
 
     async def fetch_open_orders(self, symbol: str = None):
-        fetched = await self.cca.fetch_open_orders()
+        fetched = []
+        seen_ids = set()
+        query_symbols = [symbol] if symbol is not None else self._get_hl_hip3_state_symbols()
+
+        # Default route covers core perps; HIP-3 symbols need dex-scoped queries.
+        if symbol is None or not self._get_hl_dex_for_symbol(symbol):
+            for order in await self.cca.fetch_open_orders(symbol=symbol):
+                if order["id"] in seen_ids:
+                    continue
+                seen_ids.add(order["id"])
+                fetched.append(order)
+
+        if symbol is None:
+            hip3_symbols = query_symbols
+        elif self._get_hl_dex_for_symbol(symbol):
+            hip3_symbols = query_symbols
+        else:
+            hip3_symbols = []
+
+        for hip3_symbol in hip3_symbols:
+            for order in await self.cca.fetch_open_orders(symbol=hip3_symbol):
+                if order["id"] in seen_ids:
+                    continue
+                seen_ids.add(order["id"])
+                fetched.append(order)
+
         for elm in fetched:
             elm["position_side"] = self.determine_pos_side(elm)
             elm["qty"] = elm["amount"]
@@ -123,41 +281,70 @@ class HyperliquidBot(CCXTBot):
 
     async def _fetch_positions_and_balance(self):
         info = await self.cca.fetch_balance()
-        positions = [
-            {
+        positions = {}
+        for x in info["info"]["assetPositions"]:
+            size = float(x["position"]["szi"])
+            elm = {
                 "symbol": self.coin_to_symbol(x["position"]["coin"]),
-                "position_side": ("long" if (size := float(x["position"]["szi"])) > 0.0 else "short"),
+                "position_side": ("long" if size > 0.0 else "short"),
                 "size": size,
                 "price": float(x["position"]["entryPx"]),
             }
-            for x in info["info"]["assetPositions"]
-        ]
+            positions[(elm["symbol"], elm["position_side"])] = elm
+        for position in await self._fetch_hip3_positions():
+            positions[(position["symbol"], position["position_side"])] = position
         balance = float(info["info"]["marginSummary"]["accountValue"]) - sum(
             [float(x["position"]["unrealizedPnl"]) for x in info["info"]["assetPositions"]]
         )
-        return positions, balance
+        return list(positions.values()), balance
+
+    async def _get_positions_and_balance_cached(self, my_gen: int = 0):
+        """Fetch positions+balance with dedup: concurrent callers share one API call.
+
+        my_gen is the caller's snapshot of _hl_cache_generation taken *before*
+        acquiring the lock.  If another caller completed a fetch in the
+        meantime (cache_generation advanced), we return the cached result
+        (or re-raise the cached exception if the fetch failed).
+        """
+        async with self._hl_fetch_lock:
+            cached_gen = self._hl_cache_generation
+            if cached_gen > my_gen and hasattr(self, "_hl_cached_result"):
+                if isinstance(self._hl_cached_result, Exception):
+                    raise self._hl_cached_result
+                return self._hl_cached_result
+            try:
+                result = await self._fetch_positions_and_balance()
+            except Exception as e:
+                self._hl_cached_result = e
+                self._hl_cache_generation = cached_gen + 1
+                raise
+            self._hl_cached_result = result
+            self._hl_cache_generation = cached_gen + 1
+            return result
 
     async def fetch_positions(self):
-        positions, balance = await self._fetch_positions_and_balance()
-        self._last_hl_positions_balance = (positions, balance)
-        self._hl_positions_balance_applied = False
+        # Snapshot generation *before* lock so each caller tracks its own view.
+        my_gen = self._hl_cache_generation
+        positions, balance = await self._get_positions_and_balance_cached(my_gen)
+        self._last_hl_balance = balance
+        self._hl_balance_consumed = False
         return positions
 
     async def fetch_balance(self):
-        cached = getattr(self, "_last_hl_positions_balance", None)
-        applied = getattr(self, "_hl_positions_balance_applied", False)
-        if cached and not applied:
-            positions, balance = cached
-            self._hl_positions_balance_applied = True
-            return balance
-        positions, balance = await self._fetch_positions_and_balance()
-        self._last_hl_positions_balance = (positions, balance)
-        self._hl_positions_balance_applied = True
+        # Check if fetch_positions already got us a fresh balance
+        if getattr(self, "_last_hl_balance", None) is not None and not getattr(
+            self, "_hl_balance_consumed", True
+        ):
+            self._hl_balance_consumed = True
+            return self._last_hl_balance
+        # Snapshot generation *before* lock so each caller tracks its own view.
+        my_gen = self._hl_cache_generation
+        positions, balance = await self._get_positions_and_balance_cached(my_gen)
         return balance
 
     async def fetch_tickers(self):
         fetched = await self.cca.fetch(
-            "https://api.hyperliquid.xyz/info",
+            self._hl_info_url(),
             method="POST",
             headers={"Content-Type": "application/json"},
             body=json.dumps({"type": "allMids"}),
@@ -263,11 +450,35 @@ class HyperliquidBot(CCXTBot):
     async def execute_cancellation(self, order: dict) -> dict:
         """Hyperliquid: Cancel order with vault support."""
         params = (
-            {"vaultAddress": self.user_info["wallet_address"]}
-            if self.user_info["is_vault"]
-            else {}
+            {"vaultAddress": self.user_info["wallet_address"]} if self.user_info["is_vault"] else {}
         )
-        return await self.cca.cancel_order(order["id"], symbol=order["symbol"], params=params)
+
+        def _is_already_gone(payload) -> bool:
+            try:
+                text = str(payload)
+            except Exception:
+                text = ""
+            text_l = text.lower()
+            if (
+                "order was never placed" in text_l
+                or "already canceled" in text_l
+                or "already cancelled" in text_l
+            ):
+                return True
+            return False
+
+        try:
+            res = await self.cca.cancel_order(order["id"], symbol=order["symbol"], params=params)
+            # Sometimes hyperliquid returns an "ok" wrapper with an embedded error; treat as non-fatal.
+            if _is_already_gone(res):
+                logging.info("Order already canceled/filled on exchange; treating as success.")
+                return {"status": "success"}
+            return res
+        except Exception as e:
+            if _is_already_gone(e):
+                logging.info("Order already canceled/filled on exchange; treating as success.")
+                return {"status": "success"}
+            raise
 
     def did_cancel_order(self, executed, order=None) -> bool:
         if isinstance(executed, list) and len(executed) == 1:
@@ -353,13 +564,16 @@ class HyperliquidBot(CCXTBot):
         return any_adjusted
 
     def symbol_is_eligible(self, symbol):
+        """Check if a symbol is eligible for trading.
+
+        HIP-3 stock perps (onlyIsolated=True) are eligible - they use isolated margin
+        automatically and have leverage capped at 10x.
+        """
         try:
-            if (
-                "onlyIsolated" in self.markets_dict[symbol]["info"]
-                and self.markets_dict[symbol]["info"]["onlyIsolated"]
-            ):
-                return False
-            if float(self.markets_dict[symbol]["info"]["openInterest"]) == 0.0:
+            market_info = self.markets_dict[symbol]["info"]
+
+            # Zero open interest means market is inactive
+            if float(market_info.get("openInterest", 0)) == 0.0:
                 return False
         except Exception as e:
             logging.error(f"error with symbol_is_eligible {e} {symbol}")
@@ -367,37 +581,40 @@ class HyperliquidBot(CCXTBot):
         return True
 
     async def update_exchange_config_by_symbols(self, symbols):
-        coros_to_call_margin_mode = {}
+        """Set leverage and margin mode for Hyperliquid symbols.
+
+        Uses base class methods for isolated margin detection and leverage calculation.
+        Adds Hyperliquid-specific vault address handling.
+        Calls are made sequentially with a small delay to avoid rate-limit bursts.
+        """
         for symbol in symbols:
-            try:
-                params = {
-                    "leverage": int(
-                        min(
-                            self.max_leverage[symbol],
-                            self.config_get(["live", "leverage"], symbol=symbol),
-                        )
-                    )
-                }
-                if self.user_info["is_vault"]:
-                    params["vaultAddress"] = self.user_info["wallet_address"]
-                coros_to_call_margin_mode[symbol] = asyncio.create_task(
-                    self.cca.set_margin_mode("cross", symbol=symbol, params=params)
-                )
-            except Exception as e:
-                logging.error(f"{symbol}: error setting cross mode and leverage {e}")
-        for symbol in symbols:
-            res = None
             to_print = ""
             try:
-                res = await coros_to_call_margin_mode[symbol]
-                to_print += f"set cross mode {res}"
+                leverage = self._calc_leverage_for_symbol(symbol)
+                margin_mode = self._get_margin_mode_for_symbol(symbol)
+
+                params = {"leverage": leverage}
+                if self.user_info["is_vault"]:
+                    params["vaultAddress"] = self.user_info["wallet_address"]
+
+                try:
+                    res = await self.cca.set_margin_mode(
+                        margin_mode, symbol=symbol, params=params
+                    )
+                    to_print = (
+                        f"margin={format_exchange_config_response(res)} ({margin_mode})"
+                    )
+                except Exception as e:
+                    if '"code":"59107"' in str(e):
+                        to_print = f"margin=ok (unchanged, {margin_mode})"
+                    else:
+                        logging.error(f"{symbol} error setting {margin_mode} mode {e}")
             except Exception as e:
-                if '"code":"59107"' in str(e):
-                    to_print += f" cross mode and leverage: {res} {e}"
-                else:
-                    logging.error(f"{symbol} error setting cross mode {res} {e}")
+                logging.error(f"{symbol}: error setting margin mode and leverage {e}")
             if to_print:
                 logging.info(f"{symbol}: {to_print}")
+            # Small delay between margin-mode API calls to avoid rate-limit bursts
+            await asyncio.sleep(0.2)
 
     async def update_exchange_config(self):
         pass

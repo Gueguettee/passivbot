@@ -10,8 +10,8 @@ python3 src/optimize.py [path/to/config.json]
 
 - Defaults to `configs/template.json` if no config is specified
 - Use existing configs as starting points: `--start path/to/config(s)`
-- Enable suite scenarios defined in `backtest.suite` with `--suite [y/n]` (omit value to enable)
-- Layer an external `backtest.suite` definition via `--suite-config path/to/file.json`
+- Enable suite scenarios defined in `backtest.scenarios` with `--suite [y/n]` (omit value to enable)
+- Layer additional scenario definitions via `--suite-config path/to/file.json`
 
 Example:
 ```bash
@@ -19,6 +19,26 @@ python3 src/optimize.py configs/template.json --start configs/starting_pool/
 ```
 
 Most config parameters can be modified via CLI. `python3 src/optimize.py -h` for more info.
+
+### Candle Interval
+
+For faster optimization runs, you can aggregate 1-minute data into coarser candles before the
+backtest loop runs. This reduces the number of bars processed per iteration.
+
+Set `backtest.candle_interval_minutes` to a value greater than 1:
+
+```json
+{
+  "backtest": {
+    "candle_interval_minutes": 5
+  }
+}
+```
+
+Trade-offs:
+
+- Intra-interval fill ordering is lost (fills occur only at the aggregated bar boundaries).
+- Metrics are still time-correct because analysis uses timestamps rather than bar indices.
 
 ### Fine-Tuning Specific Parameters
 
@@ -38,24 +58,27 @@ configured.
 
 ### Optimizer Suites
 
-The optimizer reuses `backtest.suite` and allows every candidate to
+The optimizer reuses the backtest suite configuration and allows every candidate to
 be evaluated across multiple scenarios before scoring. Each scenario can override coins,
-date ranges, exchanges, and `coin_sources`. The optimizer prepares a single shared
-dataset that covers the union of the requested data so additional scenarios add minimal
-overhead.
+date ranges, exchanges, `coin_sources`, and bot parameters via `overrides`. The optimizer
+prepares a single shared dataset that covers the union of the requested data so additional
+scenarios add minimal overhead.
 
-Key fields:
+Key fields (directly under `backtest`):
 
-- `backtest.suite.enabled`: can also be toggled with `--suite [y/n]`
-- `backtest.suite.include_base_scenario` / `base_label`
-- `backtest.suite.scenarios`: same schema as backtest scenarios
+- `backtest.suite_enabled`: master toggle for suite mode, can also be set with `--suite [y/n]`
+- `backtest.scenarios`: list of scenario dictionaries (same schema as backtest scenarios)
+- `backtest.aggregate`: how to combine per-scenario metrics (default: `{"default": "mean"}`)
 
 During evaluation the optimizer records:
 
 - Per-scenario combined metrics (the same mean/min/max/std set produced by standalone
   backtests). These are exposed on each individual as `<label>__{metric}`.
-- Aggregated metrics computed with the `backtest.suite.aggregate` rules (default `mean`).
+- Aggregated metrics computed with the `backtest.aggregate` rules (default `mean`).
   These aggregated values feed directly into `optimize.scoring` and `optimize.limits`.
+
+See [Suite Examples](suite_examples.md) for comprehensive scenario configurations including
+exchange comparisons, date range testing, and parameter sensitivity analysis.
 
 Result directories stay under `optimize_results/`, but the coin portion of the folder
 name switches to `suite_{n}_coins` to make suite runs easy to locate.
@@ -179,6 +202,9 @@ over all exchanges before scoring.
 - Penalties from `optimize.limits` are added to every objective when a bound is violated,
   turning constraint breaches into very poor scores.
 - Metrics are emitted with both USD and BTC suffixes (for example, `adg_usd` and `adg_btc`).
+- `_btc` metrics use BTC-denominated balance/equity as the numeraire even when
+  `backtest.btc_collateral_cap = 0`, so they can be used to compare strategy performance against
+  passive BTC exposure.
 - The tables below reference the base metric names for brevity; append `_usd` or `_btc` to select the denomination you want to use.
 - Exposure-normalized variants (e.g., `adg_per_exposure_long`) divide the base metric by
   that side’s configured `total_wallet_exposure_limit`, letting you compare bots that use
@@ -219,6 +245,8 @@ over all exchanges before scoring.
 | `volume_pct_per_day_avg`, `volume_pct_per_day_avg_w` | Average traded volume as % of account per day, with recency bias |
 | `peak_recovery_hours_equity_usd`, `_btc` | Longest time (in hours) the equity curve stayed below its prior peak before recovering, per denomination. Available for scoring and limit checks (e.g. `{"metric": "peak_recovery_hours_equity_usd", "penalize_if": ">", "value": 168}`). |
 | `peak_recovery_hours_pnl` | Longest recovery time (hours) of cumulative realised PnL (USD). Useful for monitoring realised drawdown recovery latency. |
+| `high_exposure_hours_{mean,max}_long` | Mean / maximum duration (hours) of continuous periods where total long wallet exposure exceeded the daily-resampled average long TWE |
+| `high_exposure_hours_{mean,max}_short` | Mean / maximum duration (hours) of continuous periods where total short wallet exposure exceeded the daily-resampled average short TWE |
 
 ### Equity Curve Quality
 | Metric | Description |

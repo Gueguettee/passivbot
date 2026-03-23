@@ -33,7 +33,6 @@ from utils import make_get_filepath
 from pure_funcs import denumpyize, ts_to_date
 import passivbot_rust as pbr
 
-
 plt.rcParams["figure.figsize"] = [21, 13]
 
 try:  # pragma: no cover
@@ -805,6 +804,131 @@ def create_forager_balance_figures(
                     pass
         if not return_figures:
             plt.close(fig)
+
+    return figures if return_figures else {}
+
+
+def create_forager_twe_figure(
+    fdf: pd.DataFrame,
+    figsize=(21, 8),
+    *,
+    autoplot: bool | None = None,
+    return_figures: bool | None = None,
+) -> dict:
+    """Plot total wallet exposure for long (positive) and short (negative) on one axis."""
+    figures: dict = {}
+    if fdf.empty or "twe_long" not in fdf.columns:
+        return figures
+
+    autoplot = (_ipy_display is not None) if autoplot is None else autoplot
+    if return_figures is None:
+        return_figures = not autoplot
+
+    # Resample to reduce point density — take last value per time bucket
+    twe = fdf.set_index("timestamp")[["twe_long", "twe_short"]].apply(pd.to_numeric, errors="coerce")
+    # twe_short is stored as signed negative; ensure it plots below zero
+    twe["twe_short"] = -twe["twe_short"].abs()
+    twe = twe.resample("1h").mean().dropna(how="all").ffill()
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    x = twe.index.to_numpy()
+
+    ax.fill_between(x, 0, twe["twe_long"].to_numpy(), alpha=0.35, color="tab:blue", label="TWE Long")
+    ax.fill_between(x, 0, twe["twe_short"].to_numpy(), alpha=0.35, color="tab:red", label="TWE Short")
+    ax.plot(x, twe["twe_long"].to_numpy(), linewidth=0.7, color="tab:blue")
+    ax.plot(x, twe["twe_short"].to_numpy(), linewidth=0.7, color="tab:red")
+
+    ax.axhline(0, color="grey", linewidth=0.5)
+    ax.set_title("Total Wallet Exposure")
+    ax.set_ylabel("TWE")
+    ax.set_xlabel("Time")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+    key = "total_wallet_exposure"
+    if return_figures:
+        figures[key] = fig
+    if autoplot:
+        if _ipy_display is not None:
+            _ipy_display(fig)
+        else:  # pragma: no cover
+            try:
+                fig.show()
+            except Exception:
+                pass
+    if not return_figures:
+        plt.close(fig)
+
+    return figures if return_figures else {}
+
+
+def create_forager_pnl_figure(
+    fdf: pd.DataFrame,
+    bal_eq: pd.DataFrame,
+    balance_sample_divider: int = 60,
+    figsize=(21, 8),
+    *,
+    autoplot: bool | None = None,
+    return_figures: bool | None = None,
+) -> dict:
+    figures: dict = {}
+    if fdf.empty:
+        return figures
+
+    autoplot = (_ipy_display is not None) if autoplot is None else autoplot
+    if return_figures is None:
+        return_figures = not autoplot
+
+    # Compute net PnL per fill (pnl + fee_paid) bucketed by time, then cumsum
+    sample_divider = max(1, int(balance_sample_divider))
+    timestamps_ns = fdf["timestamp"].astype("int64")
+    bucket = (timestamps_ns // (sample_divider * 60_000 * 1_000_000)) * (
+        sample_divider * 60_000 * 1_000_000
+    )
+    net_pnl = pd.to_numeric(fdf["pnl"], errors="coerce") + pd.to_numeric(
+        fdf["fee_paid"], errors="coerce"
+    )
+    pnl_cumsum = net_pnl.groupby(bucket).sum().cumsum()
+    pnl_cumsum.index = pd.to_datetime(pnl_cumsum.index, unit="ns")
+    pnl_cumsum.name = "pnl_cumsum"
+
+    # Compute unrealized PnL from bal_eq
+    upnl = pd.to_numeric(bal_eq["usd_total_equity"], errors="coerce") - pd.to_numeric(
+        bal_eq["usd_total_balance"], errors="coerce"
+    )
+    upnl.name = "upnl"
+
+    # Align on datetime index
+    combined = pd.concat([pnl_cumsum, upnl], axis=1, join="outer").sort_index()
+    combined["pnl_cumsum"] = combined["pnl_cumsum"].ffill().fillna(0.0)
+    combined["upnl"] = combined["upnl"].ffill().fillna(0.0)
+    combined["pnl_cumsum_plus_upnl"] = combined["pnl_cumsum"] + combined["upnl"]
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    x = combined.index.to_numpy()
+    ax.plot(x, combined["pnl_cumsum"].to_numpy(), linewidth=1.0, label="PnL Cumsum")
+    ax.plot(x, combined["pnl_cumsum_plus_upnl"].to_numpy(), linewidth=1.0, label="PnL Cumsum + uPnL")
+    ax.set_title("Cumulative Net PnL (USD)")
+    ax.set_ylabel("USD")
+    ax.set_xlabel("Time")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+    key = "pnl_cumsum"
+    if return_figures:
+        figures[key] = fig
+    if autoplot:
+        if _ipy_display is not None:
+            _ipy_display(fig)
+        else:  # pragma: no cover
+            try:
+                fig.show()
+            except Exception:
+                pass
+    if not return_figures:
+        plt.close(fig)
 
     return figures if return_figures else {}
 

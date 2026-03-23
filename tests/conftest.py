@@ -22,6 +22,20 @@ def _install_passivbot_rust_stub():
     except Exception:
         pass
 
+    # If pytest is launched outside the venv, try the project venv site-packages
+    # before falling back to the lightweight stub.
+    try:
+        import importlib
+
+        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        venv_site = os.path.join(ROOT_DIR, "venv", "lib", pyver, "site-packages")
+        if os.path.isdir(venv_site) and venv_site not in sys.path:
+            sys.path.insert(0, venv_site)
+        importlib.import_module("passivbot_rust")
+        return
+    except Exception:
+        pass
+
     stub = types.ModuleType("passivbot_rust")
     stub.__is_stub__ = True
 
@@ -130,6 +144,7 @@ def _install_passivbot_rust_stub():
     def _compute_ideal_orders_json(input_json: str) -> str:
         """Stub orchestrator that returns empty orders."""
         import json
+
         return json.dumps({"orders": []})
 
     stub.compute_ideal_orders_json = _compute_ideal_orders_json
