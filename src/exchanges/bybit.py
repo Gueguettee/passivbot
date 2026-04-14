@@ -3,9 +3,10 @@ from passivbot import logging, clip_by_timestamp
 from uuid import uuid4
 import asyncio
 import ccxt
+from copy import deepcopy
 from collections import defaultdict
 from utils import ts_to_date, utc_ms
-from config_utils import require_live_value
+from config.access import require_live_value
 from pure_funcs import (
     floatify,
     calc_hash,
@@ -26,20 +27,22 @@ class BybitBot(CCXTBot):
 
     # ═══════════════════ BYBIT-SPECIFIC METHODS ═══════════════════
 
-    async def fetch_open_orders(self, symbol: str = None) -> list:
+    async def _do_fetch_open_orders(self, symbol: str = None) -> list:
         """Bybit: Handle nextPageCursor pagination."""
-        open_orders = {}
+        open_orders = []
+        seen_ids = set()
         limit = 50
         fetched = await self.cca.fetch_open_orders(symbol=symbol, limit=limit)
 
         while True:
-            if all(elm["id"] in open_orders for elm in fetched):
+            if all(elm["id"] in seen_ids for elm in fetched):
                 break
             next_page_cursor = None
             for elm in fetched:
-                elm["position_side"] = self._get_position_side_for_order(elm)
-                elm["qty"] = elm["amount"]
-                open_orders[elm["id"]] = elm
+                if elm["id"] in seen_ids:
+                    continue
+                seen_ids.add(elm["id"])
+                open_orders.append(elm)
                 if "nextPageCursor" in elm.get("info", {}):
                     next_page_cursor = elm["info"]["nextPageCursor"]
             if len(fetched) < limit or next_page_cursor is None:
@@ -47,27 +50,38 @@ class BybitBot(CCXTBot):
             fetched = await self.cca.fetch_open_orders(
                 symbol=symbol, limit=limit, params={"cursor": next_page_cursor}
             )
+        return open_orders
 
+    def _normalize_open_orders(self, fetched: list) -> list:
+        open_orders = {}
+        for elm in fetched:
+            elm["position_side"] = self._get_position_side_for_order(elm)
+            elm["qty"] = elm["amount"]
+            self._record_live_margin_mode_from_payload(elm)
+            open_orders[elm["id"]] = elm
         return sorted(open_orders.values(), key=lambda x: x["timestamp"])
 
-    async def fetch_positions(self) -> list:
-        """Bybit: Handle nextPageCursor pagination."""
-        positions = {}
+    async def fetch_open_orders(self, symbol: str = None) -> list:
+        fetched = await self._do_fetch_open_orders(symbol=symbol)
+        return self._normalize_open_orders(fetched)
+
+    async def _do_fetch_positions_paginated(self) -> list:
+        """Bybit: Handle nextPageCursor pagination for raw position capture."""
+        positions = []
+        seen_keys = set()
         limit = 200
         fetched = await self.cca.fetch_positions(params={"limit": limit})
 
         while True:
-            if all(elm["symbol"] + elm["side"] in positions for elm in fetched):
+            if all(elm["symbol"] + elm["side"] in seen_keys for elm in fetched):
                 break
             next_page_cursor = None
             for elm in fetched:
                 key = elm["symbol"] + elm["side"]
-                positions[key] = {
-                    "symbol": elm["symbol"],
-                    "position_side": elm.get("side", "long").lower(),
-                    "size": float(elm["contracts"]),
-                    "price": float(elm["entryPrice"]),
-                }
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                positions.append(elm)
                 if "nextPageCursor" in elm.get("info", {}):
                     next_page_cursor = elm["info"]["nextPageCursor"]
             if len(fetched) < limit or next_page_cursor is None:
@@ -75,8 +89,32 @@ class BybitBot(CCXTBot):
             fetched = await self.cca.fetch_positions(
                 params={"cursor": next_page_cursor, "limit": limit}
             )
+        return positions
 
+    def _normalize_positions_snapshot(self, fetched: list) -> list:
+        positions = {}
+        for elm in fetched:
+            key = elm["symbol"] + elm["side"]
+            normalized = {
+                "symbol": elm["symbol"],
+                "position_side": elm.get("side", "long").lower(),
+                "size": float(elm["contracts"]),
+                "price": float(elm["entryPrice"]),
+            }
+            margin_mode = self._extract_live_margin_mode(elm)
+            if margin_mode is not None:
+                normalized["margin_mode"] = margin_mode
+            self._record_live_margin_mode(elm["symbol"], margin_mode)
+            positions[key] = normalized
         return list(positions.values())
+
+    async def fetch_positions(self) -> list:
+        fetched = await self._do_fetch_positions_paginated()
+        return self._normalize_positions_snapshot(fetched)
+
+    async def capture_positions_snapshot(self) -> tuple[list, list]:
+        fetched = await self._do_fetch_positions_paginated()
+        return fetched, self._normalize_positions_snapshot(deepcopy(fetched))
 
     async def fetch_balance(self) -> float:
         """Bybit: Complex UNIFIED account balance calculation."""
@@ -90,6 +128,18 @@ class BybitBot(CCXTBot):
         else:
             balance = fetched_balance[self.quote]["total"]
         return balance
+
+    async def capture_balance_snapshot(self) -> tuple[dict, float]:
+        fetched_balance = await self.cca.fetch_balance()
+        balinfo = fetched_balance["info"]["result"]["list"][0]
+        if balinfo["accountType"] == "UNIFIED":
+            balance = 0.0
+            for elm in balinfo["coin"]:
+                if elm["marginCollateral"] and elm["collateralSwitch"]:
+                    balance += float(elm["usdValue"]) + float(elm["unrealisedPnl"])
+        else:
+            balance = fetched_balance[self.quote]["total"]
+        return fetched_balance, balance
 
     async def fetch_pnls_sub(
         self,
@@ -445,42 +495,34 @@ class BybitBot(CCXTBot):
         }
 
     async def update_exchange_config_by_symbols(self, symbols):
-        coros_to_call_lev, coros_to_call_margin_mode = {}, {}
-        for symbol in symbols:
-            coros_to_call_margin_mode[symbol] = asyncio.create_task(
-                self.cca.set_margin_mode(
-                    "cross",
-                    symbol=symbol,
-                    params={"leverage": int(self.config_get(["live", "leverage"], symbol=symbol))},
-                )
-            )
-            coros_to_call_lev[symbol] = asyncio.create_task(
-                self.cca.set_leverage(
-                    int(self.config_get(["live", "leverage"], symbol=symbol)), symbol=symbol
-                )
-            )
         for symbol in symbols:
             to_print = ""
-            # Handle leverage setting - ignore "not modified" errors (retCode 110043)
+            leverage = self._calc_leverage_for_symbol(symbol)
+            margin_mode = self._get_margin_mode_for_symbol(symbol)
             try:
-                res = await coros_to_call_lev[symbol]
-                to_print += f"leverage={format_exchange_config_response(res)} "
+                res = await self.cca.set_margin_mode(
+                    margin_mode,
+                    symbol=symbol,
+                    params={"leverage": leverage},
+                )
+                to_print += f"margin={format_exchange_config_response(res)} "
             except ccxt.BadRequest as e:
-                if "110043" in str(e) or "not modified" in str(e).lower():
-                    logging.debug(f"{symbol}: leverage already set (not modified)")
-                else:
-                    logging.warning(f"{symbol}: leverage set failed: {e}")
-            # Handle margin mode setting - ignore "not modified" errors
-            try:
-                res = await coros_to_call_margin_mode[symbol]
-                to_print += f"margin={format_exchange_config_response(res)}"
-            except ccxt.BadRequest as e:
-                if "110026" in str(e) or "not modified" in str(e).lower():
+                err_str = str(e).lower()
+                if "110026" in err_str or "not modified" in err_str:
                     logging.debug(f"{symbol}: margin mode already set (not modified)")
                 else:
-                    logging.warning(f"{symbol}: margin mode set failed: {e}")
+                    raise
+            try:
+                res = await self.cca.set_leverage(leverage, symbol=symbol)
+                to_print += f"leverage={format_exchange_config_response(res)}"
+            except ccxt.BadRequest as e:
+                err_str = str(e).lower()
+                if "110043" in err_str or "not modified" in err_str:
+                    logging.debug(f"{symbol}: leverage already set (not modified)")
+                else:
+                    raise
             if to_print:
-                logging.info(f"{symbol}: {to_print}")
+                logging.info(f"{symbol}: {to_print.strip()}")
 
     async def update_exchange_config(self):
         res = await self.cca.set_position_mode(True)

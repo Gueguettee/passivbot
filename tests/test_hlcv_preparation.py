@@ -30,6 +30,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import hlcv_preparation as hp
 from hlcv_preparation import HLCVManager, prepare_hlcvs, prepare_hlcvs_combined
 from candlestick_manager import CandlestickManager, CANDLE_DTYPE
 
@@ -104,16 +105,16 @@ def sample_config():
                 "enabled": True,
                 "ema_span_0": 1000.0,
                 "ema_span_1": 1500.0,
-                "filter_volume_ema_span": 2000.0,
-                "filter_volatility_ema_span": 100.0,
+                "forager_volume_ema_span": 2000.0,
+                "forager_volatility_ema_span": 100.0,
                 "entry_volatility_ema_span_hours": 1.0,
             },
             "short": {
                 "enabled": True,
                 "ema_span_0": 1000.0,
                 "ema_span_1": 1500.0,
-                "filter_volume_ema_span": 2000.0,
-                "filter_volatility_ema_span": 100.0,
+                "forager_volume_ema_span": 2000.0,
+                "forager_volatility_ema_span": 100.0,
                 "entry_volatility_ema_span_hours": 1.0,
             },
         },
@@ -168,6 +169,32 @@ def create_numpy_candles(start_ts: int, num_candles: int, base_price: float = 10
         v = 100.0 + i
         candles.append((ts, o, h, l, c, v))
     return np.array(candles, dtype=CANDLE_DTYPE)
+
+
+def test_remote_fetch_log_ccxt_ok_includes_returned_range(caplog):
+    om = HLCVManager(
+        exchange="bybit",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+    )
+
+    payload = {
+        "kind": "ccxt_fetch_ohlcv",
+        "stage": "ok",
+        "symbol": "XMR/USDT:USDT",
+        "tf": "1m",
+        "rows": 1000,
+        "first_ts": 1642118400000,
+        "last_ts": 1642204740000,
+        "elapsed_ms": 612,
+    }
+
+    with caplog.at_level("INFO"):
+        om._remote_fetch_log(payload)
+
+    assert "download ccxt ok" in caplog.text
+    assert "first=2022-01-14T00:00:00Z" in caplog.text
+    assert "last=2022-01-14T23:59:00Z" in caplog.text
 
 
 # ============================================================================
@@ -435,6 +462,8 @@ class TestHLCVManagerGapHandling:
         )
         om.tradfi_for_stock_perps = True
         om.load_cc = lambda: None
+        om.load_markets = AsyncMock()
+        om.markets = {"XYZ-AAPL/USDC:USDC": {"symbol": "XYZ-AAPL/USDC:USDC"}}
         om.has_coin = lambda coin: True
         om.get_symbol = lambda coin: "XYZ-AAPL/USDC:USDC"
         om.cm = MagicMock()
@@ -1187,6 +1216,60 @@ class TestPrepareHLCVSCombined:
         pytest.skip(
             "Full integration test requires extensive mocking - validated through backtest integration"
         )
+
+    @pytest.mark.asyncio
+    async def test_prepare_hlcvs_combined_forced_source_surfaces_fetch_exception(
+        self, sample_config, monkeypatch
+    ):
+        sample_config["backtest"]["exchanges"] = ["binance", "bybit"]
+        sample_config["live"]["approved_coins"] = {"long": ["BTC"], "short": []}
+
+        class FakeManager:
+            def __init__(self, exchange, start_date, end_date, **kwargs):
+                self.exchange = exchange
+                self.start_date = start_date
+                self.end_date = end_date
+                self.markets = {"BTC/USDT:USDT": {"id": "BTCUSDT"}}
+                self.cc = None
+
+            async def load_markets(self):
+                return None
+
+            def has_coin(self, coin):
+                return coin == "BTC"
+
+            def update_date_range(self, start_ts, end_ts):
+                self.start_ts = start_ts
+                self.end_ts = end_ts
+
+            def get_market_specific_settings(self, coin):
+                return {
+                    "exchange": self.exchange,
+                    "symbol": f"{coin}/USDT:USDT",
+                    "qty_step": 0.001,
+                    "price_step": 0.1,
+                    "min_cost": 5.0,
+                }
+
+            async def close(self):
+                return None
+
+            async def aclose(self):
+                return None
+
+        async def fake_fetch_data_for_coin_and_exchange(*args, **kwargs):
+            raise RuntimeError("binance fetch exploded")
+
+        monkeypatch.setattr(hp, "HLCVManager", FakeManager)
+        monkeypatch.setattr(
+            hp, "get_first_timestamps_unified", AsyncMock(return_value={"BTC": 0})
+        )
+        monkeypatch.setattr(hp, "fetch_data_for_coin_and_exchange", fake_fetch_data_for_coin_and_exchange)
+
+        with pytest.raises(
+            RuntimeError, match=r"Forced exchange binanceusdm failed for coin BTC"
+        ):
+            await prepare_hlcvs_combined(sample_config, forced_sources={"BTC": "binance"})
 
 
 # ============================================================================

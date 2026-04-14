@@ -646,38 +646,38 @@ config = {
 
 #### TC9.1: Backtest CLI with scenarios
 ```bash
-python src/backtest.py config_with_scenarios.json
+passivbot backtest config_with_scenarios.json
 ```
 **Expected:** Suite mode detected, all scenarios executed, summary produced.
 
 #### TC9.2: Backtest CLI with --suite flag
 ```bash
-python src/backtest.py config.json --suite
+passivbot backtest config.json --suite
 ```
 **Expected:** Suite mode forced on even if scenarios might be empty.
 
 #### TC9.3: Optimizer with scenarios
 ```bash
-python src/optimize.py config_with_scenarios.json
+passivbot optimize config_with_scenarios.json
 ```
 **Expected:** Suite mode detected, candidates evaluated across all scenarios.
 
 #### TC9.4: Suite config override file
 ```bash
-python src/backtest.py base_config.json --suite-config override_scenarios.json
+passivbot backtest base_config.json --suite-config override_scenarios.json
 ```
 **Expected:** Scenarios from override file used instead of base.
 
 #### TC9.5: Filter scenarios with --scenarios
 ```bash
-python src/backtest.py config.json --scenarios base
-python src/backtest.py config.json -sc base,binance_only
+passivbot backtest config.json --scenarios base
+passivbot backtest config.json -sc base,binance_only
 ```
 **Expected:** Only scenarios matching the labels run. Implies `--suite y`.
 
 #### TC9.6: Disable suite with --suite n
 ```bash
-python src/backtest.py config.json --suite n
+passivbot backtest config.json --suite n
 ```
 **Expected:** Plain backtest, scenarios ignored even if defined in config.
 
@@ -692,14 +692,14 @@ config = {
 }
 ```
 ```bash
-python src/backtest.py config.json        # Plain backtest (config disables)
-python src/backtest.py config.json --suite y  # Suite mode (CLI overrides)
+passivbot backtest config.json        # Plain backtest (config disables)
+passivbot backtest config.json --suite y  # Suite mode (CLI overrides)
 ```
 **Expected:** Config `suite_enabled` controls default, CLI `--suite` overrides.
 
 #### TC9.8: --scenarios with no matches (error)
 ```bash
-python src/backtest.py config.json --scenarios nonexistent_label
+passivbot backtest config.json --scenarios nonexistent_label
 ```
 **Expected:** Error with message listing available scenario labels.
 
@@ -726,7 +726,8 @@ For each test case, verify:
 
 | File | Test Focus |
 |------|------------|
-| `src/config_utils.py` | Migration, validation |
+| `src/config/normalize.py` | Canonical config normalization pipeline |
+| `src/config/migrations/` | Legacy config migration and flavor detection |
 | `src/suite_runner.py` | `build_scenarios()`, `extract_suite_config()`, data prep |
 | `src/backtest.py` | CLI routing, suite mode detection |
 | `src/optimize.py` | CLI routing, suite mode detection |
@@ -744,7 +745,8 @@ For each test case, verify:
 
 ```python
 # Quick validation script
-from config_utils import load_config, format_config, get_template_config
+from config import load_prepared_config
+from config_utils import format_config, get_template_config
 from suite_runner import build_scenarios, extract_suite_config
 
 def verify_config(config_dict, expected_scenarios, expected_exchanges_per_scenario):

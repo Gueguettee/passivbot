@@ -36,11 +36,24 @@ and more stable across collateral caps.
 - `omega_ratio`: Sum of positive daily returns divided by the absolute sum of negative daily returns.
 - `sterling_ratio`: `adg` divided by the average of the worst 1% drawdowns.
 - `calmar_ratio`: `adg` divided by the worst drawdown observed over the full equity curve.
+- `paper_loss_ratio`: `adg` divided by the worst absolute negative equity-vs-balance gap.
+- `paper_loss_mean_ratio`: `adg` divided by the mean absolute negative equity-vs-balance gap.
+- `exposure_ratio`: `adg` divided by the maximum absolute recorded wallet exposure.
+- `exposure_mean_ratio`: `adg` divided by the mean absolute recorded wallet exposure.
+
+Weighted `_w` variants use the same trailing-slice averaging as the rest of the `_w` metrics.
 
 ## Drawdown and tail metrics
 - `drawdown_worst`: Maximum absolute drawdown over the equity curve.
 - `drawdown_worst_mean_1pct`: Mean of the worst 1% daily drawdowns.
 - `expected_shortfall_1pct`: Average loss of the worst 1% daily min-equity returns.
+
+## HSL metrics
+- `hard_stop_triggers`: Absolute count of RED trigger events during the run.
+- `hard_stop_restarts`: Absolute count of cooldown restarts after RED halts.
+- `hard_stop_total_loss_pct`: Total panic-close loss as a fraction of starting balance.
+- `hard_stop_triggers_per_year`: `hard_stop_triggers / n_days * 365.25`.
+- `hard_stop_restarts_per_year`: `hard_stop_restarts / n_days * 365.25`.
 
 ## Exposure, volume, and timing
 - `total_wallet_exposure_max/mean/median`: Stats over recorded wallet exposure values.
@@ -50,3 +63,15 @@ and more stable across collateral caps.
 - `position_unchanged_hours_max`: Longest span with no fills on an open position.
 - `peak_recovery_hours_equity`: Longest time to make a new high on the equity curve.
 - `peak_recovery_hours_pnl`: Same calculation on cumulative realized PnL.
+
+## Trade-level metrics
+- `win_rate`: Fraction of completed trades with positive net realized PnL.
+- `win_rate_w`: Mean `win_rate` across the same trailing-slice weighted analysis used for other
+  `_w` metrics.
+- `trade_loss_max`: Worst completed-trade loss as a fraction of the account balance at trade open.
+- `trade_loss_mean`: Mean losing-trade loss fraction in that same unit.
+- `trade_loss_median`: Median losing-trade loss fraction in that same unit.
+
+A completed trade is one full position lifecycle from open to flat for a single `coin + side`.
+Realized PnL is accumulated from `fill.pnl` over that lifecycle. Positions that remain open at the
+end of the backtest are excluded from these trade-level metrics.

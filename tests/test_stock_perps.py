@@ -3,8 +3,8 @@ Tests for HIP-3 Stock Perpetuals support.
 
 Tests cover:
 - Symbol detection (xyz: prefix, onlyIsolated flag)
-- Leverage capping (10x max for HIP-3)
-- Margin mode selection (isolated for HIP-3, cross otherwise)
+- Leverage capping (10x max for isolated-only HIP-3)
+- Margin mode selection (cross for cross-capable HIP-3, isolated metadata handling)
 - Symbol mapping (xyz:TSLA <-> TSLA)
 - Config enablement (stock_perps.enabled)
 """
@@ -144,19 +144,26 @@ class TestHyperliquidBotHIP3:
         """Test HIP-3 max leverage constant is 10."""
         assert bot_class.HIP3_MAX_LEVERAGE == 10
 
-    def test_requires_isolated_margin_by_prefix(self, bot_class):
-        """Test isolated margin detection by xyz: prefix."""
+    def test_requires_isolated_margin_uses_market_metadata(self, bot_class):
+        """HIP-3 isolated requirement must come from market metadata, not just prefix."""
         # Create minimal bot instance for method testing
         bot = object.__new__(bot_class)
-        bot.markets_dict = {}
+        bot.markets_dict = {
+            "xyz:TSLA/USDC:USDC": {
+                "info": {"onlyIsolated": True},
+                "marginModes": {"cross": False, "isolated": True},
+            },
+            "XYZ-XYZ100/USDC:USDC": {
+                "baseName": "xyz:XYZ100",
+                "info": {"marginMode": "normal"},
+                "marginModes": {"cross": True, "isolated": True},
+            },
+        }
         bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
         bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
 
-        # Test prefix detection
         assert bot._requires_isolated_margin("xyz:TSLA/USDC:USDC") is True
-        assert bot._requires_isolated_margin("xyz:NVDA/USDC:USDC") is True
-        assert bot._requires_isolated_margin("XYZ-XYZ100/USDC:USDC") is True
-        assert bot._requires_isolated_margin("XYZ:XYZ100/USDC:USDC") is True
+        assert bot._requires_isolated_margin("XYZ-XYZ100/USDC:USDC") is False
         assert bot._requires_isolated_margin("BTC/USDC:USDC") is False
         assert bot._requires_isolated_margin("ETH/USDC:USDC") is False
 
@@ -177,13 +184,20 @@ class TestHyperliquidBotHIP3:
         assert bot._requires_isolated_margin("BTC/USDC:USDC") is False
 
     @pytest.mark.asyncio
-    async def test_update_exchange_config_uses_isolated_for_xyz_prefixed_ccxt_symbol(self, bot_class):
-        """CCXT's XYZ- prefixed HIP-3 symbols must use isolated margin mode."""
+    async def test_update_exchange_config_uses_cross_for_cross_capable_hip3(self, bot_class):
+        """Cross-capable HIP-3 symbols must stay on cross mode."""
         bot = object.__new__(bot_class)
         bot.exchange = "hyperliquid"
         bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
         bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
         bot.user_info = {"is_vault": False}
+        bot.markets_dict = {
+            "XYZ-XYZ100/USDC:USDC": {
+                "baseName": "xyz:XYZ100",
+                "info": {"marginMode": "normal"},
+                "marginModes": {"cross": True, "isolated": True},
+            }
+        }
         bot.cca = MagicMock()
         bot.cca.set_margin_mode = AsyncMock(return_value={"status": "ok"})
         bot._calc_leverage_for_symbol = lambda symbol: 7
@@ -191,22 +205,23 @@ class TestHyperliquidBotHIP3:
         await bot.update_exchange_config_by_symbols(["XYZ-XYZ100/USDC:USDC"])
 
         bot.cca.set_margin_mode.assert_awaited_once_with(
-            "isolated",
+            "cross",
             symbol="XYZ-XYZ100/USDC:USDC",
             params={"leverage": 7},
         )
 
     @pytest.mark.asyncio
-    async def test_fetch_positions_and_balance_augments_hip3_positions_via_fetch_positions(
+    async def test_fetch_positions_and_balance_uses_dex_scoped_fetch_for_hip3_state(
         self, bot_class
     ):
-        """HIP-3 positions must be fetched through dex-scoped fetch_positions calls."""
+        """Symbol-less HIP-3 state refresh must use dex-scoped fetch_positions calls."""
         bot = object.__new__(bot_class)
         bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
         bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
         bot.active_symbols = ["XYZ-XYZ100/USDC:USDC"]
         bot.open_orders = {}
         bot.positions = {}
+        bot._hl_live_margin_modes = {}
         bot.markets_dict = {
             "XYZ-XYZ100/USDC:USDC": {"baseName": "xyz:XYZ100", "info": {}},
         }
@@ -231,22 +246,315 @@ class TestHyperliquidBotHIP3:
             ]
         )
 
-        positions, balance = await bot._fetch_positions_and_balance()
+        raw_snapshot, positions, balance = await bot._fetch_positions_and_balance()
 
         assert balance == 1000.0
+        assert raw_snapshot["balance"]["info"]["marginSummary"]["accountValue"] == "1000.0"
+        assert raw_snapshot["positions"]["core"] == []
+        assert raw_snapshot["positions"]["hip3"][0]["fetch_spec"] == {"params": {"dex": "xyz"}}
         assert positions == [
             {
                 "symbol": "XYZ-XYZ100/USDC:USDC",
                 "position_side": "long",
                 "size": 0.0009,
                 "price": 24982.0,
+                "margin_mode": None,
+                "margin_used": 0.0,
             }
         ]
-        bot.cca.fetch_positions.assert_awaited_once_with(symbols=["XYZ-XYZ100/USDC:USDC"])
+        bot.cca.fetch_positions.assert_awaited_once_with(params={"dex": "xyz"})
 
     @pytest.mark.asyncio
-    async def test_fetch_open_orders_queries_hip3_symbols_with_symbol_scope(self, bot_class):
-        """HIP-3 open orders must be fetched via symbol-scoped dex routes."""
+    async def test_fetch_positions_and_balance_bootstraps_approved_hip3_positions_via_dex_on_startup(
+        self, bot_class
+    ):
+        """Startup must use dex-scoped discovery even when HIP-3 approvals exist."""
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.active_symbols = []
+        bot.open_orders = {}
+        bot.positions = {}
+        bot.approved_coins_minus_ignored_coins = {
+            "long": {"XYZ-XYZ100/USDC:USDC"},
+            "short": set(),
+        }
+        bot.coin_overrides = {}
+        bot._hl_live_margin_modes = {}
+        bot.markets_dict = {
+            "XYZ-XYZ100/USDC:USDC": {"baseName": "xyz:XYZ100", "info": {}},
+            "BTC/USDC:USDC": {"baseName": "BTC", "info": {}},
+        }
+        bot.coin_to_symbol = lambda coin: f"{coin}/USDC:USDC"
+        bot.cca = MagicMock()
+        bot.cca.fetch_balance = AsyncMock(
+            return_value={
+                "info": {
+                    "assetPositions": [],
+                    "marginSummary": {"accountValue": "1000.0"},
+                }
+            }
+        )
+        bot.cca.fetch_positions = AsyncMock(
+            return_value=[
+                {
+                    "symbol": "XYZ-XYZ100/USDC:USDC",
+                    "side": "long",
+                    "contracts": 0.0009,
+                    "entryPrice": 24982.0,
+                }
+            ]
+        )
+
+        raw_snapshot, positions, balance = await bot._fetch_positions_and_balance()
+
+        assert balance == 1000.0
+        assert raw_snapshot["balance"]["info"]["marginSummary"]["accountValue"] == "1000.0"
+        assert raw_snapshot["positions"]["core"] == []
+        assert raw_snapshot["positions"]["hip3"][0]["fetch_spec"] == {"params": {"dex": "xyz"}}
+        assert positions == [
+            {
+                "symbol": "XYZ-XYZ100/USDC:USDC",
+                "position_side": "long",
+                "size": 0.0009,
+                "price": 24982.0,
+                "margin_mode": None,
+                "margin_used": 0.0,
+            }
+        ]
+        bot.cca.fetch_positions.assert_awaited_once_with(params={"dex": "xyz"})
+
+    @pytest.mark.asyncio
+    async def test_fetch_positions_and_balance_bootstraps_mixed_approved_unapproved_hip3_positions_via_dex(
+        self, bot_class
+    ):
+        """Startup must not let approved HIP-3 symbols hide different unapproved live HIP-3 positions."""
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.active_symbols = []
+        bot.open_orders = {}
+        bot.positions = {}
+        bot.approved_coins_minus_ignored_coins = {
+            "long": {"XYZ-XYZ100/USDC:USDC"},
+            "short": set(),
+        }
+        bot.coin_overrides = {}
+        bot._hl_live_margin_modes = {}
+        bot.markets_dict = {
+            "XYZ-XYZ100/USDC:USDC": {"baseName": "xyz:XYZ100", "info": {}},
+            "XYZ-XYZ200/USDC:USDC": {"baseName": "xyz:XYZ200", "info": {}},
+            "BTC/USDC:USDC": {"baseName": "BTC", "info": {}},
+        }
+        bot.coin_to_symbol = lambda coin: f"{coin}/USDC:USDC"
+        bot.cca = MagicMock()
+        bot.cca.fetch_balance = AsyncMock(
+            return_value={
+                "info": {
+                    "assetPositions": [],
+                    "marginSummary": {"accountValue": "1000.0"},
+                }
+            }
+        )
+        bot.cca.fetch_positions = AsyncMock(
+            return_value=[
+                {
+                    "symbol": "XYZ-XYZ200/USDC:USDC",
+                    "side": "long",
+                    "contracts": 0.0009,
+                    "entryPrice": 24982.0,
+                    "marginMode": "cross",
+                }
+            ]
+        )
+
+        raw_snapshot, positions, balance = await bot._fetch_positions_and_balance()
+
+        assert balance == 1000.0
+        assert raw_snapshot["balance"]["info"]["marginSummary"]["accountValue"] == "1000.0"
+        assert raw_snapshot["positions"]["core"] == []
+        assert raw_snapshot["positions"]["hip3"][0]["fetch_spec"] == {"params": {"dex": "xyz"}}
+        assert positions == [
+            {
+                "symbol": "XYZ-XYZ200/USDC:USDC",
+                "position_side": "long",
+                "size": 0.0009,
+                "price": 24982.0,
+                "margin_mode": "cross",
+                "margin_used": 0.0,
+            }
+        ]
+        bot.cca.fetch_positions.assert_awaited_once_with(params={"dex": "xyz"})
+
+    @pytest.mark.asyncio
+    async def test_fetch_positions_and_balance_steady_state_discovers_untracked_hip3_positions_via_dex(
+        self, bot_class
+    ):
+        """Once any HIP-3 symbol is tracked, dex-wide discovery must still find new external HIP-3 state."""
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.active_symbols = ["XYZ-XYZ100/USDC:USDC"]
+        bot.open_orders = {"XYZ-XYZ100/USDC:USDC": [{"id": "tracked"}]}
+        bot.positions = {
+            "XYZ-XYZ100/USDC:USDC": {
+                "long": {"size": 0.001, "price": 24000.0},
+                "short": {"size": 0.0, "price": 0.0},
+            }
+        }
+        bot.approved_coins_minus_ignored_coins = {
+            "long": {"XYZ-XYZ100/USDC:USDC"},
+            "short": set(),
+        }
+        bot.coin_overrides = {}
+        bot._hl_live_margin_modes = {}
+        bot.markets_dict = {
+            "XYZ-XYZ100/USDC:USDC": {"baseName": "xyz:XYZ100", "info": {}},
+            "XYZ-XYZ200/USDC:USDC": {"baseName": "xyz:XYZ200", "info": {}},
+            "BTC/USDC:USDC": {"baseName": "BTC", "info": {}},
+        }
+        bot.coin_to_symbol = lambda coin: f"{coin}/USDC:USDC"
+        bot.cca = MagicMock()
+        bot.cca.fetch_balance = AsyncMock(
+            return_value={
+                "info": {
+                    "assetPositions": [],
+                    "marginSummary": {"accountValue": "1000.0"},
+                }
+            }
+        )
+        bot.cca.fetch_positions = AsyncMock(
+            return_value=[
+                {
+                    "symbol": "XYZ-XYZ200/USDC:USDC",
+                    "side": "long",
+                    "contracts": 0.0009,
+                    "entryPrice": 24982.0,
+                    "marginMode": "cross",
+                }
+            ]
+        )
+
+        raw_snapshot, positions, balance = await bot._fetch_positions_and_balance()
+
+        assert balance == 1000.0
+        assert raw_snapshot["balance"]["info"]["marginSummary"]["accountValue"] == "1000.0"
+        assert raw_snapshot["positions"]["core"] == []
+        assert raw_snapshot["positions"]["hip3"][0]["fetch_spec"] == {"params": {"dex": "xyz"}}
+        assert positions == [
+            {
+                "symbol": "XYZ-XYZ200/USDC:USDC",
+                "position_side": "long",
+                "size": 0.0009,
+                "price": 24982.0,
+                "margin_mode": "cross",
+                "margin_used": 0.0,
+            }
+        ]
+        bot.cca.fetch_positions.assert_awaited_once_with(params={"dex": "xyz"})
+
+    @pytest.mark.asyncio
+    async def test_fetch_positions_and_balance_bootstraps_unapproved_hip3_positions_via_dex(
+        self, bot_class
+    ):
+        """Startup must discover pre-existing unapproved HIP-3 positions via dex-scoped queries."""
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.active_symbols = []
+        bot.open_orders = {}
+        bot.positions = {}
+        bot.approved_coins_minus_ignored_coins = {"long": set(), "short": set()}
+        bot.coin_overrides = {}
+        bot._hl_live_margin_modes = {}
+        bot.markets_dict = {
+            "XYZ-XYZ100/USDC:USDC": {"baseName": "xyz:XYZ100", "info": {}},
+            "XYZ-XYZ200/USDC:USDC": {"baseName": "xyz:XYZ200", "info": {}},
+            "BTC/USDC:USDC": {"baseName": "BTC", "info": {}},
+        }
+        bot.coin_to_symbol = lambda coin: f"{coin}/USDC:USDC"
+        bot.cca = MagicMock()
+        bot.cca.fetch_balance = AsyncMock(
+            return_value={
+                "info": {
+                    "assetPositions": [],
+                    "marginSummary": {"accountValue": "1000.0"},
+                }
+            }
+        )
+        bot.cca.fetch_positions = AsyncMock(
+            return_value=[
+                {
+                    "symbol": "XYZ-XYZ100/USDC:USDC",
+                    "side": "long",
+                    "contracts": 0.0009,
+                    "entryPrice": 24982.0,
+                    "marginMode": "cross",
+                }
+            ]
+        )
+
+        raw_snapshot, positions, balance = await bot._fetch_positions_and_balance()
+
+        assert balance == 1000.0
+        assert raw_snapshot["balance"]["info"]["marginSummary"]["accountValue"] == "1000.0"
+        assert raw_snapshot["positions"]["core"] == []
+        assert raw_snapshot["positions"]["hip3"][0]["fetch_spec"] == {"params": {"dex": "xyz"}}
+        assert positions == [
+            {
+                "symbol": "XYZ-XYZ100/USDC:USDC",
+                "position_side": "long",
+                "size": 0.0009,
+                "price": 24982.0,
+                "margin_mode": "cross",
+                "margin_used": 0.0,
+            }
+        ]
+        bot.cca.fetch_positions.assert_awaited_once_with(params={"dex": "xyz"})
+
+    def test_isolated_only_hip3_is_ignored_for_new_entries(self, bot_class, caplog):
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.markets_dict = {
+            "xyz:TSLA/USDC:USDC": {
+                "info": {"onlyIsolated": True},
+                "marginModes": {"cross": False, "isolated": True},
+            }
+        }
+
+        with caplog.at_level("WARNING"):
+            filtered = bot._filter_approved_symbols("long", {"xyz:TSLA/USDC:USDC"})
+
+        assert filtered == set()
+        assert "isolated margin is currently unsupported" in caplog.text
+
+    def test_isolated_only_hip3_open_orders_hard_fail(self, bot_class):
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.markets_dict = {
+            "xyz:SP500/USDC:USDC": {
+                "baseName": "xyz:SP500",
+                "info": {"onlyIsolated": True},
+                "marginModes": {"cross": False, "isolated": True},
+            }
+        }
+        bot.positions = {
+            "xyz:SP500/USDC:USDC": {
+                "long": {"size": 0.0, "price": 0.0},
+                "short": {"size": 0.0, "price": 0.0},
+            }
+        }
+        bot.open_orders = {"xyz:SP500/USDC:USDC": [{"id": "1"}]}
+        bot._hl_live_margin_modes = {}
+
+        with pytest.raises(NotImplementedError, match="Unsupported live state detected"):
+            bot._assert_supported_live_state()
+
+    @pytest.mark.asyncio
+    async def test_fetch_open_orders_queries_explicit_hip3_symbol_with_symbol_scope(self, bot_class):
+        """Explicit HIP-3 symbol queries must still use symbol-scoped order routes."""
         bot = object.__new__(bot_class)
         bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
         bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
@@ -259,13 +567,74 @@ class TestHyperliquidBotHIP3:
         bot.determine_pos_side = lambda order: "long"
         bot.cca = MagicMock()
 
-        async def fetch_open_orders(symbol=None):
+        async def fetch_open_orders(symbol=None, params=None):
+            if params is not None:
+                return []
             if symbol is None:
                 return []
             return [
                 {
                     "id": "abc123",
                     "symbol": symbol,
+                    "side": "buy",
+                    "amount": 0.0009,
+                    "price": 24980.0,
+                    "timestamp": 1000,
+                }
+            ]
+
+        bot.cca.fetch_open_orders = AsyncMock(side_effect=fetch_open_orders)
+
+        orders = await bot.fetch_open_orders(symbol="XYZ-XYZ100/USDC:USDC")
+
+        assert orders == [
+            {
+                "id": "abc123",
+                "symbol": "XYZ-XYZ100/USDC:USDC",
+                "side": "buy",
+                "amount": 0.0009,
+                "price": 24980.0,
+                "timestamp": 1000,
+                "position_side": "long",
+                "qty": 0.0009,
+            }
+        ]
+        assert bot.cca.fetch_open_orders.await_args_list[0].kwargs == {
+            "symbol": "XYZ-XYZ100/USDC:USDC"
+        }
+
+    @pytest.mark.asyncio
+    async def test_fetch_open_orders_bootstraps_approved_hip3_orders_via_dex_on_startup(
+        self, bot_class
+    ):
+        """Startup must use dex-scoped order discovery even when HIP-3 approvals exist."""
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.active_symbols = []
+        bot.open_orders = {}
+        bot.positions = {}
+        bot.approved_coins_minus_ignored_coins = {
+            "long": {"XYZ-XYZ100/USDC:USDC"},
+            "short": set(),
+        }
+        bot.coin_overrides = {}
+        bot.markets_dict = {
+            "XYZ-XYZ100/USDC:USDC": {"baseName": "xyz:XYZ100", "info": {}},
+            "BTC/USDC:USDC": {"baseName": "BTC", "info": {}},
+        }
+        bot.determine_pos_side = lambda order: "long"
+        bot.cca = MagicMock()
+
+        async def fetch_open_orders(symbol=None, params=None):
+            if symbol is None and params is None:
+                return []
+            if params != {"dex": "xyz"}:
+                return []
+            return [
+                {
+                    "id": "abc123",
+                    "symbol": "XYZ-XYZ100/USDC:USDC",
                     "side": "buy",
                     "amount": 0.0009,
                     "price": 24980.0,
@@ -290,9 +659,187 @@ class TestHyperliquidBotHIP3:
             }
         ]
         assert bot.cca.fetch_open_orders.await_args_list[0].kwargs == {"symbol": None}
-        assert bot.cca.fetch_open_orders.await_args_list[1].kwargs == {
-            "symbol": "XYZ-XYZ100/USDC:USDC"
+        assert bot.cca.fetch_open_orders.await_args_list[1].kwargs == {"params": {"dex": "xyz"}}
+
+    @pytest.mark.asyncio
+    async def test_fetch_open_orders_bootstraps_mixed_approved_unapproved_hip3_orders_via_dex(
+        self, bot_class
+    ):
+        """Startup must not let approved HIP-3 symbols hide unapproved live HIP-3 orders."""
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.active_symbols = []
+        bot.open_orders = {}
+        bot.positions = {}
+        bot.approved_coins_minus_ignored_coins = {
+            "long": {"XYZ-XYZ100/USDC:USDC"},
+            "short": set(),
         }
+        bot.coin_overrides = {}
+        bot._hl_live_margin_modes = {}
+        bot.markets_dict = {
+            "XYZ-XYZ100/USDC:USDC": {"baseName": "xyz:XYZ100", "info": {}},
+            "XYZ-XYZ200/USDC:USDC": {"baseName": "xyz:XYZ200", "info": {}},
+            "BTC/USDC:USDC": {"baseName": "BTC", "info": {}},
+        }
+        bot.determine_pos_side = lambda order: "long"
+        bot.cca = MagicMock()
+
+        async def fetch_open_orders(symbol=None, params=None):
+            if symbol is None and params is None:
+                return []
+            if params != {"dex": "xyz"}:
+                return []
+            return [
+                {
+                    "id": "abc123",
+                    "symbol": "XYZ-XYZ200/USDC:USDC",
+                    "side": "buy",
+                    "amount": 0.0009,
+                    "price": 24980.0,
+                    "timestamp": 1000,
+                }
+            ]
+
+        bot.cca.fetch_open_orders = AsyncMock(side_effect=fetch_open_orders)
+
+        orders = await bot.fetch_open_orders()
+
+        assert orders == [
+            {
+                "id": "abc123",
+                "symbol": "XYZ-XYZ200/USDC:USDC",
+                "side": "buy",
+                "amount": 0.0009,
+                "price": 24980.0,
+                "timestamp": 1000,
+                "position_side": "long",
+                "qty": 0.0009,
+            }
+        ]
+        assert bot.cca.fetch_open_orders.await_args_list[0].kwargs == {"symbol": None}
+        assert bot.cca.fetch_open_orders.await_args_list[1].kwargs == {"params": {"dex": "xyz"}}
+
+    @pytest.mark.asyncio
+    async def test_fetch_open_orders_steady_state_discovers_untracked_hip3_orders_via_dex(
+        self, bot_class
+    ):
+        """Once any HIP-3 symbol is tracked, dex-wide order discovery must still find new external HIP-3 orders."""
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.active_symbols = ["XYZ-XYZ100/USDC:USDC"]
+        bot.open_orders = {"XYZ-XYZ100/USDC:USDC": [{"id": "tracked"}]}
+        bot.positions = {
+            "XYZ-XYZ100/USDC:USDC": {
+                "long": {"size": 0.001, "price": 24000.0},
+                "short": {"size": 0.0, "price": 0.0},
+            }
+        }
+        bot.approved_coins_minus_ignored_coins = {
+            "long": {"XYZ-XYZ100/USDC:USDC"},
+            "short": set(),
+        }
+        bot.coin_overrides = {}
+        bot._hl_live_margin_modes = {}
+        bot.markets_dict = {
+            "XYZ-XYZ100/USDC:USDC": {"baseName": "xyz:XYZ100", "info": {}},
+            "XYZ-XYZ200/USDC:USDC": {"baseName": "xyz:XYZ200", "info": {}},
+            "BTC/USDC:USDC": {"baseName": "BTC", "info": {}},
+        }
+        bot.determine_pos_side = lambda order: "long"
+        bot.cca = MagicMock()
+
+        async def fetch_open_orders(symbol=None, params=None):
+            if symbol is None and params is None:
+                return []
+            if params != {"dex": "xyz"}:
+                return []
+            return [
+                {
+                    "id": "abc123",
+                    "symbol": "XYZ-XYZ200/USDC:USDC",
+                    "side": "buy",
+                    "amount": 0.0009,
+                    "price": 24980.0,
+                    "timestamp": 1000,
+                }
+            ]
+
+        bot.cca.fetch_open_orders = AsyncMock(side_effect=fetch_open_orders)
+
+        orders = await bot.fetch_open_orders()
+
+        assert orders == [
+            {
+                "id": "abc123",
+                "symbol": "XYZ-XYZ200/USDC:USDC",
+                "side": "buy",
+                "amount": 0.0009,
+                "price": 24980.0,
+                "timestamp": 1000,
+                "position_side": "long",
+                "qty": 0.0009,
+            }
+        ]
+        assert bot.cca.fetch_open_orders.await_args_list[0].kwargs == {"symbol": None}
+        assert bot.cca.fetch_open_orders.await_args_list[1].kwargs == {"params": {"dex": "xyz"}}
+
+    @pytest.mark.asyncio
+    async def test_fetch_open_orders_bootstraps_unapproved_hip3_orders_via_dex(self, bot_class):
+        """Startup must discover pre-existing unapproved HIP-3 open orders via dex-scoped queries."""
+        bot = object.__new__(bot_class)
+        bot.HIP3_PREFIX = bot_class.HIP3_PREFIX
+        bot.HIP3_ALT_PREFIXES = bot_class.HIP3_ALT_PREFIXES
+        bot.active_symbols = []
+        bot.open_orders = {}
+        bot.positions = {}
+        bot.approved_coins_minus_ignored_coins = {"long": set(), "short": set()}
+        bot.coin_overrides = {}
+        bot._hl_live_margin_modes = {}
+        bot.markets_dict = {
+            "XYZ-XYZ100/USDC:USDC": {"baseName": "xyz:XYZ100", "info": {}},
+            "XYZ-XYZ200/USDC:USDC": {"baseName": "xyz:XYZ200", "info": {}},
+            "BTC/USDC:USDC": {"baseName": "BTC", "info": {}},
+        }
+        bot.determine_pos_side = lambda order: "long"
+        bot.cca = MagicMock()
+
+        async def fetch_open_orders(symbol=None, params=None):
+            if symbol is None and params is None:
+                return []
+            if params == {"dex": "xyz"}:
+                return [
+                    {
+                        "id": "abc123",
+                        "symbol": "XYZ-XYZ100/USDC:USDC",
+                        "side": "buy",
+                        "amount": 0.0009,
+                        "price": 24980.0,
+                        "timestamp": 1000,
+                    }
+                ]
+            return []
+
+        bot.cca.fetch_open_orders = AsyncMock(side_effect=fetch_open_orders)
+
+        orders = await bot.fetch_open_orders()
+
+        assert orders == [
+            {
+                "id": "abc123",
+                "symbol": "XYZ-XYZ100/USDC:USDC",
+                "side": "buy",
+                "amount": 0.0009,
+                "price": 24980.0,
+                "timestamp": 1000,
+                "position_side": "long",
+                "qty": 0.0009,
+            }
+        ]
+        assert bot.cca.fetch_open_orders.await_args_list[0].kwargs == {"symbol": None}
+        assert bot.cca.fetch_open_orders.await_args_list[1].kwargs == {"params": {"dex": "xyz"}}
 
 
 class TestIsolatedMarginLeverageCapping:
@@ -351,7 +898,7 @@ class TestIsolatedMarginLeverageCapping:
             else:
                 bot.max_leverage[symbol] = int(elm["info"]["maxLeverage"])
 
-        # Isolated symbol (xyz: prefix) should be capped at 10x
+        # Isolated-only symbol should be capped at 10x
         assert bot.max_leverage["xyz:TSLA/USDC:USDC"] == 10
         assert bot._requires_isolated_margin("xyz:TSLA/USDC:USDC") is True
 

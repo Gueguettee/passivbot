@@ -1,5 +1,6 @@
 """Tests for MissingEma fix: EMA paths and error handling."""
 
+import asyncio
 import math
 import time
 import json
@@ -82,6 +83,7 @@ async def test_missing_ema_raises_from_snapshot(monkeypatch):
         effective_min_cost = {}
         _config_hedge_mode = False
         hedge_mode = False
+        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
 
         def config_get(self, keys):
             return None
@@ -134,6 +136,7 @@ async def test_missing_ema_raises_from_snapshot_with_return(monkeypatch):
         effective_min_cost = {}
         _config_hedge_mode = False
         hedge_mode = False
+        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
 
         def config_get(self, keys):
             return None
@@ -249,6 +252,8 @@ def _make_orchestrator_payload(symbol, m1_close_pairs, m1_volume_pairs, m1_lr_pa
                     "min_qty": 0.0,
                     "min_cost": 0.0,
                     "c_mult": 1.0,
+                    "maker_fee": 0.0002,
+                    "taker_fee": 0.00055,
                 },
                 "tradable": True,
                 "next_candle": None,
@@ -513,3 +518,93 @@ async def test_required_h1_log_range_ema_present_in_bundle():
     ) = await pb_mod.Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
 
     assert h1_log_range_emas[symbol][4.0] == pytest.approx(0.0042)
+
+
+class _PacingProbeCM:
+    def __init__(self, sleep_fn):
+        self._sleep_fn = sleep_fn
+        self.current_concurrency = 0
+        self.max_concurrency = 0
+
+    async def get_latest_ema_close(self, symbol, *, span, max_age_ms):
+        self.current_concurrency += 1
+        self.max_concurrency = max(self.max_concurrency, self.current_concurrency)
+        try:
+            await self._sleep_fn(0.01)
+            return 100.0
+        finally:
+            self.current_concurrency -= 1
+
+    async def get_latest_ema_quote_volume(self, symbol, *, span, max_age_ms):
+        return 0.0
+
+    async def get_latest_ema_log_range(self, symbol, *, span, max_age_ms, tf="1m"):
+        return 0.0
+
+
+class _PacingProbeBot:
+    def __init__(self, exchange: str, sleep_fn):
+        self.exchange = exchange
+        self.config = {"live": {}}
+        self.positions = {}
+        self.cm = _PacingProbeCM(sleep_fn)
+
+    def _get_fetch_delay_seconds(self):
+        import passivbot as pb_mod
+
+        return pb_mod.Passivbot._get_fetch_delay_seconds(self)
+
+    def has_position(self, pside=None, symbol=None):
+        return False
+
+    def bp(self, pside, key, symbol=None):
+        if key == "ema_span_0":
+            return 10.0
+        return 0.0
+
+    def bot_value(self, pside, key):
+        return 0.0
+
+
+@pytest.mark.asyncio
+async def test_ema_bundle_keeps_parallel_fetches_when_exchange_has_zero_delay(monkeypatch):
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    monkeypatch.setattr(pb_mod.random, "shuffle", lambda items: None)
+    bot = _PacingProbeBot(exchange="binance", sleep_fn=asyncio.sleep)
+
+    await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot,
+        ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+        {"long": {}, "short": {}},
+    )
+
+    assert bot.cm.max_concurrency >= 2
+
+
+@pytest.mark.asyncio
+async def test_ema_bundle_serializes_fetches_when_exchange_has_default_pacing(monkeypatch):
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    original_sleep = asyncio.sleep
+
+    async def _no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(pb_mod.random, "shuffle", lambda items: None)
+    monkeypatch.setattr(pb_mod.asyncio, "sleep", _no_delay)
+    bot = _PacingProbeBot(exchange="bybit", sleep_fn=original_sleep)
+
+    await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot,
+        ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+        {"long": {}, "short": {}},
+    )
+
+    assert bot.cm.max_concurrency == 1

@@ -2,6 +2,12 @@
 
 Passivbot ships with a backtester that replays historical 1 minute candles. When a coin isn't cached locally, the backtester fetches data from the exchange archives and caches it under `caches/ohlcv/` for reuse.
 
+Backtesting requires the full install profile:
+
+```shell
+python3 -m pip install -e ".[full]"
+```
+
 > **GateIO cache note:** If you have existing GateIO OHLCV data in `caches/ohlcv/gateio`, delete the folder after upgrading to the new data strategy so fresh data (normalized to base volume) is fetched.
 
 ### External OHLCV source dir
@@ -20,13 +26,15 @@ For `.npz` files, the archive must contain a `candles` key with a structured Num
 ## Usage
 
 ```shell
-python3 src/backtest.py
+passivbot backtest
 ```
 Or
 ```shell
-python3 src/backtest.py path/to/config.json
+passivbot backtest path/to/config.json
 ```
-If no config is specified, it will default to `configs/template.json`
+If no config is specified, backtesting starts from the in-code schema defaults in `src/config/schema.py`.
+The example config `configs/examples/default_trailing_grid_long_npos10.json` mirrors those defaults exactly.
+See [Config Workflow](config_workflow.md) for the recommended way to copy and customize configs.
 
 ## Backtest Results
 
@@ -39,9 +47,23 @@ Standalone runs write metrics and plots to `backtests/{exchange}/timestamp/`. Su
 - `--scenarios label1,label2,...` to run only specific scenarios by label (implies `--suite y`).
 - `--suite-config path/to/overrides.json` to merge an additional suite definition onto the base config. Useful when you want to keep suite definitions outside the main config file.
 
+The canonical default profile keeps `backtest.suite_enabled = false`. A normal backtest run is
+therefore a single run unless you explicitly enable suite mode in the config or via `--suite`.
+
 For a comprehensive list of CLI args:
 ```shell
-python3 src/backtest.py -h
+passivbot backtest -h
+```
+
+## Pre-download OHLCV
+
+Use `passivbot download` when you want to warm the OHLCV cache before a long backtest or optimize
+run. It uses the same `backtest.start_date`, `backtest.end_date`, `backtest.exchanges`, and
+approved-coin selection flow as the backtester, but stops after preparing cache data.
+
+```shell
+passivbot download configs/examples/default_trailing_grid_long_npos10.json
+passivbot download --start-date 2025-01-01 --end-date 2025-02-01 --exchanges binance,bybit
 ```
 
 ## Suite Runs
@@ -57,6 +79,10 @@ Suite mode evaluates multiple scenario slices in one invocation. Configuration u
   ...
 }
 ```
+
+Suite mode is off by default in the hardcoded schema and in
+`configs/examples/default_trailing_grid_long_npos10.json`. Enable it only when you deliberately
+want multi-scenario evaluation.
 
 Each scenario may override:
 
@@ -82,7 +108,8 @@ backtests/suite_runs/<timestamp>/<scenario_label>/
 Every suite also receives a `suite_summary.json` containing per-scenario metrics and the aggregated statistics defined in `backtest.aggregate`.
 Each scenario's entry exposes `metrics.stats[metric] = {mean,min,max,std}` so you can inspect exchange-combined performance without digging through `analysis.json` files.
 
-See [Suite Examples](suite_examples.md) for comprehensive examples including exchange comparisons, date range scenarios, long-only/short-only configurations, and parameter sensitivity testing.
+See [Suite Examples](suite_examples.md) for practical configurations including exchange
+comparisons, date range scenarios, and parameter sensitivity testing.
 
 ### Data Strategy
 
@@ -132,9 +159,11 @@ Suite scenarios can add more overrides under `coin_sources`; conflicts between s
 The backtester supports OHLCV data from the following exchanges:
 - **binance** - Binance USDT-M Futures
 - **bybit** - Bybit USDT Perpetuals
+- **bitget** - Bitget USDT Perpetuals
 - **gateio** - Gate.io USDT Perpetuals
 
-All three exchanges are included in the default template configuration.
+The canonical default template currently uses `binance` and `bybit`. Add `bitget` and/or `gateio`
+explicitly in `backtest.exchanges` when you want them included.
 
 ## Exchange Name Conventions
 

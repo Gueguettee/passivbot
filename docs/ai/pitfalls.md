@@ -73,6 +73,37 @@ Avoid: `int(sqrt(span0 * span1))`.
 
 Do: keep EMA spans as float throughout calculations.
 
+---
+
+## 7) Re-Applying Config Defaults Outside Config Loading
+
+**Don't**: Re-define defaults in runtime code for required config fields.
+
+**Because**: It hides config/schema regressions and scatters source-of-truth for defaults.
+
+**Example**:
+```python
+# WRONG: Runtime fallback for required config
+red_threshold = float(config["bot"]["long"].get("hsl_red_threshold", 0.25))
+
+# CORRECT: Required config access (defaults handled centrally at config load)
+red_threshold = float(require_config_value(config, "bot.long.hsl_red_threshold"))
+```
+
+```rust
+// WRONG: Silent fallback in parser for required key
+let red_threshold = cfg
+    .get_item("red_threshold")?
+    .map(|v| v.extract::<f64>())
+    .transpose()?
+    .unwrap_or(0.25);
+
+// CORRECT: Required key extraction
+let red_threshold: f64 = extract_value(cfg, "red_threshold")?;
+```
+
+**Instead**: Keep defaults in one place (config loader/formatter). Runtime code must validate and consume required fields without fallback.
+
 Example:
 
 ```python
@@ -112,6 +143,19 @@ Do: keep stock perp routing constrained to Hyperliquid.
 Avoid: debugging behavior before validating which extension binary is loaded.
 
 Do: read `build_pitfalls.md` and verify module path + rebuild status first.
+
+## 12) Re-Implementing Live Rolling Risk Logic Without Parity Tests
+
+Avoid: optimizing rolling PnL / lookback logic in backtest with a different internal coordinate system or peak bookkeeping than live.
+
+Because:
+- these paths can look mathematically similar while drifting semantically
+- once peak/current reconstruction diverges, unstuck allowance and realized-loss gating can become silently wrong
+
+Do:
+1. define the contract using the naive live behavior first
+2. optimize only as an implementation detail
+3. add regression tests that compare the optimized path against a naive filter-and-recompute reference
 
 ## Pre-PR Safety Scan
 

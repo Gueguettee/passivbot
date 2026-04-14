@@ -16,11 +16,13 @@ Then use `docs/ai/README.md` to load task-specific docs only when relevant.
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-cd passivbot-rust && maturin develop --release && cd ..
+pip install -e ".[dev]"
 pytest
-python3 src/main.py -u {account_name}
+passivbot live -u {account_name}
 ```
+
+Legacy direct-script entrypoints such as `python3 src/main.py ...` still work, but prefer the
+unified `passivbot ...` CLI for new usage.
 
 ## Non-Negotiables
 
@@ -83,4 +85,5 @@ Use `docs/ai/commands.md` for setup, test, backtest, optimizer, and Rust build c
 1. Keep AI docs lean and task-oriented.
 2. Put durable rules in `principles.yaml` or `error_contract.md`, not in many files.
 3. Put deep investigations in case-study docs, not core instruction docs.
-4. Update `CHANGELOG.md` for user-facing behavior changes.
+4. User-facing docs and `CHANGELOG.md` should describe the diff from `master`, not intermediate changes made within the current dev branch.
+5. Update `CHANGELOG.md` for user-facing behavior changes.

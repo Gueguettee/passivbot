@@ -1,7 +1,8 @@
 import os
 import sys
 import argparse
-from rust_utils import check_and_maybe_compile
+from cli_utils import help_requested
+from rust_utils import check_and_maybe_compile, verify_loaded_runtime_extension
 
 # Perform Rust compilation check before importing any modules that may load the extension
 _rust_parser = argparse.ArgumentParser(add_help=False)
@@ -15,9 +16,11 @@ _rust_parser.add_argument(
     help="Abort if Rust extension appears stale instead of attempting rebuild.",
 )
 _rust_known, _rust_remaining = _rust_parser.parse_known_args()
+_help_only = help_requested(_rust_remaining)
 try:
     check_and_maybe_compile(
-        skip=_rust_known.skip_rust_compile
+        skip=_help_only
+        or _rust_known.skip_rust_compile
         or os.environ.get("SKIP_RUST_COMPILE", "").lower() in ("1", "true", "yes"),
         force=_rust_known.force_rust_compile,
         fail_on_stale=_rust_known.fail_on_stale_rust,
@@ -33,22 +36,45 @@ import math
 import pandas as pd
 import json
 import asyncio
+import numbers
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
+from cli_utils import (
+    add_help_all_argument,
+    build_command_parser,
+    expand_help_all_argv,
+    get_cli_prog,
+    help_all_requested,
+)
+from config import (
+    compile_runtime_config,
+    get_template_config,
+    load_input_config,
+    load_prepared_config,
+    prepare_config,
+)
+from config.access import (
+    get_optional_config_value,
+    get_optional_live_value,
+    require_config_value,
+    require_live_value,
+)
+from config.pnl_lookback import parse_pnls_max_lookback_days
+from config.metrics import ANALYSIS_SHARED_KEYS
+from config.coerce import normalize_hsl_signal_mode
+from config.overrides import parse_overrides
+from backtest_dataset import dump_backtest_dataset_metadata
 from config_utils import (
-    load_config,
     dump_config,
     add_config_arguments,
+    project_template_config_for_cli,
     update_config_with_args,
     recursive_config_update,
     format_config,
-    get_template_config,
-    parse_overrides,
-    require_config_value,
-    require_live_value,
-    get_optional_config_value,
     strip_config_metadata,
+    HSL_PSIDE_KEYS,
 )
+from analysis_visibility import filter_analysis_for_visibility
 from utils import (
     utc_ms,
     make_get_filepath,
@@ -56,7 +82,6 @@ from utils import (
     format_end_date,
     format_approved_ignored_coins,
     date_to_ts,
-    trim_analysis_aliases,
 )
 from pure_funcs import (
     ts_to_date,
@@ -70,9 +95,11 @@ from hlcv_preparation import prepare_hlcvs, prepare_hlcvs_combined
 from ohlcv_utils import aggregate_hlcvs, align_and_aggregate_hlcvs
 from warmup_utils import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes
 from pathlib import Path
+import re
 from plotting import (
     create_forager_balance_figures,
     create_forager_coin_figures,
+    create_forager_hard_stop_drawdown_figure,
     create_forager_pnl_figure,
     create_forager_twe_figure,
     save_figures,
@@ -84,7 +111,46 @@ import traceback
 from logging_setup import configure_logging, resolve_log_level
 from suite_runner import extract_suite_config, filter_scenarios_by_label, run_backtest_suite_async
 import passivbot_rust as pbr  # noqa: E402
+verify_loaded_runtime_extension()
 from tools.event_loop_policy import set_windows_event_loop_policy
+
+PLOT_GROUP_SUMMARY = {"balance", "twe", "pnl", "hard_stop"}
+PLOT_GROUP_ALL = PLOT_GROUP_SUMMARY | {"coin_fills"}
+HLCVS_CACHE_ROOT = Path("caches") / "hlcvs_data"
+HLCVS_CACHE_HASH_LEN = 16
+HLCVS_CACHE_DIR_SEP = "__"
+
+
+def parse_disabled_plot_groups(value) -> set[str]:
+    if value in (None, False, "", [], ()):
+        return set()
+    if value is True:
+        return set(PLOT_GROUP_ALL)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or raw.lower() in {"false", "none", "n", "no", "0"}:
+            return set()
+        tokens = [token.strip().lower() for token in raw.split(",") if token.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        tokens = [str(token).strip().lower() for token in value if str(token).strip()]
+    else:
+        raise ValueError(f"invalid disable_plotting value type: {type(value).__name__}")
+
+    disabled = set()
+    for token in tokens:
+        if token in {"true", "all", "y", "yes", "1"}:
+            disabled.update(PLOT_GROUP_ALL)
+        elif token == "summary":
+            disabled.update(PLOT_GROUP_SUMMARY)
+        elif token in PLOT_GROUP_ALL:
+            disabled.add(token)
+        else:
+            raise ValueError(
+                "disable_plotting must be one of all, summary, balance, twe, pnl, hard_stop, coin_fills"
+            )
+    return disabled
+
+ANALYSIS_SHARED_PREFIXES = ("hard_stop_",)
 
 # Fallback stubs for test environments without full extension symbols
 if not hasattr(pbr, "HlcvsBundle"):  # pragma: no cover
@@ -107,6 +173,41 @@ def _looks_like_bool_token(value: str) -> bool:
         return False
     lowered = value.lower()
     return lowered in {"1", "0", "true", "false", "t", "f", "yes", "no", "y", "n"}
+
+
+def _resolve_backtest_hsl_configs(config: dict) -> tuple[dict, dict]:
+    long_cfg = config.get("bot", {}).get("long", {})
+    short_cfg = config.get("bot", {}).get("short", {})
+    if not (
+        all(key in long_cfg for key in HSL_PSIDE_KEYS)
+        and all(key in short_cfg for key in HSL_PSIDE_KEYS)
+    ):
+        raise KeyError("missing required per-side HSL config under bot.long/bot.short")
+
+    def _convert(pside_cfg: dict) -> dict:
+        return {
+            "enabled": bool(pside_cfg["hsl_enabled"]),
+            "red_threshold": float(pside_cfg["hsl_red_threshold"]),
+            "ema_span_minutes": float(pside_cfg["hsl_ema_span_minutes"]),
+            "cooldown_minutes_after_red": float(pside_cfg["hsl_cooldown_minutes_after_red"]),
+            "no_restart_drawdown_threshold": float(
+                pside_cfg["hsl_no_restart_drawdown_threshold"]
+            ),
+            "tier_ratios": {
+                "yellow": float(pside_cfg["hsl_tier_ratios"]["yellow"]),
+                "orange": float(pside_cfg["hsl_tier_ratios"]["orange"]),
+            },
+            "orange_tier_mode": str(pside_cfg["hsl_orange_tier_mode"]),
+            "panic_close_order_type": str(pside_cfg["hsl_panic_close_order_type"]),
+        }
+
+    return _convert(long_cfg), _convert(short_cfg)
+
+
+def _resolve_backtest_hsl_signal_mode(config: dict) -> str:
+    return normalize_hsl_signal_mode(
+        get_optional_config_value(config, "live.hsl_signal_mode", "pside")
+    )
 
 
 def _normalize_optional_bool_flag(argv: list[str], flag: str) -> list[str]:
@@ -314,6 +415,15 @@ def _build_hlcvs_bundle(
 
 
 @dataclass
+class BacktestExecutionSettings:
+    market_orders_allowed: bool
+    market_order_near_touch_threshold: float
+    market_order_slippage_pct: float
+    pnls_max_lookback_days: str | float
+    pnls_max_lookback_days_backtest_value: float
+
+
+@dataclass
 class BacktestPayload:
     """Container for everything needed to run a backtest via the Rust engine."""
 
@@ -321,6 +431,8 @@ class BacktestPayload:
     bot_params_list: list
     exchange_params: list
     backtest_params: dict
+    execution_settings: BacktestExecutionSettings | None = None
+    hard_stop_plot_data: dict | None = None
 
 
 def build_backtest_payload(
@@ -337,7 +449,15 @@ def build_backtest_payload(
     Assemble the bundle, bot params, and metadata needed to execute a backtest.
     """
 
-    bot_params_list, exchange_params, backtest_params = prep_backtest_args(config, mss, exchange)
+    runtime_config = compile_runtime_config(config, runtime="backtest", record_step=False)
+    execution_settings = get_backtest_execution_settings(runtime_config, is_runtime_compiled=True)
+    bot_params_list, exchange_params, backtest_params = prep_backtest_args(
+        runtime_config,
+        mss,
+        exchange,
+        execution_settings=execution_settings,
+        is_runtime_compiled=True,
+    )
     backtest_params = dict(backtest_params)
     coins_order = backtest_params.get("coins", [])
 
@@ -496,6 +616,7 @@ def build_backtest_payload(
         bot_params_list=bot_params_list,
         exchange_params=exchange_params,
         backtest_params=backtest_params,
+        execution_settings=execution_settings,
     )
 
 
@@ -504,20 +625,38 @@ def execute_backtest(payload: BacktestPayload, config: dict):
     Execute a prepared backtest payload and expand the resulting analysis.
     """
 
-    (
-        fills,
-        equities_array,
-        analysis_usd,
-        analysis_btc,
-    ) = pbr.run_backtest_bundle(
+    backtest_result = pbr.run_backtest_bundle(
         payload.bundle,
         payload.bot_params_list,
         payload.exchange_params,
         payload.backtest_params,
     )
+    if len(backtest_result) == 5:
+        (
+            fills,
+            equities_array,
+            analysis_usd,
+            analysis_btc,
+            hard_stop_plot_data,
+        ) = backtest_result
+    elif len(backtest_result) == 4:
+        fills, equities_array, analysis_usd, analysis_btc = backtest_result
+        hard_stop_plot_data = {}
+    else:
+        raise ValueError(
+            f"run_backtest_bundle returned {len(backtest_result)} values; expected 4 or 5"
+        )
 
     equities_array = np.asarray(equities_array)
+    payload.hard_stop_plot_data = dict(hard_stop_plot_data or {})
     analysis = expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config)
+    if bool(analysis.get("liquidated", False)):
+        final_equity_usd = float(equities_array[-1, 1]) if equities_array.size else float("nan")
+        logging.debug(
+            "Backtest liquidated early | final_equity_usd=%.6f | liquidation_threshold=%.6f",
+            final_equity_usd,
+            float(get_optional_config_value(config, "backtest.liquidation_threshold", 0.05) or 0.0),
+        )
     return fills, equities_array, analysis
 
 
@@ -595,6 +734,7 @@ def subset_backtest_payload(
         bot_params_list=new_bot,
         exchange_params=new_exchange_params,
         backtest_params=new_backtest_params,
+        execution_settings=payload.execution_settings,
     )
 
 
@@ -622,6 +762,7 @@ def process_forager_fills(
             "psize",
             "pprice",
             "type",
+            "liquidity",
             "wallet_exposure",
             "twe_long",
             "twe_short",
@@ -692,10 +833,11 @@ def process_forager_fills(
         btc_cash_series.index = pd.to_datetime(btc_cash_series.index, unit="ns")
         btc_total_balance_series.index = pd.to_datetime(btc_total_balance_series.index, unit="ns")
     else:
-        usd_cash_series = pd.Series(dtype=float, name="usd_cash_wallet")
-        usd_total_balance_series = pd.Series(dtype=float, name="usd_total_balance")
-        btc_cash_series = pd.Series(dtype=float, name="btc_cash_wallet")
-        btc_total_balance_series = pd.Series(dtype=float, name="btc_total_balance")
+        empty_dtidx = pd.DatetimeIndex([])
+        usd_cash_series = pd.Series(dtype=float, name="usd_cash_wallet", index=empty_dtidx)
+        usd_total_balance_series = pd.Series(dtype=float, name="usd_total_balance", index=empty_dtidx)
+        btc_cash_series = pd.Series(dtype=float, name="btc_cash_wallet", index=empty_dtidx)
+        btc_total_balance_series = pd.Series(dtype=float, name="btc_total_balance", index=empty_dtidx)
     equities_array = np.asarray(equities_array)
     equities_index = pd.to_datetime(equities_array[:, 0].astype(np.int64), unit="ms")
     edf = pd.Series(
@@ -749,9 +891,12 @@ def process_forager_fills(
             .bfill()
         )
         if sample_divider > 1 and not bal_eq.empty:
-            try:
-                bal_eq = bal_eq.resample(f"{sample_divider}min").last()
-            except ValueError:
+            if isinstance(bal_eq.index, pd.DatetimeIndex):
+                try:
+                    bal_eq = bal_eq.resample(f"{sample_divider}min").last()
+                except ValueError:
+                    bal_eq = bal_eq.iloc[::sample_divider]
+            else:
                 bal_eq = bal_eq.iloc[::sample_divider]
             bal_eq = bal_eq.dropna(how="all").ffill().bfill()
     bal_eq = bal_eq.round(4).astype(np.float32)
@@ -800,9 +945,10 @@ def get_cache_hash(config, exchange):
     exchanges_cfg = require_config_value(config, "backtest.exchanges")
     approved_coins = require_live_value(config, "approved_coins")
     minimum_coin_age = require_live_value(config, "minimum_coin_age_days")
-    coin_sources = config.get("backtest", {}).get("coin_sources") or {}
+    backtest_cfg = config.get("backtest", {}) or {}
+    coin_sources = backtest_cfg.get("coin_sources") or {}
     coin_sources_sorted = sorted((str(k), str(v)) for k, v in coin_sources.items())
-    market_settings_sources = config.get("backtest", {}).get("market_settings_sources") or {}
+    market_settings_sources = backtest_cfg.get("market_settings_sources") or {}
     market_settings_sources_sorted = sorted(
         (str(k), str(v)) for k, v in market_settings_sources.items()
     )
@@ -817,15 +963,117 @@ def get_cache_hash(config, exchange):
         ),
         "coin_sources": coin_sources_sorted,
         "market_settings_sources": market_settings_sources_sorted,
+        "ohlcv_source_dir": backtest_cfg.get("ohlcv_source_dir"),
     }
     return calc_hash(to_hash)
 
 
+def _extract_hlcvs_cache_hash_prefix(cache_hash) -> str:
+    return str(cache_hash)[:HLCVS_CACHE_HASH_LEN]
+
+
+def _sanitize_hlcvs_cache_label(value) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "").strip())
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    return sanitized or "na"
+
+
+def _normalize_hlcvs_cache_coin_label(coin) -> str:
+    coin_str = str(coin or "").strip()
+    if "/" in coin_str:
+        coin_str = coin_str.split("/", 1)[0]
+    return _sanitize_hlcvs_cache_label(coin_str).upper()
+
+
+def _format_hlcvs_cache_coins_label(coins) -> str:
+    normalized = []
+    seen = set()
+    for coin in coins or []:
+        label = _normalize_hlcvs_cache_coin_label(coin)
+        if label in seen:
+            continue
+        seen.add(label)
+        normalized.append(label)
+    if not normalized:
+        return "0_coins"
+    if len(normalized) > 5:
+        return f"{len(normalized)}_coins"
+    joined = "_".join(normalized)
+    if len(joined) > 80:
+        return f"{len(normalized)}_coins"
+    return joined
+
+
+def _format_hlcvs_cache_date_label(config, timestamps=None) -> str:
+    try:
+        if timestamps is not None and len(timestamps) > 0:
+            start_ts = int(timestamps[0])
+            end_ts = int(timestamps[-1])
+            return f"{ts_to_date(start_ts)[:10]}_to_{ts_to_date(end_ts)[:10]}"
+    except Exception:
+        pass
+    start_date = _sanitize_hlcvs_cache_label(require_config_value(config, "backtest.start_date"))
+    end_date = _sanitize_hlcvs_cache_label(
+        format_end_date(require_config_value(config, "backtest.end_date"))
+    )
+    return f"{start_date}_to_{end_date}"
+
+
+def _build_hlcvs_cache_dir_name(config, exchange, coins, cache_hash, timestamps=None) -> str:
+    exchange_label = _sanitize_hlcvs_cache_label(str(exchange).lower())
+    coins_label = _format_hlcvs_cache_coins_label(coins)
+    date_label = _format_hlcvs_cache_date_label(config, timestamps=timestamps)
+    hash_prefix = _extract_hlcvs_cache_hash_prefix(cache_hash)
+    return (
+        f"{exchange_label}{HLCVS_CACHE_DIR_SEP}"
+        f"{coins_label}{HLCVS_CACHE_DIR_SEP}"
+        f"{date_label}{HLCVS_CACHE_DIR_SEP}"
+        f"{hash_prefix}"
+    )
+
+
+def _resolve_hlcvs_cache_dir(cache_hash):
+    hash_prefix = _extract_hlcvs_cache_hash_prefix(cache_hash)
+    legacy_dir = HLCVS_CACHE_ROOT / hash_prefix
+    if legacy_dir.is_dir():
+        return legacy_dir
+    if not HLCVS_CACHE_ROOT.exists():
+        return None
+    suffix = f"{HLCVS_CACHE_DIR_SEP}{hash_prefix}"
+    candidates = sorted(
+        path
+        for path in HLCVS_CACHE_ROOT.iterdir()
+        if path.is_dir() and path.name.endswith(suffix)
+    )
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        raise RuntimeError(
+            f"multiple HLCV cache directories found for hash {hash_prefix}: "
+            + ", ".join(str(path) for path in candidates)
+        )
+    return candidates[0]
+
+
+def _get_hlcvs_cache_dir_for_save(config, exchange, coins, cache_hash, timestamps=None):
+    existing_dir = _resolve_hlcvs_cache_dir(cache_hash)
+    if existing_dir is not None:
+        return existing_dir
+    dir_name = _build_hlcvs_cache_dir_name(
+        config,
+        exchange,
+        coins,
+        cache_hash,
+        timestamps=timestamps,
+    )
+    return HLCVS_CACHE_ROOT / dir_name
+
+
 def load_coins_hlcvs_from_cache(config, exchange, warmup_minutes=0):
     cache_hash = get_cache_hash(config, exchange)
-    cache_dir = Path("caches") / "hlcvs_data" / cache_hash[:16]
+    cache_dir = _resolve_hlcvs_cache_dir(cache_hash)
     compress_cache = bool(require_config_value(config, "backtest.compress_cache"))
-    if os.path.exists(cache_dir):
+    if cache_dir and os.path.exists(cache_dir):
         # Check warmup sufficiency: cached data must cover at least the needed warmup
         meta_path = cache_dir / "cache_meta.json"
         if meta_path.exists():
@@ -908,7 +1156,13 @@ def save_coins_hlcvs_to_cache(
     warmup_minutes=0,
 ):
     cache_hash = get_cache_hash(config, exchange)
-    cache_dir = Path("caches") / "hlcvs_data" / cache_hash[:16]
+    cache_dir = _get_hlcvs_cache_dir_for_save(
+        config,
+        exchange,
+        coins,
+        cache_hash,
+        timestamps=timestamps,
+    )
     cache_dir.mkdir(parents=True, exist_ok=True)
     is_compressed = bool(require_config_value(config, "backtest.compress_cache"))
     warmup_minutes = int(warmup_minutes)
@@ -1055,8 +1309,89 @@ async def prepare_hlcvs_mss(config, exchange, *, force_refetch_gaps: bool = Fals
     return coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices, timestamps
 
 
-def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_params=None):
+def _coerce_config_bool(value, *, field_name):
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", ""}:
+            return False
+        raise ValueError(f"{field_name} must be a boolean; got {value!r}")
+    return bool(value)
+
+
+def get_backtest_execution_settings(config, *, is_runtime_compiled: bool = False) -> BacktestExecutionSettings:
+    if not is_runtime_compiled:
+        config = compile_runtime_config(config, runtime="backtest", record_step=False)
+    market_order_slippage_pct = float(
+        get_optional_config_value(config, "backtest.market_order_slippage_pct", 0.0005) or 0.0
+    )
+    if market_order_slippage_pct < 0.0:
+        raise ValueError("backtest.market_order_slippage_pct must be >= 0.0")
+    market_orders_allowed_raw = get_optional_live_value(config, "market_orders_allowed", False)
+    market_orders_allowed = _coerce_config_bool(
+        market_orders_allowed_raw,
+        field_name="live.market_orders_allowed",
+    )
+    market_order_near_touch_threshold_raw = get_optional_live_value(
+        config, "market_order_near_touch_threshold", 0.001
+    )
+    market_order_near_touch_threshold = float(market_order_near_touch_threshold_raw or 0.0)
+    if market_order_near_touch_threshold < 0.0:
+        raise ValueError(
+            "live.market_order_near_touch_threshold must be >= 0.0"
+        )
+    pnls_max_lookback = parse_pnls_max_lookback_days(
+        get_optional_live_value(config, "pnls_max_lookback_days", 30.0),
+        field_name="live.pnls_max_lookback_days",
+    )
+    return BacktestExecutionSettings(
+        market_orders_allowed=market_orders_allowed,
+        market_order_near_touch_threshold=market_order_near_touch_threshold,
+        market_order_slippage_pct=market_order_slippage_pct,
+        pnls_max_lookback_days=pnls_max_lookback.display_value,
+        pnls_max_lookback_days_backtest_value=pnls_max_lookback.to_backtest_days_value(),
+    )
+
+
+def log_backtest_execution_settings(execution_settings: BacktestExecutionSettings | None) -> None:
+    if execution_settings is None:
+        return
+    logging.info("[backtest] effective execution settings:")
+    logging.info(
+        "[backtest]   market_orders_allowed = %s (live)",
+        execution_settings.market_orders_allowed,
+    )
+    logging.info(
+        "[backtest]   market_order_near_touch_threshold = %s (live)",
+        execution_settings.market_order_near_touch_threshold,
+    )
+    logging.info(
+        "[backtest]   market_order_slippage_pct = %s (backtest)",
+        execution_settings.market_order_slippage_pct,
+    )
+    logging.info(
+        "[backtest]   pnls_max_lookback_days = %s (live)",
+        execution_settings.pnls_max_lookback_days,
+    )
+
+
+def prep_backtest_args(
+    config,
+    mss,
+    exchange,
+    exchange_params=None,
+    backtest_params=None,
+    execution_settings: BacktestExecutionSettings | None = None,
+    *,
+    is_runtime_compiled: bool = False,
+):
+    if not is_runtime_compiled:
+        config = compile_runtime_config(config, runtime="backtest", record_step=False)
+    if execution_settings is None:
+        execution_settings = get_backtest_execution_settings(config, is_runtime_compiled=True)
     coins = sorted(set(require_config_value(config, f"backtest.coins.{exchange}")))
+    candle_interval = int(config.get("backtest", {}).get("candle_interval_minutes", 1) or 1)
     bot_params_list = []
     bot_params_template = deepcopy(require_config_value(config, "bot"))
     for coin in coins:
@@ -1079,22 +1414,104 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
         bot_params_list.append(coin_specific_bot_params)
     if exchange_params is None:
         exchange_params = [
-            {k: mss[coin][k] for k in ["qty_step", "price_step", "min_qty", "min_cost", "c_mult"]}
+            {
+                "qty_step": mss[coin]["qty_step"],
+                "price_step": mss[coin]["price_step"],
+                "min_qty": mss[coin]["min_qty"],
+                "min_cost": mss[coin]["min_cost"],
+                "c_mult": mss[coin]["c_mult"],
+                "maker_fee": float(mss[coin].get("maker_fee", mss[coin].get("maker", 0.0002))),
+                "taker_fee": float(mss[coin].get("taker_fee", mss[coin].get("taker", 0.00055))),
+            }
             for coin in coins
         ]
     if backtest_params is None:
+        hard_stop_cfg_long, hard_stop_cfg_short = _resolve_backtest_hsl_configs(config)
+        hsl_signal_mode = _resolve_backtest_hsl_signal_mode(config)
+        if not isinstance(hard_stop_cfg_long, dict) or not isinstance(hard_stop_cfg_short, dict):
+            raise TypeError("HSL pside configs must be dicts")
+
+        def _normalize_hsl_cfg(cfg: dict, path_prefix: str) -> dict:
+            tier_ratios = cfg.get("tier_ratios")
+            if not isinstance(tier_ratios, dict):
+                raise TypeError(
+                    f"{path_prefix}.tier_ratios must be a dict, got {type(tier_ratios).__name__}"
+                )
+            enabled = bool(cfg["enabled"])
+            red_threshold = float(cfg["red_threshold"])
+            ema_span_minutes = float(cfg["ema_span_minutes"])
+            cooldown_minutes_after_red = float(cfg["cooldown_minutes_after_red"])
+            no_restart_drawdown_threshold = float(cfg["no_restart_drawdown_threshold"])
+            tier_ratio_yellow = float(tier_ratios["yellow"])
+            tier_ratio_orange = float(tier_ratios["orange"])
+            orange_tier_mode = str(cfg["orange_tier_mode"])
+            panic_close_order_type = str(cfg["panic_close_order_type"])
+            if enabled and red_threshold <= 0.0:
+                raise ValueError(f"{path_prefix}.red_threshold must be > 0.0 when enabled")
+            if enabled and ema_span_minutes <= 0.0:
+                raise ValueError(f"{path_prefix}.ema_span_minutes must be > 0.0 when enabled")
+            if cooldown_minutes_after_red < 0.0:
+                raise ValueError(f"{path_prefix}.cooldown_minutes_after_red must be >= 0.0")
+            if no_restart_drawdown_threshold < red_threshold:
+                logging.info(
+                    "[config] clamped %s.no_restart_drawdown_threshold %.6f -> %.6f to match red_threshold",
+                    path_prefix,
+                    no_restart_drawdown_threshold,
+                    red_threshold,
+                )
+                no_restart_drawdown_threshold = red_threshold
+            if not (red_threshold <= no_restart_drawdown_threshold <= 1.0):
+                raise ValueError(
+                    f"{path_prefix}.no_restart_drawdown_threshold must satisfy red_threshold <= no_restart_drawdown_threshold <= 1.0"
+                )
+            if not (0.0 < tier_ratio_yellow < tier_ratio_orange < 1.0):
+                raise ValueError(f"{path_prefix}.tier_ratios must satisfy 0 < yellow < orange < 1")
+            if orange_tier_mode not in {"graceful_stop", "tp_only_with_active_entry_cancellation"}:
+                raise ValueError(
+                    f"{path_prefix}.orange_tier_mode must be one of {{graceful_stop, tp_only_with_active_entry_cancellation}}"
+                )
+            if panic_close_order_type not in {"market", "limit"}:
+                raise ValueError(f"{path_prefix}.panic_close_order_type must be one of {{market, limit}}")
+            return {
+                "enabled": enabled,
+                "signal_mode": hsl_signal_mode,
+                "red_threshold": red_threshold,
+                "ema_span_minutes": ema_span_minutes,
+                "cooldown_minutes_after_red": cooldown_minutes_after_red,
+                "no_restart_drawdown_threshold": no_restart_drawdown_threshold,
+                "tier_ratios": {
+                    "yellow": tier_ratio_yellow,
+                    "orange": tier_ratio_orange,
+                },
+                "orange_tier_mode": orange_tier_mode,
+                "panic_close_order_type": panic_close_order_type,
+            }
+
+        hard_stop_cfg_long = _normalize_hsl_cfg(hard_stop_cfg_long, "bot.long.hsl")
+        hard_stop_cfg_short = _normalize_hsl_cfg(hard_stop_cfg_short, "bot.short.hsl")
+        liquidation_threshold = float(
+            get_optional_config_value(config, "backtest.liquidation_threshold", 0.05) or 0.0
+        )
+        if not (0.0 <= liquidation_threshold < 1.0):
+            raise ValueError("backtest.liquidation_threshold must satisfy 0.0 <= x < 1.0")
         btc_collateral_cap = float(require_config_value(config, "backtest.btc_collateral_cap"))
         btc_collateral_ltv_cap = require_config_value(config, "backtest.btc_collateral_ltv_cap")
         if btc_collateral_ltv_cap is not None:
             btc_collateral_ltv_cap = float(btc_collateral_ltv_cap)
         maker_fee_override = get_optional_config_value(config, "backtest.maker_fee_override", None)
+        taker_fee_override = get_optional_config_value(config, "backtest.taker_fee_override", None)
         if maker_fee_override is None:
             maker_fee = mss[coins[0]]["maker"]
         else:
             maker_fee = float(maker_fee_override)
+        if taker_fee_override is None:
+            taker_fee = mss[coins[0]].get("taker_fee", mss[coins[0]].get("taker", 0.00055))
+        else:
+            taker_fee = float(taker_fee_override)
         backtest_params = {
             "starting_balance": require_config_value(config, "backtest.starting_balance"),
             "maker_fee": maker_fee,
+            "taker_fee": taker_fee,
             "coins": coins,
             "btc_collateral_cap": btc_collateral_cap,
             "btc_collateral_ltv_cap": btc_collateral_ltv_cap,
@@ -1112,9 +1529,13 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
                 require_config_value(config, "backtest.dynamic_wel_by_tradability")
             ),
             "hedge_mode": bool(require_config_value(config, "live.hedge_mode")),
-            "max_realized_loss_pct": float(
-                get_optional_config_value(config, "live.max_realized_loss_pct", 1.0)
-            ),
+            "max_realized_loss_pct": float(require_config_value(config, "live.max_realized_loss_pct")),
+            "pnls_max_lookback_days": execution_settings.pnls_max_lookback_days_backtest_value,
+            "equity_hard_stop_loss": hard_stop_cfg_long,
+            "market_order_slippage_pct": execution_settings.market_order_slippage_pct,
+            "market_orders_allowed": execution_settings.market_orders_allowed,
+            "market_order_near_touch_threshold": execution_settings.market_order_near_touch_threshold,
+            "liquidation_threshold": liquidation_threshold,
         }
     return bot_params_list, exchange_params, backtest_params
 
@@ -1137,45 +1558,39 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
                 else None
             )
 
-    shared_keys = {
-        "positions_held_per_day",
-        "positions_held_per_day_w",
-        "position_held_hours_mean",
-        "position_held_hours_max",
-        "position_held_hours_median",
-        "position_unchanged_hours_max",
-        "loss_profit_ratio",
-        "loss_profit_ratio_w",
-        "volume_pct_per_day_avg",
-        "volume_pct_per_day_avg_w",
-        "peak_recovery_hours_pnl",
-        "total_wallet_exposure_max",
-        "total_wallet_exposure_mean",
-        "total_wallet_exposure_median",
-        "high_exposure_hours_mean_long",
-        "high_exposure_hours_max_long",
-        "high_exposure_hours_mean_short",
-        "high_exposure_hours_max_short",
-        "entry_initial_balance_pct_long",
-        "entry_initial_balance_pct_short",
-        "adg_pnl",
-        "adg_pnl_w",
-        "mdg_pnl",
-        "mdg_pnl_w",
-        "sharpe_ratio_pnl",
-        "sharpe_ratio_pnl_w",
-        "sortino_ratio_pnl",
-        "sortino_ratio_pnl_w",
-    }
-
     result = {}
 
-    for key in shared_keys:
-        usd_val = analysis_usd.pop(key, None)
-        btc_val = analysis_btc.pop(key, None)
+    def _scalar_values_match(usd_val, btc_val) -> bool:
+        if usd_val is None or btc_val is None:
+            return False
+        if isinstance(usd_val, numbers.Integral) and isinstance(btc_val, numbers.Integral):
+            return usd_val == btc_val
+        if isinstance(usd_val, bool) and isinstance(btc_val, bool):
+            return usd_val == btc_val
+        try:
+            return bool(np.isclose(usd_val, btc_val, equal_nan=True))
+        except Exception:
+            return usd_val == btc_val
+
+    def _is_shared_key(key: str, usd_val, btc_val) -> bool:
+        if key in ANALYSIS_SHARED_KEYS:
+            return True
+        if key.startswith(ANALYSIS_SHARED_PREFIXES):
+            return True
+        if isinstance(usd_val, (bool, numbers.Integral)) and isinstance(
+            btc_val, (bool, numbers.Integral)
+        ):
+            return usd_val == btc_val
+        return False
+
+    for key in sorted(set(analysis_usd) | set(analysis_btc)):
+        usd_val = analysis_usd.get(key)
+        btc_val = analysis_btc.get(key)
+        if not _is_shared_key(key, usd_val, btc_val):
+            continue
         if usd_val is not None:
             result[key] = usd_val
-            if btc_val is not None and not np.isclose(usd_val, btc_val, equal_nan=True):
+            if btc_val is not None and not _scalar_values_match(usd_val, btc_val):
                 logging.debug(
                     "shared metric %s differs across denominations: usd=%s btc=%s",
                     key,
@@ -1184,6 +1599,8 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
                 )
         elif btc_val is not None:
             result[key] = btc_val
+        analysis_usd.pop(key, None)
+        analysis_btc.pop(key, None)
 
     def _add_metrics(metrics: dict, suffix: str):
         for key, value in metrics.items():
@@ -1217,7 +1634,15 @@ def run_backtest(
 
     logging.info(f"Backtesting {exchange}...")
     sts = utc_ms()
-    payload = build_backtest_payload(hlcvs, mss, config, exchange, btc_usd_prices, timestamps)
+    payload = build_backtest_payload(
+        hlcvs,
+        mss,
+        config,
+        exchange,
+        btc_usd_prices,
+        timestamps,
+    )
+    log_backtest_execution_settings(payload.execution_settings)
     fills, equities_array, analysis = execute_backtest(payload, config)
     logging.info(f"seconds elapsed for backtest: {(utc_ms() - sts) / 1000:.4f}")
     if return_payload:
@@ -1236,8 +1661,10 @@ def post_process(
     exchange,
     label=None,
     plot_hlcvs=None,
+    hard_stop_plot_data=None,
 ):
     sts = utc_ms()
+    disabled_plot_groups = parse_disabled_plot_groups(config.get("disable_plotting"))
     equities_array = np.asarray(equities_array)
     balance_sample_divider = get_optional_config_value(config, "backtest.balance_sample_divider", 60)
     try:
@@ -1257,7 +1684,14 @@ def post_process(
             analysis[k] = analysis_py[k]
     logging.info(f"seconds elapsed for analysis: {(utc_ms() - sts) / 1000:.4f}")
     label_prefix = f"[{label}] " if label else ""
-    print(f"{label_prefix}{pprint.pformat(trim_analysis_aliases(analysis))}")
+    visible_analysis = filter_analysis_for_visibility(analysis, config)
+    if visible_analysis.shown_count < visible_analysis.total_count:
+        print(
+            f"{label_prefix}Showing {visible_analysis.shown_count} of "
+            f"{visible_analysis.total_count} metrics "
+            "(set backtest.visible_metrics=[] to show all)."
+        )
+    print(f"{label_prefix}{pprint.pformat(visible_analysis.analysis)}")
     results_path = make_get_filepath(
         oj(results_path, f"{ts_to_date(utc_ms())[:19].replace(':', '_')}", "")
     )
@@ -1266,27 +1700,40 @@ def post_process(
     formatted_config = format_config(config, verbose=False)
     sanitized_config = strip_config_metadata(formatted_config)
     dump_config(sanitized_config, f"{results_path}config.json")
+    dump_backtest_dataset_metadata(config, exchange, results_path)
     fdf.to_csv(f"{results_path}fills.csv")
     bal_eq.to_csv(oj(results_path, "balance_and_equity.csv.gz"), compression="gzip")
-    balance_figs = create_forager_balance_figures(
-        bal_eq,
-        include_logy=True,
-        autoplot=False,
-        return_figures=True,
-    )
-    save_figures(balance_figs, results_path)
-    twe_figs = create_forager_twe_figure(fdf, autoplot=False, return_figures=True)
-    save_figures(twe_figs, results_path)
-    pnl_figs = create_forager_pnl_figure(
-        fdf,
-        bal_eq,
-        balance_sample_divider=balance_sample_divider,
-        autoplot=False,
-        return_figures=True,
-    )
-    save_figures(pnl_figs, results_path)
-
-    if not config["disable_plotting"]:
+    if "balance" not in disabled_plot_groups:
+        balance_figs = create_forager_balance_figures(
+            bal_eq,
+            include_logy=True,
+            autoplot=False,
+            return_figures=True,
+        )
+        save_figures(balance_figs, results_path)
+    if "twe" not in disabled_plot_groups:
+        twe_figs = create_forager_twe_figure(fdf, autoplot=False, return_figures=True)
+        save_figures(twe_figs, results_path)
+    if "pnl" not in disabled_plot_groups:
+        pnl_figs = create_forager_pnl_figure(
+            fdf,
+            bal_eq,
+            balance_sample_divider=balance_sample_divider,
+            autoplot=False,
+            return_figures=True,
+        )
+        save_figures(pnl_figs, results_path)
+    if "hard_stop" not in disabled_plot_groups:
+        hard_stop_figs = create_forager_hard_stop_drawdown_figure(
+            bal_eq,
+            config,
+            hard_stop_plot_data=hard_stop_plot_data,
+            autoplot=False,
+            return_figures=True,
+        )
+        if hard_stop_figs:
+            save_figures(hard_stop_figs, results_path)
+    if "coin_fills" not in disabled_plot_groups:
         try:
             coins = require_config_value(config, f"backtest.coins.{exchange}")
             fills_plot_dir = oj(results_path, "fills_plots")
@@ -1307,47 +1754,42 @@ def post_process(
 
 
 async def main():
-    parser = argparse.ArgumentParser(prog="backtest", description="run forager backtest")
-    parser.add_argument(
-        "config_path", type=str, default=None, nargs="?", help="path to json passivbot config"
+    raw_argv = sys.argv[1:]
+    help_all = help_all_requested(raw_argv)
+    parser = build_command_parser(
+        prog=get_cli_prog("backtest"),
+        description="run backtest",
+        usage="%(prog)s [config_path] [options]",
+        epilog=(
+            "Examples:\n"
+            "  passivbot backtest configs/examples/default_trailing_grid_long_npos10.json -s XMR -sd 2025 --suite n\n"
+            "  passivbot backtest -e bybit -s BTC,ETH -sd 2024-01 -ed 2024-06\n"
+            "\n"
+            "Use --help-all to show every config override flag."
+        ),
     )
     parser.add_argument(
-        "--disable_plotting",
-        "-dp",
-        dest="disable_plotting",
-        action="store_true",
-        help="disable plotting",
+        "config_path",
+        type=str,
+        default=None,
+        nargs="?",
+        help="path to json/hjson passivbot config (defaults to in-code schema defaults if omitted)",
     )
-    parser.add_argument(
+    add_help_all_argument(
+        parser,
+        help_all=help_all,
+        help_text="Show all backtest override flags, including advanced config overrides.",
+    )
+
+    logging_group = parser.add_argument_group("Logging")
+    logging_group.add_argument(
         "--log-level",
         dest="log_level",
         default=None,
         help="Logging verbosity (warning, info, debug, trace or 0-3).",
     )
-    parser.add_argument(
-        "--cm-debug",
-        nargs="?",
-        const=1,
-        type=int,
-        default=None,
-        help="CandlestickManager debug level (0=off, 1=network only, 2=all). "
-        "If passed without value, defaults to 1. Overrides config backtest.cm_debug_level.",
-    )
-    parser.add_argument(
-        "--cm-progress",
-        nargs="?",
-        const=30.0,
-        type=float,
-        default=None,
-        help="CandlestickManager INFO progress log interval in seconds (0 disables). "
-        "If passed without value, defaults to 30. Overrides config backtest.cm_progress_log_interval_seconds.",
-    )
-    parser.add_argument(
-        "--cm-remote",
-        action="store_true",
-        help="Show a per-exchange per-coin remote request progress bar (updates on every CCXT/archive request).",
-    )
-    parser.add_argument(
+    suite_group = parser.add_argument_group("Suite")
+    suite_group.add_argument(
         "--suite",
         nargs="?",
         const="true",
@@ -1356,7 +1798,7 @@ async def main():
         metavar="y/n",
         help="Enable or disable suite mode (omit to use config's suite_enabled setting).",
     )
-    parser.add_argument(
+    suite_group.add_argument(
         "--scenarios",
         "-sc",
         type=str,
@@ -1365,46 +1807,108 @@ async def main():
         help="Comma-separated list of scenario labels to run (implies --suite y). "
         "Example: --scenarios base,binance_only",
     )
-    parser.add_argument(
+    suite_group.add_argument(
         "--suite-config",
         type=str,
         default=None,
         help="Optional config file providing backtest.suite overrides.",
     )
-    parser.add_argument(
+
+    runtime_group = parser.add_argument_group("Backtest Runtime")
+    runtime_group.add_argument(
+        "--disable_plotting",
+        "-dp",
+        dest="disable_plotting",
+        nargs="?",
+        const="all",
+        default=None,
+        help=(
+            "Disable selected plot groups. Use without a value to disable all plotting. "
+            "Allowed values: all, summary, balance, twe, pnl, coin_fills, or a comma-separated combination."
+        ),
+    )
+    runtime_group.add_argument(
+        "--cm-debug",
+        nargs="?",
+        const=1,
+        type=int,
+        default=None,
+        help=(
+            "CandlestickManager debug level (0=off, 1=network only, 2=all). "
+            "If passed without value, defaults to 1. Overrides config "
+            "backtest.cm_debug_level."
+            if help_all
+            else argparse.SUPPRESS
+        ),
+    )
+    runtime_group.add_argument(
+        "--cm-progress",
+        nargs="?",
+        const=30.0,
+        type=float,
+        default=None,
+        help=(
+            "CandlestickManager INFO progress log interval in seconds (0 disables). "
+            "If passed without value, defaults to 30. Overrides config "
+            "backtest.cm_progress_log_interval_seconds."
+            if help_all
+            else argparse.SUPPRESS
+        ),
+    )
+    runtime_group.add_argument(
+        "--cm-remote",
+        action="store_true",
+        help=(
+            "Show a per-exchange per-coin remote request progress bar "
+            "(updates on every CCXT/archive request)."
+            if help_all
+            else argparse.SUPPRESS
+        ),
+    )
+    runtime_group.add_argument(
         "--force-refetch-gaps",
         action="store_true",
-        help="Force refetch all known gaps (clears gap cache before downloading). "
-        "Useful when you suspect gaps may have been incorrectly marked as persistent.",
+        help=(
+            "Force refetch all known gaps (clears gap cache before downloading). "
+            "Useful when you suspect gaps may have been incorrectly marked as persistent."
+            if help_all
+            else argparse.SUPPRESS
+        ),
     )
-    template_config = get_template_config()
-    del template_config["optimize"]
-    keep_live_keys = {
-        "approved_coins",
-        "hedge_mode",
-        "ignored_coins",
-        "max_realized_loss_pct",
-        "minimum_coin_age_days",
+
+    group_map = {
+        "Coin Selection": parser.add_argument_group("Coin Selection"),
+        "Date Range": parser.add_argument_group("Date Range"),
+        "Backtest Runtime": runtime_group,
+        "Suite": suite_group,
+        "Output / Analysis": parser.add_argument_group("Output / Analysis"),
+        "Logging": logging_group,
+        "Advanced Overrides": parser.add_argument_group("Advanced Overrides"),
     }
-    for key in sorted(template_config["live"]):
-        if key not in keep_live_keys:
-            del template_config["live"][key]
+
+    template_config = project_template_config_for_cli(get_template_config(), "backtest")
     if "logging" in template_config and isinstance(template_config["logging"], dict):
         template_config["logging"].pop("level", None)
-    add_config_arguments(parser, template_config)
-    raw_args = _normalize_optional_bool_flag(sys.argv[1:], "--suite")
+    allowed_config_keys = add_config_arguments(
+        parser,
+        template_config,
+        command="backtest",
+        help_all=help_all,
+        group_map=group_map,
+    )
+    raw_args = _normalize_optional_bool_flag(expand_help_all_argv(raw_argv), "--suite")
     args = parser.parse_args(raw_args)
     cli_log_level = args.log_level
     initial_log_level = resolve_log_level(cli_log_level, None, fallback=1)
     configure_logging(debug=initial_log_level)
-    if args.config_path is None:
-        logging.info(f"loading default template config configs/template.json")
-        config = load_config("configs/template.json", verbose=False)
-    else:
-        logging.info(f"loading config {args.config_path}")
-        config = load_config(args.config_path)
-    update_config_with_args(config, args, verbose=True)
-    config = format_config(config, verbose=False)
+    source_config, base_config_path, raw_snapshot = load_input_config(args.config_path)
+    update_config_with_args(source_config, args, verbose=True, allowed_keys=allowed_config_keys)
+    config = prepare_config(
+        source_config,
+        base_config_path=base_config_path,
+        verbose=False,
+        raw_snapshot=raw_snapshot,
+    )
     config_logging_value = get_optional_config_value(config, "logging.level", None)
     effective_log_level = resolve_log_level(cli_log_level, config_logging_value, fallback=1)
     if effective_log_level != initial_log_level:
@@ -1430,7 +1934,7 @@ async def main():
     suite_override = None
     if args.suite_config:
         logging.info("loading suite config %s", args.suite_config)
-        override_cfg = load_config(args.suite_config, verbose=False)
+        override_cfg = load_prepared_config(args.suite_config, verbose=False)
         override_backtest = override_cfg.get("backtest", {})
         # Support both new (scenarios at top level) and legacy (suite wrapper) formats
         if "scenarios" in override_backtest:
@@ -1460,8 +1964,8 @@ async def main():
         suite_cfg["enabled"] = bool(args.suite)
 
     # Log disable_plotting if set (not a config key, just a runtime flag)
-    if args.disable_plotting:
-        logging.info("changed disable_plotting False -> True")
+    if args.disable_plotting is not None:
+        logging.info("changed disable_plotting False -> %s", args.disable_plotting)
 
     if suite_cfg.get("enabled"):
         logging.info("Running backtest suite (%d scenarios)...", len(suite_cfg.get("scenarios", [])))
@@ -1481,7 +1985,7 @@ async def main():
     for ex in backtest_exchanges:
         await load_markets(ex)
     await format_approved_ignored_coins(config, backtest_exchanges)
-    config["disable_plotting"] = args.disable_plotting
+    config["disable_plotting"] = args.disable_plotting if args.disable_plotting is not None else False
     config["backtest"]["cache_dir"] = {}
     config["backtest"]["coins"] = {}
     force_refetch_gaps = getattr(args, "force_refetch_gaps", False)
@@ -1517,6 +2021,7 @@ async def main():
             results_path,
             exchange,
             plot_hlcvs=np.asarray(payload.bundle.hlcvs),
+            hard_stop_plot_data=payload.hard_stop_plot_data,
         )
     else:
         # Single exchange mode
@@ -1551,6 +2056,7 @@ async def main():
                 results_path,
                 exchange,
                 plot_hlcvs=np.asarray(payload.bundle.hlcvs),
+                hard_stop_plot_data=payload.hard_stop_plot_data,
             )
 
 

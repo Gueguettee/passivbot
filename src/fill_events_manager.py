@@ -27,13 +27,13 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypedDict
 
 from ccxt.base.errors import RateLimitExceeded
+from config import load_input_config, prepare_config
 
 try:
     from utils import ts_to_date  # type: ignore
 except ImportError:  # pragma: no cover - fallback for package-relative execution
     from .utils import ts_to_date
 
-from config_utils import format_config, load_config
 from logging_setup import configure_logging
 from procedures import load_user_info
 from pure_funcs import ensure_millis
@@ -783,7 +783,9 @@ class CacheMetadata(TypedDict, total=False):
     last_refresh_ms: int  # Timestamp of last successful refresh
     oldest_event_ts: int  # Oldest event timestamp in cache
     newest_event_ts: int  # Newest event timestamp in cache
+    covered_start_ms: int  # Earliest open-ended lookback start confirmed against exchange
     known_gaps: List[KnownGap]  # List of known gaps
+    history_scope: str  # unknown, window, all
 
 
 class FillEventCache:
@@ -862,7 +864,9 @@ class FillEventCache:
             "last_refresh_ms": 0,
             "oldest_event_ts": 0,
             "newest_event_ts": 0,
+            "covered_start_ms": 0,
             "known_gaps": [],
+            "history_scope": "unknown",
         }
 
         if not self.metadata_path.exists():
@@ -927,6 +931,37 @@ class FillEventCache:
     def get_known_gaps(self) -> List[KnownGap]:
         """Return list of known gaps."""
         return self.load_metadata().get("known_gaps", [])
+
+    def get_covered_start_ms(self) -> int:
+        """Return earliest open-ended lookback start confirmed against exchange."""
+        metadata = self.load_metadata()
+        return int(metadata.get("covered_start_ms", 0) or 0)
+
+    def mark_covered_start(self, start_ts: int) -> None:
+        """Persist earliest open-ended lookback start confirmed against exchange."""
+        metadata = self.load_metadata()
+        start_ts = int(start_ts)
+        current = int(metadata.get("covered_start_ms", 0) or 0)
+        if current == 0 or start_ts < current:
+            metadata["covered_start_ms"] = start_ts
+        metadata["last_refresh_ms"] = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        self.save_metadata(metadata)
+
+    def get_history_scope(self) -> str:
+        """Return the cached history coverage contract."""
+        scope = str(self.load_metadata().get("history_scope", "unknown") or "unknown").lower()
+        return scope if scope in {"unknown", "window", "all"} else "unknown"
+
+    def set_history_scope(self, scope: str) -> None:
+        """Persist the cache history coverage contract."""
+        normalized = str(scope or "unknown").lower()
+        if normalized not in {"unknown", "window", "all"}:
+            raise ValueError(f"invalid history scope {scope!r}")
+        metadata = self.load_metadata()
+        if metadata.get("history_scope") == normalized:
+            return
+        metadata["history_scope"] = normalized
+        self.save_metadata(metadata)
 
     def add_known_gap(
         self,
@@ -1027,7 +1062,9 @@ class FillEventCache:
         return {
             "oldest_event_ts": metadata.get("oldest_event_ts", 0),
             "newest_event_ts": metadata.get("newest_event_ts", 0),
+            "covered_start_ms": metadata.get("covered_start_ms", 0),
             "last_refresh_ms": metadata.get("last_refresh_ms", 0),
+            "history_scope": self.get_history_scope(),
             "total_gaps": len(gaps),
             "persistent_gaps": len(persistent_gaps),
             "retryable_gaps": len(retryable_gaps),
@@ -1061,6 +1098,33 @@ class BaseFetcher:
         on_batch: Optional[Callable[[List[Dict[str, object]]], None]] = None,
     ) -> List[Dict[str, object]]:
         raise NotImplementedError
+
+
+class FakeFetcher(BaseFetcher):
+    """Fetch canonical fill events from the fake exchange ledger."""
+
+    def __init__(self, api) -> None:
+        self.api = api
+
+    async def fetch(
+        self,
+        since_ms: Optional[int],
+        until_ms: Optional[int],
+        detail_cache: Dict[str, Tuple[str, str]],
+        on_batch: Optional[Callable[[List[Dict[str, object]]], None]] = None,
+    ) -> List[Dict[str, object]]:
+        events = list(self.api.get_fill_events(since_ms, until_ms))
+        for event in events:
+            cache_entry = detail_cache.get(event["id"])
+            if cache_entry:
+                event["client_order_id"], event["pb_order_type"] = cache_entry
+            elif event["client_order_id"]:
+                event["pb_order_type"] = custom_id_to_snake(event["client_order_id"])
+            if not event["pb_order_type"]:
+                event["pb_order_type"] = "unknown"
+        if on_batch and events:
+            on_batch(events)
+        return events
 
 
 class BitgetFetcher(BaseFetcher):
@@ -1697,9 +1761,9 @@ class BinanceFetcher(BaseFetcher):
             if since_ms is None and until_ms is None:
                 return await self.api.fetch_my_trades(ccxt_symbol, limit=limit)
 
-            end_bound = until_ms or (self._now_func() + 60 * 60 * 1000)
+            end_bound = until_ms or self._now_func()
             start_bound = since_ms or max(0, end_bound - 7 * 24 * 60 * 60 * 1000)
-            week_span = int(7 * 24 * 60 * 60 * 1000 * 0.999)
+            week_span = int(7 * 24 * 60 * 60 * 1000 * 0.99)
             params: Dict[str, object] = {}
             fetched: Dict[str, Dict[str, object]] = {}
             previous_key: Optional[Tuple[Tuple[str, object], ...]] = None
@@ -2380,6 +2444,89 @@ class FillEventsManager:
             start_ms = self._events[idx].timestamp
         await self.refresh(start_ms=start_ms, end_ms=None)
 
+    async def refresh_for_lookback(
+        self,
+        start_ms: int,
+        *,
+        end_ms: Optional[int] = None,
+        overlap: int = 20,
+        gap_hours: float = 12.0,
+        force_refetch_gaps: bool = False,
+    ) -> None:
+        """Refresh fills for a requested lookback window using cache-derived coverage.
+
+        Open-ended lookbacks are tracked in cache metadata so bots can avoid
+        re-running the same expensive history bootstrap after restart when the
+        early portion of the lookback legitimately contains no fills.
+        """
+        await self.ensure_loaded()
+        start_ms = int(start_ms)
+        if end_ms is not None:
+            await self.refresh_range(
+                start_ms=start_ms,
+                end_ms=end_ms,
+                gap_hours=gap_hours,
+                overlap=overlap,
+                force_refetch_gaps=force_refetch_gaps,
+            )
+            return
+
+        metadata = self.cache.load_metadata()
+        covered_start_ms = int(metadata.get("covered_start_ms", 0) or 0)
+        oldest_event_ts = int(self._events[0].timestamp) if self._events else 0
+        metadata_oldest_event_ts = int(metadata.get("oldest_event_ts", 0) or 0)
+        metadata_newest_event_ts = int(metadata.get("newest_event_ts", 0) or 0)
+        metadata_indicates_no_cached_fills = (
+            metadata_oldest_event_ts <= 0 and metadata_newest_event_ts <= 0
+        )
+        metadata_claims_history_without_events = (
+            not self._events
+            and (metadata_oldest_event_ts > 0 or metadata_newest_event_ts > 0)
+            and covered_start_ms > 0
+            and covered_start_ms <= start_ms
+        )
+        lookback_covered = (
+            covered_start_ms > 0 and covered_start_ms <= start_ms and bool(self._events)
+        ) or (oldest_event_ts > 0 and oldest_event_ts <= start_ms) or (
+            covered_start_ms > 0
+            and covered_start_ms <= start_ms
+            and metadata_indicates_no_cached_fills
+        )
+
+        if lookback_covered:
+            logger.debug(
+                "[fills] lookback already covered from %s (covered_start=%s oldest_event=%s); refreshing latest",
+                _format_ms(start_ms),
+                _format_ms(covered_start_ms) if covered_start_ms else "None",
+                _format_ms(oldest_event_ts) if oldest_event_ts else "None",
+            )
+            await self.refresh_latest(overlap=overlap)
+            return
+
+        if metadata_claims_history_without_events:
+            logger.warning(
+                "[fills] cache metadata claims lookback coverage from %s, but no cached events were loaded; rebuilding from requested lookback",
+                _format_ms(covered_start_ms),
+            )
+
+        if self._events:
+            logger.info(
+                "[fills] lookback uncovered from %s; refreshing missing range before latest",
+                _format_ms(start_ms),
+            )
+            await self.refresh_range(
+                start_ms=start_ms,
+                end_ms=None,
+                gap_hours=gap_hours,
+                overlap=overlap,
+                force_refetch_gaps=force_refetch_gaps,
+            )
+        else:
+            logger.info("[fills] cache empty; refreshing full lookback from %s", _format_ms(start_ms))
+            await self.refresh(start_ms=start_ms, end_ms=None)
+
+        self.cache.mark_covered_start(start_ms)
+
     async def refresh_range(
         self,
         start_ms: int,
@@ -2562,6 +2709,12 @@ class FillEventsManager:
             summary["symbols_count"] = len(symbols)
             summary["symbols"] = sorted(symbols)
         return summary
+
+    def get_history_scope(self) -> str:
+        return self.cache.get_history_scope()
+
+    def set_history_scope(self, scope: str) -> None:
+        self.cache.set_history_scope(scope)
 
     @staticmethod
     def _events_for_days(
@@ -4405,6 +4558,7 @@ EXCHANGE_BOT_CLASSES: Dict[str, Tuple[str, str]] = {
     "binance": ("exchanges.binance", "BinanceBot"),
     "bitget": ("exchanges.bitget", "BitgetBot"),
     "bybit": ("exchanges.bybit", "BybitBot"),
+    "fake": ("exchanges.fake", "FakeBot"),
     "hyperliquid": ("exchanges.hyperliquid", "HyperliquidBot"),
     "gateio": ("exchanges.gateio", "GateIOBot"),
     "kucoin": ("exchanges.kucoin", "KucoinBot"),
@@ -4517,6 +4671,8 @@ def _build_fetcher_for_bot(bot, symbols: List[str]) -> BaseFetcher:
         )
     if exchange == "bybit":
         return BybitFetcher(api=bot.cca)
+    if exchange == "fake":
+        return FakeFetcher(api=bot.cca)
     if exchange == "hyperliquid":
         return HyperliquidFetcher(
             api=bot.cca,
@@ -4551,8 +4707,15 @@ def _instantiate_bot(config: dict):
 
 
 async def _run_cli(args: argparse.Namespace) -> None:
-    config = load_config(args.config, verbose=False)
-    config = format_config(config, verbose=False)
+    source_config, base_config_path, raw_snapshot = load_input_config(args.config)
+    config = prepare_config(
+        source_config,
+        base_config_path=base_config_path,
+        verbose=False,
+        target="live",
+        runtime="live",
+        raw_snapshot=raw_snapshot,
+    )
     live = config.setdefault("live", {})
     if args.user:
         live["user"] = args.user
@@ -4596,7 +4759,11 @@ async def _run_cli(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fill events cache refresher")
     parser.add_argument(
-        "--config", "-c", type=str, default="configs/template.json", help="Config path"
+        "--config",
+        "-c",
+        type=str,
+        default=None,
+        help="Config path (defaults to in-code schema defaults)",
     )
     parser.add_argument("--user", "-u", type=str, required=True, help="Live user identifier")
     parser.add_argument("--start", "-s", type=str, help="Start datetime (ms or ISO)")

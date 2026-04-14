@@ -7,13 +7,13 @@ itself; it only inspects filesystem state.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
 import sysconfig
 import time
 import hashlib
-from shutil import copy2
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -22,6 +22,7 @@ LOCK_TIMEOUT = 300  # seconds
 LOCK_CHECK_INTERVAL = 2  # seconds
 COMPILED_EXTENSION_NAME = "libpassivbot_rust"
 PYTHON_MODULE_NAME = "passivbot_rust"
+SOURCE_STAMP_SUFFIX = ".rust-src-sha256"
 
 
 def _extension_suffixes() -> list[str]:
@@ -44,13 +45,17 @@ def _local_extension_candidates() -> list[Path]:
 def _installed_extension_candidates() -> list[Path]:
     exts = _extension_suffixes()
     out: list[Path] = []
-    # The installed extension module produced by `maturin develop` typically lives in
-    # `<site-packages>/passivbot_rust/passivbot_rust.*.so` (platform-specific).
+    # The installed extension produced by `maturin develop` is typically a direct module in
+    # `<site-packages>/passivbot_rust.*.so` (platform-specific), though some layouts may place
+    # it under a package directory.
     for key in ("platlib", "purelib"):
         root = sysconfig.get_paths().get(key)
         if not root:
             continue
-        pkg_dir = Path(root) / PYTHON_MODULE_NAME
+        root_path = Path(root)
+        for ext in exts:
+            out.extend(root_path.glob(f"{PYTHON_MODULE_NAME}*.{ext}"))
+        pkg_dir = root_path / PYTHON_MODULE_NAME
         if not pkg_dir.exists():
             continue
         for ext in exts:
@@ -81,6 +86,65 @@ def compiled_extension_paths() -> List[Path]:
     )
 
 
+def _import_target_compiled_path() -> Optional[Path]:
+    """
+    Resolve the compiled artifact Python would import in the current process.
+
+    This must work both for direct extension modules and for the package layout produced by
+    `maturin develop`, where `find_spec("passivbot_rust")` resolves to `__init__.py` and the
+    compiled extension lives alongside it.
+    """
+    spec = importlib.util.find_spec(PYTHON_MODULE_NAME)
+    if spec is None:
+        return None
+
+    origin = getattr(spec, "origin", None)
+    if origin and origin not in {"built-in", "frozen"}:
+        origin_path = Path(origin)
+        suffixes = {suffix.lower() for suffix in _extension_suffixes()}
+        if any(str(origin_path).lower().endswith(f".{suffix}") for suffix in suffixes):
+            return origin_path
+
+    locations = list(getattr(spec, "submodule_search_locations", []) or [])
+    if not locations:
+        return None
+
+    suffixes = _extension_suffixes()
+    for location in locations:
+        location_path = Path(location)
+        for ext in suffixes:
+            matches = [p for p in location_path.glob(f"{PYTHON_MODULE_NAME}*.{ext}") if p.exists()]
+            if matches:
+                return max(matches, key=lambda p: p.stat().st_mtime)
+    return None
+
+
+def _compiled_path_from_loaded_module() -> Optional[Path]:
+    module = sys.modules.get(PYTHON_MODULE_NAME)
+    if module is None:
+        return None
+
+    module_file = getattr(module, "__file__", None)
+    if module_file and module_file not in {"built-in", "frozen"}:
+        module_path = Path(module_file)
+        suffixes = {suffix.lower() for suffix in _extension_suffixes()}
+        if any(str(module_path).lower().endswith(f".{suffix}") for suffix in suffixes):
+            return module_path
+
+    locations = list(getattr(module, "__path__", []) or [])
+    if not locations:
+        return None
+
+    suffixes = _extension_suffixes()
+    for location in locations:
+        location_path = Path(location)
+        for ext in suffixes:
+            matches = [p for p in location_path.glob(f"{PYTHON_MODULE_NAME}*.{ext}") if p.exists()]
+            if matches:
+                return max(matches, key=lambda p: p.stat().st_mtime)
+    return None
+
+
 def preferred_compiled_mtime() -> Optional[float]:
     """
     Mtime of the extension artifact that is *most likely* to be imported.
@@ -90,6 +154,9 @@ def preferred_compiled_mtime() -> Optional[float]:
     2) installed site-packages `passivbot_rust/passivbot_rust*.so`
     3) `passivbot-rust/target/release/libpassivbot_rust.*`
     """
+    import_target = _import_target_compiled_path()
+    if import_target is not None and import_target.exists():
+        return import_target.stat().st_mtime
     for group in (
         _local_extension_candidates(),
         _installed_extension_candidates(),
@@ -100,10 +167,99 @@ def preferred_compiled_mtime() -> Optional[float]:
             return max(mtimes)
     return None
 
+def preferred_compiled_path() -> Optional[Path]:
+    """
+    Path of the extension artifact that is *most likely* to be imported.
+
+    Priority matches `preferred_compiled_mtime()`.
+    """
+    import_target = _import_target_compiled_path()
+    if import_target is not None and import_target.exists():
+        return import_target
+    for group in (
+        _local_extension_candidates(),
+        _installed_extension_candidates(),
+        _target_extension_candidates(),
+    ):
+        existing = [p for p in group if p.exists()]
+        if existing:
+            return max(existing, key=lambda p: p.stat().st_mtime)
+    return None
+
+
+def sha256_file(path: str | Path | None) -> Optional[str]:
+    if path is None:
+        return None
+    file_path = Path(path)
+    if not file_path.exists() or not file_path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with file_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def collect_runtime_provenance() -> dict:
+    preferred_path = preferred_compiled_path()
+    preferred_str = str(preferred_path) if preferred_path is not None else None
+    preferred_hash = sha256_file(preferred_str)
+    runtime_path = None
+    runtime_hash = None
+    runtime_mtime = None
+    runtime_stamp = None
+    module_loaded = False
+    module_name = PYTHON_MODULE_NAME
+    module = sys.modules.get(module_name)
+    if module is not None:
+        module_loaded = True
+        runtime_compiled = _compiled_path_from_loaded_module()
+        runtime_path = str(runtime_compiled) if runtime_compiled is not None else None
+        runtime_hash = sha256_file(runtime_path)
+        runtime_stamp = read_source_stamp(runtime_compiled) if runtime_compiled is not None else None
+        try:
+            runtime_mtime = Path(runtime_path).stat().st_mtime if runtime_path else None
+        except OSError:
+            runtime_mtime = None
+    preferred_mtime = None
+    try:
+        preferred_mtime = Path(preferred_str).stat().st_mtime if preferred_str else None
+    except OSError:
+        preferred_mtime = None
+    return {
+        "module_name": module_name,
+        "module_loaded": module_loaded,
+        "runtime_module_path": runtime_path,
+        "runtime_module_sha256": runtime_hash,
+        "runtime_module_mtime": runtime_mtime,
+        "runtime_module_source_stamp": runtime_stamp,
+        "preferred_compiled_path": preferred_str,
+        "preferred_compiled_sha256": preferred_hash,
+        "preferred_compiled_mtime": preferred_mtime,
+        "runtime_matches_preferred": (
+            runtime_hash is not None and preferred_hash is not None and runtime_hash == preferred_hash
+        ),
+        "pid": os.getpid(),
+    }
+
 
 def latest_compiled_mtime(paths: Iterable[Path]) -> Optional[float]:
     mtimes = [p.stat().st_mtime for p in paths if p.exists()]
     return max(mtimes) if mtimes else None
+
+
+def _tracked_source_files(root: Path = Path("passivbot-rust")) -> list[Path]:
+    tracked_files: list[Path] = []
+    for file_path in (root / "Cargo.toml", root / "Cargo.lock"):
+        if file_path.exists():
+            tracked_files.append(file_path)
+    for file_path in root.glob("*.rs"):
+        if file_path.exists():
+            tracked_files.append(file_path)
+    src_root = root / "src"
+    if src_root.exists():
+        tracked_files.extend(path for path in src_root.rglob("*.rs") if path.exists())
+    return sorted(set(tracked_files))
 
 
 def latest_source_mtime(root: Path = Path("passivbot-rust")) -> Optional[float]:
@@ -114,31 +270,29 @@ def latest_source_mtime(root: Path = Path("passivbot-rust")) -> Optional[float]:
     - Avoid scanning `target/` since build artifacts may contain generated `.rs` files and
       can cause perpetual "stale" detection.
     """
-    tracked_roots = [root / "src"]
-    tracked_files = [root / "Cargo.toml", root / "Cargo.lock"]
-
     mtimes: list[float] = []
-    for file_path in tracked_files:
+    for file_path in _tracked_source_files(root):
         try:
-            if file_path.exists():
-                mtimes.append(file_path.stat().st_mtime)
+            mtimes.append(file_path.stat().st_mtime)
         except OSError:
             continue
-    for file_path in root.glob("*.rs"):
-        try:
-            if file_path.exists():
-                mtimes.append(file_path.stat().st_mtime)
-        except OSError:
-            continue
-    for scan_root in tracked_roots:
-        if not scan_root.exists():
-            continue
-        for path in scan_root.rglob("*.rs"):
-            try:
-                mtimes.append(path.stat().st_mtime)
-            except OSError:
-                continue
     return max(mtimes) if mtimes else None
+
+
+def source_fingerprint(root: Path = Path("passivbot-rust")) -> Optional[str]:
+    tracked_files = _tracked_source_files(root)
+    if not tracked_files:
+        return None
+    digest = hashlib.sha256()
+    for path in tracked_files:
+        rel = path.relative_to(root)
+        digest.update(str(rel).encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def is_stale(compiled_mtime: Optional[float], source_mtime: Optional[float]) -> bool:
@@ -147,6 +301,42 @@ def is_stale(compiled_mtime: Optional[float], source_mtime: Optional[float]) -> 
     if source_mtime is None:
         return False
     return compiled_mtime < source_mtime
+
+
+def source_stamp_path(compiled_path: Path) -> Path:
+    return compiled_path.with_name(f"{compiled_path.name}{SOURCE_STAMP_SUFFIX}")
+
+
+def read_source_stamp(compiled_path: Path) -> Optional[str]:
+    stamp_path = source_stamp_path(compiled_path)
+    try:
+        if stamp_path.exists():
+            return stamp_path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+    return None
+
+
+def write_source_stamp(compiled_path: Path, fingerprint: str) -> None:
+    stamp_path = source_stamp_path(compiled_path)
+    stamp_path.write_text(f"{fingerprint}\n", encoding="utf-8")
+
+
+def extension_needs_rebuild(
+    compiled_path: Optional[Path],
+    source_mtime: Optional[float],
+    fingerprint: Optional[str],
+) -> bool:
+    if compiled_path is None or not compiled_path.exists():
+        return True
+    stamp = read_source_stamp(compiled_path)
+    if fingerprint is not None and stamp is not None:
+        return stamp != fingerprint
+    if is_stale(compiled_path.stat().st_mtime, source_mtime):
+        return True
+    if fingerprint is None:
+        return False
+    return stamp != fingerprint
 
 
 def acquire_lock(lock_file: Path = LOCK_FILE) -> bool:
@@ -186,6 +376,38 @@ def release_lock(lock_file: Path = LOCK_FILE) -> None:
         pass
 
 
+def stamp_compiled_extensions(fingerprint: Optional[str]) -> None:
+    if fingerprint is None:
+        return
+    for compiled_path in compiled_extension_paths():
+        if not compiled_path.exists():
+            continue
+        try:
+            write_source_stamp(compiled_path, fingerprint)
+        except OSError:
+            continue
+
+
+def prune_shadowing_local_extensions() -> None:
+    """
+    Remove local `src/passivbot_rust*.so` copies when an installed build exists.
+
+    The canonical runtime artifact is the editable-install output in site-packages. A local copied
+    extension in `src/` can shadow that build when `src/` is first on `sys.path`, which is exactly
+    how stale-extension confusion happens in this repo.
+    """
+    installed = [p for p in _installed_extension_candidates() if p.exists()]
+    if not installed:
+        return
+    for local in _local_extension_candidates():
+        try:
+            if local.exists():
+                local.unlink()
+            source_stamp_path(local).unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
 def recompile_rust() -> bool:
     try:
         start = time.time()
@@ -199,7 +421,8 @@ def recompile_rust() -> bool:
         elapsed = time.time() - start
         print(result.stdout)
         print(f"Rust extension rebuild finished in {elapsed:.2f}s")
-        sync_installed_extension_into_src()
+        stamp_compiled_extensions(source_fingerprint())
+        prune_shadowing_local_extensions()
         return True
     except subprocess.CalledProcessError as e:
         print(e.stderr)
@@ -230,14 +453,13 @@ def check_and_maybe_compile(
         print("passivbot_rust already imported; using existing binary.")
         return
 
-    # If a newer build already exists in site-packages, sync it into `src/` first so we don't
-    # spuriously rebuild just because a stale local `.so` is shadowing the installed one.
-    sync_installed_extension_into_src()
+    # Prefer the editable-install artifact in site-packages and delete shadowing local copies.
+    prune_shadowing_local_extensions()
 
-    compiled_paths = compiled_extension_paths()
-    compiled_mtime = preferred_compiled_mtime()
     source_mtime = latest_source_mtime()
-    stale = is_stale(compiled_mtime, source_mtime)
+    fingerprint = source_fingerprint()
+    compiled_path = preferred_compiled_path()
+    stale = extension_needs_rebuild(compiled_path, source_mtime, fingerprint)
 
     needs_compile = force or stale
     if fail_on_stale and stale:
@@ -245,7 +467,7 @@ def check_and_maybe_compile(
     if not needs_compile:
         return
 
-    if compiled_mtime is None:
+    if compiled_path is None:
         print("Rust extension missing; compiling...")
     elif stale:
         print("Rust extension is stale; recompiling...")
@@ -261,68 +483,59 @@ def check_and_maybe_compile(
         release_lock()
 
     # Re-check staleness after compile
-    compiled_mtime = preferred_compiled_mtime()
-    if is_stale(compiled_mtime, latest_source_mtime()):
+    prune_shadowing_local_extensions()
+    compiled_path = preferred_compiled_path()
+    if extension_needs_rebuild(compiled_path, latest_source_mtime(), source_fingerprint()):
         raise RuntimeError("Rust extension appears stale even after recompilation; check build.")
 
 
 def sync_installed_extension_into_src() -> None:
     """
-    Ensure `src/passivbot_rust*.so` matches the installed `maturin develop` build.
+    Deprecated compatibility shim.
 
-    `src/*.py` scripts put `src/` first on `sys.path`, so a stale local `.so` will shadow
-    the freshly-installed site-packages build and make changes appear to have no effect.
+    The robust fix for stale-extension shadowing is to remove local `src/passivbot_rust*.so`
+    copies entirely and rely on the installed editable build in site-packages.
     """
-    installed = [p for p in _installed_extension_candidates() if p.exists()]
-    if not installed:
-        return
-    installed_path = max(installed, key=lambda p: p.stat().st_mtime)
-    dst = Path("src") / installed_path.name
+    prune_shadowing_local_extensions()
 
-    # Remove any shadowing local builds with a different filename.
-    for local in _local_extension_candidates():
-        try:
-            if local.exists() and local.name != dst.name:
-                local.unlink()
-        except OSError:
-            pass
 
-    def _sha256(path: Path) -> str:
-        h = hashlib.sha256()
-        with path.open("rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
+def verify_loaded_runtime_extension(*, fingerprint: Optional[str] = None) -> dict:
+    """
+    Verify that the compiled artifact loaded in this Python process matches current Rust sources.
 
-    # Copy only when needed.
-    try:
-        if dst.exists():
-            src_stat = installed_path.stat()
-            dst_stat = dst.stat()
-            if src_stat.st_size == dst_stat.st_size:
-                # Avoid rewriting an identical dylib. Rewriting in-place can race with imports
-                # from concurrent processes on macOS and trigger "Code Signature Invalid" kills.
-                if _sha256(installed_path) == _sha256(dst):
-                    # Content is identical; update mtime so staleness checks pass.
-                    try:
-                        inst_mtime = installed_path.stat().st_mtime
-                        os.utime(dst, (inst_mtime, inst_mtime))
-                    except OSError:
-                        pass
-                    return
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}")
-        copy2(installed_path, tmp)
-        if sys.platform == "darwin":
-            # Best-effort ad-hoc sign; keeps macOS happy when loading copied extension pages.
-            subprocess.run(  # noqa: S603,S607
-                ["codesign", "--force", "--sign", "-", str(tmp)],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        os.replace(tmp, dst)
-        print(f"Synced Rust extension into {dst}")
-    except OSError:
-        # Best-effort; if we can't sync, the build still exists in site-packages.
-        return
+    This should be called after importing `passivbot_rust` in long-lived command entrypoints.
+    """
+    if fingerprint is None:
+        fingerprint = source_fingerprint()
+
+    module = sys.modules.get(PYTHON_MODULE_NAME)
+    runtime_path = _compiled_path_from_loaded_module()
+    if runtime_path is None and module is not None:
+        # Test environments frequently install a lightweight stub module under this name.
+        if not hasattr(module, "__path__") and not getattr(module, "__file__", None):
+            return {
+                "runtime_compiled_path": None,
+                "runtime_compiled_sha256": None,
+                "runtime_compiled_source_stamp": None,
+                "expected_source_fingerprint": fingerprint,
+                "skipped": "stub_module",
+            }
+    if runtime_path is None or not runtime_path.exists():
+        raise RuntimeError("Loaded Rust extension path could not be resolved.")
+
+    stamp = read_source_stamp(runtime_path)
+    if fingerprint is not None and stamp is not None and stamp != fingerprint:
+        raise RuntimeError(
+            "Loaded Rust extension does not match current Rust sources; restart after rebuild."
+        )
+    if fingerprint is not None and stamp is None and is_stale(runtime_path.stat().st_mtime, latest_source_mtime()):
+        raise RuntimeError(
+            "Loaded Rust extension has no source fingerprint stamp and appears stale."
+        )
+
+    return {
+        "runtime_compiled_path": str(runtime_path),
+        "runtime_compiled_sha256": sha256_file(runtime_path),
+        "runtime_compiled_source_stamp": stamp,
+        "expected_source_fingerprint": fingerprint,
+    }

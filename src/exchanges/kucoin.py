@@ -183,11 +183,11 @@ class KucoinBot(CCXTBot):
             return "short"
         raise Exception(f"unknown side {order['side']}")
 
-    async def fetch_open_orders(self, symbol: str = None) -> list:
+    async def _do_fetch_open_orders(self, symbol: str = None) -> list:
         """KuCoin: Fetch open orders with pagination.
 
         Returns:
-            list: Orders sorted by timestamp with normalized fields.
+            list: Raw open orders across pages.
 
         Raises:
             Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
@@ -203,13 +203,25 @@ class KucoinBot(CCXTBot):
             for order in fetched:
                 order["position_side"] = self.determine_pos_side(order)
                 order["qty"] = order["amount"]
+                self._record_live_margin_mode_from_payload(order)
             open_orders.extend(fetched)
             if len(fetched) < page_size:
                 break
             if len(open_orders) >= self.MAX_OPEN_ORDERS:
                 break
             current_page += 1
-        return sorted(open_orders, key=lambda x: x["timestamp"])
+        return open_orders
+
+    def _normalize_open_orders(self, fetched: list) -> list:
+        for order in fetched:
+            order["position_side"] = self.determine_pos_side(order)
+            order["qty"] = order["amount"]
+            self._record_live_margin_mode_from_payload(order)
+        return sorted(fetched, key=lambda x: x["timestamp"])
+
+    async def fetch_open_orders(self, symbol: str = None) -> list:
+        fetched = await self._do_fetch_open_orders(symbol=symbol)
+        return self._normalize_open_orders(fetched)
 
     def _get_balance(self, fetched: dict) -> float:
         """KuCoin uses marginBalance in info.data."""
@@ -417,10 +429,11 @@ class KucoinBot(CCXTBot):
         return events
 
     def _build_order_params(self, order: dict) -> dict:
+        margin_mode = self._get_margin_mode_for_symbol(order["symbol"])
         return {
             "timeInForce": "GTC",
             "reduceOnly": order.get("reduce_only", False),
-            "marginMode": "CROSS",
+            "marginMode": margin_mode.upper(),
             "clientOid": order.get("custom_id", None),
             "positionSide": order.get("position_side", "").upper(),
         }
@@ -434,18 +447,6 @@ class KucoinBot(CCXTBot):
             )
         except (KeyError, TypeError, AttributeError):
             return False
-
-    async def determine_utc_offset(self, verbose=True):
-        # returns millis to add to utc to get exchange timestamp
-        # call some endpoint which includes timestamp for exchange's server
-        # if timestamp is not included in self.cca.fetch_balance(),
-        # implement method in exchange child class
-        result = await self.cca.fetch_ticker("BTC/USDT:USDT")
-        self.utc_offset = round((result["timestamp"] - utc_ms()) / (1000 * 60 * 60)) * (
-            1000 * 60 * 60
-        )
-        if verbose:
-            logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
 
     async def update_exchange_config(self):
         """Ensure account-level settings (hedge mode) are applied."""
@@ -463,8 +464,9 @@ class KucoinBot(CCXTBot):
         coros_to_call = []
         for symbol in symbols:
             try:
+                margin_mode = self._get_margin_mode_for_symbol(symbol)
                 params = {
-                    "marginMode": "cross",
+                    "marginMode": margin_mode,
                     "symbol": symbol,
                 }
                 coros_to_call.append(
@@ -490,15 +492,11 @@ class KucoinBot(CCXTBot):
         coros_to_call = []
         for symbol in symbols:
             try:
+                margin_mode = self._get_margin_mode_for_symbol(symbol)
                 params = {
-                    "leverage": int(
-                        min(
-                            self.max_leverage[symbol],
-                            self.config_get(["live", "leverage"], symbol=symbol),
-                        )
-                    ),
+                    "leverage": self._calc_leverage_for_symbol(symbol),
                     "symbol": symbol,
-                    "params": {"marginMode": "cross"},
+                    "params": {"marginMode": margin_mode},
                 }
                 coros_to_call.append(
                     (symbol, "set_leverage", asyncio.create_task(self.cca.set_leverage(**params)))

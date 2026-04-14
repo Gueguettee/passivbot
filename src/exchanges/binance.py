@@ -6,7 +6,7 @@ import random
 from utils import ts_to_date, utc_ms
 from pure_funcs import flatten
 from procedures import load_broker_code
-from config_utils import require_live_value
+from config.access import require_live_value
 
 
 class BinanceBot(CCXTBot):
@@ -88,14 +88,17 @@ class BinanceBot(CCXTBot):
         positions = []
         for elm in fetched:
             if float(elm["positionAmt"]) != 0.0:
-                positions.append(
-                    {
-                        "symbol": self.get_symbol_id_inv(elm["symbol"]),
-                        "position_side": elm["positionSide"].lower(),
-                        "size": float(elm["positionAmt"]),
-                        "price": float(elm["entryPrice"]),
-                    }
-                )
+                normalized = {
+                    "symbol": self.get_symbol_id_inv(elm["symbol"]),
+                    "position_side": elm["positionSide"].lower(),
+                    "size": float(elm["positionAmt"]),
+                    "price": float(elm["entryPrice"]),
+                }
+                margin_mode = self._extract_live_margin_mode(elm)
+                if margin_mode is not None:
+                    normalized["margin_mode"] = margin_mode
+                    self._record_live_margin_mode(normalized["symbol"], margin_mode)
+                positions.append(normalized)
         return positions
 
     def _get_balance(self, fetched: dict) -> float:
@@ -104,7 +107,7 @@ class BinanceBot(CCXTBot):
 
     # ═══════════════════ BINANCE-SPECIFIC METHODS ═══════════════════
 
-    async def fetch_open_orders(self, symbol: str = None, all=False) -> list:
+    async def _do_fetch_open_orders(self, symbol: str = None, all=False) -> list:
         """Binance: Parallel fetch per-symbol to avoid expensive all-symbols query."""
         if all:
             self.cca.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
@@ -121,13 +124,20 @@ class BinanceBot(CCXTBot):
                 *[self.cca.fetch_open_orders(symbol=s) for s in sorted(symbols_)]
             )
             fetched = [x for sublist in results for x in sublist]
+        return fetched
 
+    def _normalize_open_orders(self, fetched: list) -> list:
         open_orders = {}
         for elm in fetched:
             elm["position_side"] = elm["info"]["positionSide"].lower()
             elm["qty"] = elm["amount"]
+            self._record_live_margin_mode_from_payload(elm)
             open_orders[elm["id"]] = elm
         return sorted(open_orders.values(), key=lambda x: x["timestamp"])
+
+    async def fetch_open_orders(self, symbol: str = None, all=False) -> list:
+        fetched = await self._do_fetch_open_orders(symbol=symbol, all=all)
+        return self._normalize_open_orders(fetched)
 
     async def fetch_tickers(self) -> dict:
         """Binance: Use bookticker endpoint for efficiency."""
@@ -353,12 +363,13 @@ class BinanceBot(CCXTBot):
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call_lev, coros_to_call_margin_mode = {}, {}
         for symbol in symbols:
+            margin_mode = self._get_margin_mode_for_symbol(symbol)
             coros_to_call_margin_mode[symbol] = asyncio.create_task(
-                self.cca.set_margin_mode("cross", symbol=symbol)
+                self.cca.set_margin_mode(margin_mode, symbol=symbol)
             )
             coros_to_call_lev[symbol] = asyncio.create_task(
                 self.cca.set_leverage(
-                    int(self.config_get(["live", "leverage"], symbol=symbol)), symbol=symbol
+                    self._calc_leverage_for_symbol(symbol), symbol=symbol
                 )
             )
         for symbol in symbols:
@@ -386,18 +397,6 @@ class BinanceBot(CCXTBot):
                 logging.debug("[config] hedge mode unchanged: %s", e)
             else:
                 logging.error("[config] error setting hedge mode: %s", e)
-
-    async def determine_utc_offset(self, verbose=True):
-        # returns millis to add to utc to get exchange timestamp
-        # call some endpoint which includes timestamp for exchange's server
-        # if timestamp is not included in self.cca.fetch_balance(),
-        # implement method in exchange child class
-        result = await self.cca.fetch_ticker("BTC/USDT:USDT")
-        self.utc_offset = round((result["timestamp"] - utc_ms()) / (1000 * 60 * 60)) * (
-            1000 * 60 * 60
-        )
-        if verbose:
-            logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
 
     def format_custom_id_single(self, order_type_id: int) -> str:
         formatted = super().format_custom_id_single(order_type_id)

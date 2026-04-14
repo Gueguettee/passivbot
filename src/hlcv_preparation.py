@@ -64,7 +64,7 @@ class ProgressTracker:
         _pct_log("info", 100, f"{self.context} done {self.processed}/{self.total} in {elapsed}s")
 
 
-from config_utils import require_config_value, require_live_value
+from config.access import require_config_value, require_live_value
 from ohlcv_utils import dump_ohlcv_data, get_days_in_between, load_ohlcv_data
 from procedures import get_first_timestamps_unified
 from utils import (
@@ -250,12 +250,32 @@ class HLCVManager:
                 if (now - float(self._download_log_last.get(key, 0.0))) < 10.0:
                     return
                 self._download_log_last[key] = now
+                first_ts = payload.get("first_ts")
+                last_ts = payload.get("last_ts")
+                first_iso = None
+                last_iso = None
+                try:
+                    if first_ts is not None:
+                        first_iso = datetime.fromtimestamp(
+                            int(first_ts) / 1000, tz=timezone.utc
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except Exception:
+                    first_iso = None
+                try:
+                    if last_ts is not None:
+                        last_iso = datetime.fromtimestamp(
+                            int(last_ts) / 1000, tz=timezone.utc
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except Exception:
+                    last_iso = None
                 logging.info(
-                    "[%s] download ccxt ok symbol=%s tf=%s rows=%s elapsed_ms=%s",
+                    "[%s] download ccxt ok symbol=%s tf=%s rows=%s first=%s last=%s elapsed_ms=%s",
                     self.exchange,
                     symbol,
                     payload.get("tf"),
                     payload.get("rows"),
+                    first_iso if first_iso is not None else first_ts,
+                    last_iso if last_iso is not None else last_ts,
                     payload.get("elapsed_ms"),
                 )
                 return
@@ -328,9 +348,35 @@ class HLCVManager:
         except Exception:
             pass
 
+    @staticmethod
+    def _market_lookup_forms(value: str) -> set[str]:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return set()
+        return {
+            normalized,
+            normalized.replace("-", ":"),
+            normalized.replace(":", "-"),
+        }
+
     def get_symbol(self, coin: str) -> str:
         assert self.markets, "needs to call load_markets() first"
-        return coin_to_symbol(coin, self.exchange)
+        symbol = coin_to_symbol(coin, self.exchange)
+        if symbol in self.markets:
+            return symbol
+
+        coin_forms = self._market_lookup_forms(coin)
+        symbol_forms = self._market_lookup_forms(symbol)
+        for market_symbol, market in self.markets.items():
+            market_forms = self._market_lookup_forms(market_symbol)
+            base_forms = self._market_lookup_forms(market.get("base", ""))
+            if market_forms & symbol_forms:
+                return market_symbol
+            if base_forms & coin_forms:
+                return market_symbol
+            if base_forms & symbol_forms:
+                return market_symbol
+        return symbol
 
     def has_coin(self, coin: str) -> bool:
         symbol = self.get_symbol(coin)
@@ -1278,6 +1324,7 @@ async def _prepare_hlcvs_combined_impl(
     async def process_coin(coin: str, sem: asyncio.Semaphore):
         """Fetch coin data from all candidate exchanges and select the best one."""
         async with sem:  # Rate limiting
+            forced_exchange = None
             try:
                 is_stock_perp_coin = coin.startswith("xyz:")
                 if coin not in first_timestamps_unified and not (
@@ -1339,6 +1386,14 @@ async def _prepare_hlcvs_combined_impl(
                         )
                     )
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                if forced_exchange:
+                    forced_idx = candidate_exchanges.index(forced_exchange)
+                    forced_result = results[forced_idx]
+                    if isinstance(forced_result, Exception):
+                        raise RuntimeError(
+                            f"Forced exchange {forced_exchange} failed for coin {coin}"
+                        ) from forced_result
 
                 # Filter successful results
                 exchange_candidates = []
@@ -1408,6 +1463,8 @@ async def _prepare_hlcvs_combined_impl(
             except Exception as e:
                 logging.error(f"Error processing coin {coin}: {e}")
                 traceback.print_exc()
+                if forced_exchange:
+                    raise
                 return None
 
     # Parallelize coin processing with rate limiting
@@ -1422,7 +1479,9 @@ async def _prepare_hlcvs_combined_impl(
     for result in results:
         progress.maybe_log()
 
-        if result is None or isinstance(result, Exception):
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
             progress.update()
             continue
 

@@ -38,7 +38,7 @@ Use a short window + one coin for fast review checks on order/risk/EMA/config-fl
 ```bash
 python3 - <<'PY'
 import copy, json
-cfg = copy.deepcopy(json.load(open("configs/template.json")))
+cfg = copy.deepcopy(json.load(open("configs/examples/default_trailing_grid_long_npos10.json")))
 cfg.setdefault("backtest", {})
 cfg["backtest"]["start_date"] = "2025-01-01"
 cfg["backtest"]["end_date"] = "2025-01-08"
@@ -46,7 +46,7 @@ cfg.setdefault("live", {})
 cfg["live"]["approved_coins"] = {"long": ["BTC/USDT:USDT"], "short": []}
 json.dump(cfg, open("/tmp/review_backtest.json", "w"), indent=2)
 PY
-python3 src/backtest.py /tmp/review_backtest.json --suite n -dp
+passivbot backtest /tmp/review_backtest.json --suite n -dp
 ```
 
 ## Review Report Template

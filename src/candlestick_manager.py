@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import sys
 
 import time
@@ -54,7 +55,7 @@ if TYPE_CHECKING:
 
 import warnings
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import portalocker  # type: ignore
@@ -137,6 +138,111 @@ EMA_SERIES_DTYPE = np.dtype(
 
 
 # ----- Utilities -----
+
+
+def _linear_interpolate(value0: float, value1: float, ratio: float) -> float:
+    return float(value0 + (value1 - value0) * ratio)
+
+
+def ohlcv_xm_to_1m(candle: np.void, minutes: int) -> np.ndarray:
+    """Expand one higher-timeframe OHLCV candle into deterministic synthetic 1m candles."""
+    if minutes <= 0:
+        raise ValueError(f"minutes must be > 0, got {minutes}")
+
+    ts = int(candle["ts"])
+    o = float(candle["o"])
+    h = float(candle["h"])
+    l = float(candle["l"])
+    c = float(candle["c"])
+    bv = float(candle["bv"])
+
+    if not all(math.isfinite(x) for x in (o, h, l, c, bv)):
+        raise ValueError("all OHLCV values must be finite")
+    if h < l:
+        h, l = l, h
+    o = min(max(o, l), h)
+    c = min(max(c, l), h)
+
+    out = np.zeros(minutes, dtype=CANDLE_DTYPE)
+    out["ts"] = np.arange(ts, ts + minutes * ONE_MIN_MS, ONE_MIN_MS, dtype=np.int64)
+    out["bv"] = float(bv / minutes)
+
+    last_idx = minutes - 1
+    if last_idx == 0:
+        out[0]["o"] = o
+        out[0]["h"] = h
+        out[0]["l"] = l
+        out[0]["c"] = c
+        return out
+
+    pivot_a = min(last_idx, max(1, minutes // 3))
+    pivot_b = min(last_idx, max(pivot_a + 1, (2 * minutes) // 3))
+
+    if c >= o:
+        waypoints = [(0, o), (pivot_a, l), (pivot_b, h), (last_idx, c)]
+        low_idx = pivot_a
+        high_idx = pivot_b
+    else:
+        waypoints = [(0, o), (pivot_a, h), (pivot_b, l), (last_idx, c)]
+        high_idx = pivot_a
+        low_idx = pivot_b
+
+    deduped = [waypoints[0]]
+    for idx, value in waypoints[1:]:
+        if idx > deduped[-1][0]:
+            deduped.append((idx, value))
+        else:
+            deduped[-1] = (idx, value)
+
+    close_path = np.empty(minutes, dtype=np.float64)
+    close_path[0] = o
+    for (i0, v0), (i1, v1) in zip(deduped, deduped[1:]):
+        span = max(1, i1 - i0)
+        for minute_idx in range(i0, i1 + 1):
+            ratio = 0.0 if i1 == i0 else (minute_idx - i0) / span
+            close_path[minute_idx] = min(max(_linear_interpolate(v0, v1, ratio), l), h)
+
+    prev_close = o
+    for minute_idx in range(minutes):
+        minute_open = prev_close
+        minute_close = float(close_path[minute_idx])
+        minute_high = max(minute_open, minute_close)
+        minute_low = min(minute_open, minute_close)
+        if minute_idx == high_idx:
+            minute_high = max(minute_high, h)
+        if minute_idx == low_idx:
+            minute_low = min(minute_low, l)
+        out[minute_idx]["o"] = minute_open
+        out[minute_idx]["h"] = minute_high
+        out[minute_idx]["l"] = minute_low
+        out[minute_idx]["c"] = minute_close
+        prev_close = minute_close
+
+    return out
+
+
+def ohlcv_5m_to_1m(candle: np.void) -> np.ndarray:
+    return ohlcv_xm_to_1m(candle, 5)
+
+
+def ohlcv_15m_to_1m(candle: np.void) -> np.ndarray:
+    return ohlcv_xm_to_1m(candle, 15)
+
+
+def synthesize_1m_from_higher_tf(candles: np.ndarray, tf_minutes: int) -> np.ndarray:
+    """Expand a higher-timeframe candle array into synthetic 1m OHLCV candles."""
+    arr = _ensure_dtype(candles)
+    if arr.size == 0:
+        return np.empty((0,), dtype=CANDLE_DTYPE)
+    if tf_minutes == 5:
+        expanded = [ohlcv_5m_to_1m(row) for row in arr]
+    elif tf_minutes == 15:
+        expanded = [ohlcv_15m_to_1m(row) for row in arr]
+    else:
+        raise ValueError(f"unsupported tf_minutes={tf_minutes}")
+    if not expanded:
+        return np.empty((0,), dtype=CANDLE_DTYPE)
+    return np.sort(np.concatenate(expanded), order="ts")
 
 
 def get_caller_name(depth: int = 2, logger: Optional[logging.Logger] = None) -> str:
@@ -311,6 +417,76 @@ def _quarantine_gateio_cache_if_stale(cache_base: str, cutoff_date: str) -> None
                 return
 
 
+def _looks_like_daily_shard_filename(name: str) -> bool:
+    if not isinstance(name, str) or not name.endswith(".npy"):
+        return False
+    stem = name[:-4]
+    if len(stem) != 10 or stem[4] != "-" or stem[7] != "-":
+        return False
+    try:
+        datetime.strptime(stem, "%Y-%m-%d")
+    except Exception:
+        return False
+    return True
+
+
+def _quarantine_root_level_timeframe_debris(cache_base: str) -> int:
+    """
+    Quarantine invalid files found directly under exchange/timeframe roots.
+
+    Valid OHLCV layout is:
+    `{cache_base}/{exchange}/{timeframe}/{symbol}/YYYY-MM-DD.npy`
+
+    Any daily shard files or index.json files found directly under
+    `{cache_base}/{exchange}/{timeframe}` are debris from older/corrupt layouts and
+    should not remain in place.
+    """
+    root = Path(cache_base)
+    if not root.is_dir():
+        return 0
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    moved = 0
+
+    for exchange_dir in root.iterdir():
+        if not exchange_dir.is_dir() or exchange_dir.name.startswith("."):
+            continue
+        if exchange_dir.name.startswith("_"):
+            continue
+
+        for tf_dir in exchange_dir.iterdir():
+            if not tf_dir.is_dir():
+                continue
+
+            debris: List[Path] = []
+            for child in tf_dir.iterdir():
+                if not child.is_file():
+                    continue
+                if child.name == "index.json" or _looks_like_daily_shard_filename(child.name):
+                    debris.append(child)
+
+            if not debris:
+                continue
+
+            quarantine_dir = (
+                root / "_quarantine_root_level" / stamp / exchange_dir.name / tf_dir.name
+            )
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+            for child in debris:
+                shutil.move(str(child), str(quarantine_dir / child.name))
+                moved += 1
+
+            logging.warning(
+                "Quarantined %d invalid root-level OHLCV cache artifact(s) from %s -> %s",
+                len(debris),
+                tf_dir,
+                quarantine_dir,
+            )
+
+    return moved
+
+
 # Parse timeframe string like '1m','5m','1h','1d' to milliseconds.
 # Falls back to ONE_MIN_MS on invalid input. Seconds are rounded down to minutes.
 def _tf_to_ms(s: Optional[str]) -> int:
@@ -423,6 +599,9 @@ class CandlestickManager:
         self._progress_last_log: Dict[Tuple[str, str, str], float] = {}
         self._warning_last_log: Dict[str, float] = {}  # throttle repeated warnings
         self._warning_throttle_seconds: float = 300.0  # 5 minutes between repeated warnings
+        self._persist_batch_observer: Optional[
+            Callable[[str, str, np.ndarray], None]
+        ] = None
         # Summary tracking for strict gap warnings (logged once per 15 min instead of per-event)
         self._strict_gaps_summary: Dict[str, int] = {}  # symbol -> missing count
         self._strict_gaps_summary_last_log: float = 0.0
@@ -500,6 +679,13 @@ class CandlestickManager:
         migration_done = os.path.join(ohlcv_cache_base, ".migration_done")
         try:
             with portalocker.Lock(migration_lock, timeout=0.1, fail_when_locked=True):
+                try:
+                    _quarantine_root_level_timeframe_debris(ohlcv_cache_base)
+                except Exception as exc:
+                    logging.exception(
+                        "Root-level OHLCV cache cleanup failed (non-fatal). Continuing: %s",
+                        exc,
+                    )
                 if not os.path.exists(migration_done):
                     try:
                         standardize_cache_directories(ohlcv_cache_base)
@@ -996,6 +1182,12 @@ class CandlestickManager:
         except Exception:
             # Must never break the fetch path due to logging/progress UI.
             return
+
+    def set_persist_batch_observer(
+        self,
+        observer: Optional[Callable[[str, str, np.ndarray], None]],
+    ) -> None:
+        self._persist_batch_observer = observer
 
     # ----- Paths and index -----
 
@@ -1878,6 +2070,13 @@ class CandlestickManager:
             self._check_synthetic_replacement(symbol, arr)
 
         self._save_range_incremental(symbol, arr, timeframe=tf_norm, defer_index=defer_index)
+        observer = self._persist_batch_observer
+        if observer is not None:
+            try:
+                observer(symbol, tf_norm, arr)
+            except Exception:
+                # Observability hooks must never break persistence or trading.
+                return
 
     def _check_synthetic_replacement(self, symbol: str, real_data: np.ndarray) -> None:
         """Check if real data replaces previously synthetic timestamps and invalidate EMA cache if so."""
@@ -2931,6 +3130,17 @@ class CandlestickManager:
                         limit=limit,
                         params=params,
                     )
+                first_ts = None
+                last_ts = None
+                if res:
+                    try:
+                        first_ts = int(res[0][0])
+                    except Exception:
+                        first_ts = None
+                    try:
+                        last_ts = int(res[-1][0])
+                    except Exception:
+                        last_ts = None
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
                 self._emit_remote_fetch(
                     {
@@ -2941,6 +3151,8 @@ class CandlestickManager:
                         "tf": tf_norm,
                         "since_ts": int(since_ms),
                         "rows": int(len(res) if res else 0),
+                        "first_ts": first_ts,
+                        "last_ts": last_ts,
                         "elapsed_ms": elapsed_ms,
                     }
                 )
@@ -2951,6 +3163,8 @@ class CandlestickManager:
                     tf=tf_norm,
                     since_ts=int(since_ms),
                     rows=(len(res) if res else 0),
+                    first_ts=first_ts,
+                    last_ts=last_ts,
                 )
                 return res or []
             except Exception as e:  # pragma: no cover - network not used in tests
