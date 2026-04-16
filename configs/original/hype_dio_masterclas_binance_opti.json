@@ -6,15 +6,23 @@
     },
     "backtest": {
         "balance_sample_divider": 60,
-        "base_dir": "backtests/original/hype_dio_masterclas_binance_opti",
+        "base_dir": "backtests/original/hype_dio_masterclas_binance_opti_twel15",
         "btc_collateral_cap": 0.0,
         "btc_collateral_ltv_cap": null,
-        "coin_sources": {"HYPE": "binance"},
-        "coins": {"binance": ["HYPE"]},
+        "coin_sources": {
+            "HYPE": "binance"
+        },
+        "coins": {
+            "binance": [
+                "HYPE"
+            ]
+        },
         "combine_ohlcvs": true,
         "compress_cache": true,
         "end_date": "2026-04-16",
-        "exchanges": ["binance"],
+        "exchanges": [
+            "binance"
+        ],
         "filter_by_min_effective_cost": false,
         "gap_tolerance_ohlcvs_minutes": 120,
         "maker_fee_override": null,
@@ -25,7 +33,9 @@
             "enabled": false,
             "include_base_scenario": true,
             "base_label": "base",
-            "aggregate": {"default": "mean"},
+            "aggregate": {
+                "default": "mean"
+            },
             "scenarios": []
         }
     },
@@ -56,7 +66,11 @@
             "entry_trailing_threshold_volatility_weight": 219.82,
             "entry_trailing_threshold_we_weight": 5.0508,
             "entry_volatility_ema_span_hours": 294.62,
-            "forager_score_weights": {"volume": 0.0, "ema_readiness": 0.0, "volatility": 1.0},
+            "forager_score_weights": {
+                "volume": 0.0,
+                "ema_readiness": 0.0,
+                "volatility": 1.0
+            },
             "forager_volatility_ema_span": 720.92,
             "forager_volume_drop_pct": 0.87461,
             "forager_volume_ema_span": 636.26,
@@ -64,7 +78,7 @@
             "risk_twel_enforcer_threshold": 1.1653,
             "risk_we_excess_allowance_pct": 0.18928,
             "risk_wel_enforcer_threshold": 0.94648,
-            "total_wallet_exposure_limit": 1.2233,
+            "total_wallet_exposure_limit": 1.5,
             "unstuck_close_pct": 0.15585,
             "unstuck_ema_dist": -0.065693,
             "unstuck_loss_allowance_pct": 0.096325,
@@ -73,7 +87,12 @@
     },
     "coin_overrides": {},
     "live": {
-        "approved_coins": {"long": ["HYPE"], "short": []},
+        "approved_coins": {
+            "long": [
+                "HYPE"
+            ],
+            "short": []
+        },
         "auto_gs": true,
         "balance_hysteresis_snap_pct": 0.02,
         "balance_override": null,
@@ -84,7 +103,10 @@
         "forced_mode_long": "",
         "forced_mode_short": "",
         "hedge_mode": true,
-        "ignored_coins": {"long": [], "short": []},
+        "ignored_coins": {
+            "long": [],
+            "short": []
+        },
         "inactive_coin_candle_ttl_minutes": 10,
         "leverage": 5,
         "market_orders_allowed": false,
