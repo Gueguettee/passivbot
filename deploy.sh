@@ -45,11 +45,11 @@ done
 
 if [ "$EXCHANGE" == "hyperliquid" ]; then
     CONTAINER_NAME="passivbot-live-hl"
-    LIVE_CONFIG="configs/live_rank1_hype_hl.json"
+    LIVE_CONFIG="configs/original/hype_dio_masterclass.json"
     DOCKER_PROFILE="live-hl"
 else
     CONTAINER_NAME="passivbot-live"
-    LIVE_CONFIG="configs/live_rank1_hype.json"
+    LIVE_CONFIG="configs/original/hype_dio_masterclass.json"
     DOCKER_PROFILE="live"
 fi
 
@@ -69,6 +69,14 @@ resolve_ssh_key() {
         win_key="${win_key//\\//}"
         if [ -f "$win_key" ]; then
             key="$win_key"
+        fi
+    fi
+    # If on WSL and Git Bash-style /c/... path doesn't exist, try /mnt/c/... or ~/.ssh/
+    if [ ! -f "$key" ] && grep -qi microsoft /proc/version 2>/dev/null; then
+        if [[ "$key" == /c/* ]] && [ -f "/mnt${key}" ]; then
+            key="/mnt${key}"
+        elif [ -f "$HOME/.ssh/$(basename "$key")" ]; then
+            key="$HOME/.ssh/$(basename "$key")"
         fi
     fi
     echo "$key"

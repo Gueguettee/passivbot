@@ -40,7 +40,7 @@ services:
       - ./logs/:/data/logs/
       - ./monitor/:/data/monitor/
     working_dir: /app
-    command: ["python", "src/main.py", "configs/live_rank1_hype.json"]
+    command: ["python", "src/main.py", "configs/original/hype_dio_masterclass.json"]
 
   passivbot-live-hl:
     profiles:
@@ -51,11 +51,14 @@ services:
     image: passivbot-live:latest
     container_name: passivbot-live-hl
     restart: unless-stopped
+    environment:
+      PB_USER: ${PB_USER:-hyperliquid_01}
+      PB_CONFIG_PATH: ${PB_CONFIG_PATH:-/app/configs/original/hype_dio_masterclass.json}
+      SKIP_CCXT_ASSERT: "1"
     volumes:
       - ./configs/:/app/configs/
       - ./api-keys.json:/app/api-keys.json
     working_dir: /app
-    command: ["python", "src/main.py", "configs/live_rank1_hype_hl.json"]
 
     # Example:
     # PB_USER=bitget_01 docker compose --profile live up passivbot-live

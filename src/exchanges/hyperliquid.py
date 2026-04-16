@@ -417,9 +417,10 @@ class HyperliquidBot(CCXTBot):
         return self._normalize_open_orders(fetched)
 
     async def _fetch_positions_and_balance(self):
-        info = await self.cca.fetch_balance()
+        info = await self.cca.fetch_balance(params={"enableUnifiedMargin": False})
+        asset_positions = info["info"].get("assetPositions", [])
         positions = {}
-        for x in info["info"]["assetPositions"]:
+        for x in asset_positions:
             symbol = self.coin_to_symbol(x["position"]["coin"])
             leverage = x["position"].get("leverage", {})
             if isinstance(leverage, dict):
@@ -441,15 +442,29 @@ class HyperliquidBot(CCXTBot):
         hip3_raw, hip3_positions = await self._fetch_hip3_positions(include_raw=True)
         for position in hip3_positions:
             positions[(position["symbol"], position["position_side"])] = position
-        balance = float(info["info"]["marginSummary"]["accountValue"]) - sum(
-            [float(x["position"]["unrealizedPnl"]) for x in info["info"]["assetPositions"]]
+        perps_account_value = float(info["info"]["marginSummary"]["accountValue"])
+        unrealized_pnl = sum(float(x["position"]["unrealizedPnl"]) for x in asset_positions)
+        unified_enabled, _ = await self.cca.is_unified_enabled(
+            "fetchBalance", None, False, {}
         )
+        spot_raw = None
+        spot_usdc = 0.0
+        if unified_enabled:
+            spot_info = await self.cca.fetch_balance(params={"type": "spot"})
+            spot_raw = spot_info.get("info")
+            spot_usdc = sum(
+                float(b.get("total", 0.0))
+                for b in (spot_raw or {}).get("balances", [])
+                if b.get("coin") == "USDC"
+            )
+        balance = perps_account_value + spot_usdc - unrealized_pnl
         raw_snapshot = {
             "balance": deepcopy(info),
             "positions": {
-                "core": deepcopy(info["info"].get("assetPositions", [])),
+                "core": deepcopy(asset_positions),
                 "hip3": hip3_raw,
             },
+            "spot": deepcopy(spot_raw),
         }
         return raw_snapshot, list(positions.values()), balance
 
