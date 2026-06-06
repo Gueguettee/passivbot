@@ -19,6 +19,7 @@ import copy
 import gzip
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -30,11 +31,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from backtest import (
     _build_hlcvs_cache_dir_name,
     _resolve_hlcvs_cache_dir,
+    assert_hlcv_has_tradable_coverage,
     ensure_valid_index_metadata,
     get_cache_hash,
     load_coins_hlcvs_from_cache,
     save_coins_hlcvs_to_cache,
 )
+from hlcvs_manifest import build_hlcvs_manifest, write_hlcvs_manifest
 
 # ============================================================================
 # Fixtures
@@ -54,6 +57,9 @@ def _base_config(**overrides):
         },
         "bot": {
             "long": {
+                "n_positions": 1,
+                "total_wallet_exposure_limit": 1.0,
+                "wallet_exposure_limit": 1.0,
                 "ema_span_0": 1000.0,
                 "ema_span_1": 1500.0,
                 "forager_volume_ema_span": 2000.0,
@@ -61,6 +67,9 @@ def _base_config(**overrides):
                 "entry_volatility_ema_span_hours": 1.0,
             },
             "short": {
+                "n_positions": 0,
+                "total_wallet_exposure_limit": 0.0,
+                "wallet_exposure_limit": 0.0,
                 "ema_span_0": 100.0,
                 "ema_span_1": 100.0,
                 "forager_volume_ema_span": 360.0,
@@ -82,8 +91,13 @@ def _base_config(**overrides):
     return cfg
 
 
-def _write_fake_cache(cache_dir, *, compress=False, warmup_minutes=None):
+def _allow_legacy_cache(cfg):
+    return cfg
+
+
+def _write_fake_cache(cache_dir, *, compress=False, warmup_minutes=None, write_manifest=True):
     """Write minimal valid cache files so load_coins_hlcvs_from_cache succeeds."""
+    cache_dir_path = Path(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
 
     coins = ["BTC"]
@@ -113,6 +127,22 @@ def _write_fake_cache(cache_dir, *, compress=False, warmup_minutes=None):
             {"warmup_minutes": int(warmup_minutes)},
             open(os.path.join(cache_dir, "cache_meta.json"), "w"),
         )
+    if write_manifest:
+        config = _base_config()
+        cache_hash = get_cache_hash(config, "binance")
+        manifest = build_hlcvs_manifest(
+            config=config,
+            exchange="binance",
+            cache_hash=cache_hash,
+            coins=coins,
+            hlcvs=hlcvs,
+            mss=mss,
+            btc_usd_prices=btc_usd,
+            timestamps=timestamps,
+            warmup_minutes=int(warmup_minutes or 0),
+            compressed=compress,
+        )
+        write_hlcvs_manifest(cache_dir_path, manifest)
 
 
 # ============================================================================
@@ -178,7 +208,7 @@ class TestWarmupSufficiencyGate:
 
     def test_sufficient_warmup_returns_cache(self, tmp_path, monkeypatch):
         """Cache with warmup >= needed returns data."""
-        cfg = _base_config()
+        cfg = _allow_legacy_cache(_base_config())
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=5000)
@@ -190,7 +220,7 @@ class TestWarmupSufficiencyGate:
 
     def test_insufficient_warmup_returns_none(self, tmp_path, monkeypatch):
         """Cache with warmup < needed returns None."""
-        cfg = _base_config()
+        cfg = _allow_legacy_cache(_base_config())
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=1000)
@@ -202,7 +232,7 @@ class TestWarmupSufficiencyGate:
 
     def test_exact_warmup_match_returns_cache(self, tmp_path, monkeypatch):
         """Cache with warmup == needed returns data (boundary condition)."""
-        cfg = _base_config()
+        cfg = _allow_legacy_cache(_base_config())
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=5000)
@@ -214,7 +244,7 @@ class TestWarmupSufficiencyGate:
 
     def test_zero_needed_warmup_always_hits(self, tmp_path, monkeypatch):
         """When needed warmup is 0, any cache is sufficient."""
-        cfg = _base_config()
+        cfg = _allow_legacy_cache(_base_config())
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=0)
@@ -226,7 +256,7 @@ class TestWarmupSufficiencyGate:
 
     def test_default_warmup_param_is_zero(self, tmp_path, monkeypatch):
         """Calling without warmup_minutes defaults to 0 (always hits)."""
-        cfg = _base_config()
+        cfg = _allow_legacy_cache(_base_config())
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=0)
@@ -245,9 +275,21 @@ class TestWarmupSufficiencyGate:
 class TestLegacyCacheCompatibility:
     """Verify behavior with pre-existing caches that lack cache_meta.json."""
 
+    def test_manifest_missing_cache_rejected_by_default(self, tmp_path, monkeypatch):
+        """Manifest-missing final caches are rebuilt."""
+        cfg = _base_config()
+        cache_hash = get_cache_hash(cfg, "binance")
+        cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
+        _write_fake_cache(str(cache_dir), warmup_minutes=5000, write_manifest=False)
+
+        monkeypatch.chdir(tmp_path)
+
+        result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=0)
+        assert result is None
+
     def test_missing_cache_meta_treated_as_zero_warmup(self, tmp_path, monkeypatch):
         """Legacy cache without cache_meta.json has cached_warmup=0."""
-        cfg = _base_config()
+        cfg = _allow_legacy_cache(_base_config())
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=None)
@@ -260,7 +302,7 @@ class TestLegacyCacheCompatibility:
 
     def test_missing_cache_meta_hits_when_zero_needed(self, tmp_path, monkeypatch):
         """Legacy cache still works when needed warmup is 0."""
-        cfg = _base_config()
+        cfg = _allow_legacy_cache(_base_config())
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=None)
@@ -272,7 +314,7 @@ class TestLegacyCacheCompatibility:
 
     def test_corrupt_cache_meta_treated_as_zero(self, tmp_path, monkeypatch):
         """Corrupt cache_meta.json falls back to cached_warmup=0."""
-        cfg = _base_config()
+        cfg = _allow_legacy_cache(_base_config())
         cache_hash = get_cache_hash(cfg, "binance")
         cache_dir = tmp_path / "caches" / "hlcvs_data" / cache_hash[:16]
         _write_fake_cache(str(cache_dir), warmup_minutes=5000)
@@ -285,6 +327,22 @@ class TestLegacyCacheCompatibility:
         monkeypatch.chdir(tmp_path)
         result = load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=100)
         assert result is None
+
+
+class TestTradableCoverageGuard:
+    def test_rejects_when_warmup_consumes_all_valid_rows(self):
+        mss = {"BTC": {"first_valid_index": 0, "last_valid_index": 10, "warmup_minutes": 11}}
+
+        with pytest.raises(ValueError, match="no tradable candles"):
+            assert_hlcv_has_tradable_coverage(["BTC"], mss)
+
+    def test_accepts_when_any_coin_has_tradable_rows_after_warmup(self):
+        mss = {
+            "BTC": {"first_valid_index": 0, "last_valid_index": 10, "warmup_minutes": 11},
+            "ETH": {"first_valid_index": 5, "last_valid_index": 20, "warmup_minutes": 10},
+        }
+
+        assert_hlcv_has_tradable_coverage(["BTC", "ETH"], mss)
 
 
 # ============================================================================
@@ -401,6 +459,88 @@ class TestSavePersistsWarmupMetadata:
 
         meta = json.load(open(os.path.join(str(cache_dir), "cache_meta.json")))
         assert meta["warmup_minutes"] == 5000
+
+    def test_force_overwrite_bypasses_existing_warmup_early_return(self, tmp_path, monkeypatch):
+        """Force refetch callers can replace an otherwise sufficient cache."""
+        monkeypatch.chdir(tmp_path)
+        cfg = _base_config()
+
+        coins = ["BTC"]
+        hlcvs = np.zeros((10, 1, 4), dtype=np.float64)
+        mss = {"BTC": {}}
+        btc_usd = np.ones(10, dtype=np.float64)
+        timestamps = np.arange(10, dtype=np.int64) * 60_000
+
+        cache_dir = save_coins_hlcvs_to_cache(
+            cfg,
+            coins,
+            hlcvs,
+            "binance",
+            mss,
+            btc_usd,
+            timestamps,
+            warmup_minutes=5000,
+        )
+        replacement = np.ones((10, 1, 4), dtype=np.float64) * 7.0
+        save_coins_hlcvs_to_cache(
+            cfg,
+            coins,
+            replacement,
+            "binance",
+            mss,
+            btc_usd,
+            timestamps,
+            warmup_minutes=1000,
+            force_overwrite=True,
+        )
+
+        loaded = np.load(os.path.join(str(cache_dir), "hlcvs.npy"))
+        assert float(loaded[0, 0, 0]) == 7.0
+        meta = json.load(open(os.path.join(str(cache_dir), "cache_meta.json")))
+        assert meta["warmup_minutes"] == 1000
+
+    def test_save_overwrites_corrupt_manifest_cache_even_when_warmup_sufficient(
+        self, tmp_path, monkeypatch
+    ):
+        """A corrupt manifest cache must not take the warmup early-return path."""
+        monkeypatch.chdir(tmp_path)
+        cfg = _base_config()
+
+        coins = ["BTC"]
+        hlcvs = np.zeros((10, 1, 4), dtype=np.float64)
+        mss = {"BTC": {}}
+        btc_usd = np.ones(10, dtype=np.float64)
+        timestamps = np.arange(10, dtype=np.int64) * 60_000
+
+        cache_dir = save_coins_hlcvs_to_cache(
+            cfg,
+            coins,
+            hlcvs,
+            "binance",
+            mss,
+            btc_usd,
+            timestamps,
+            warmup_minutes=5000,
+        )
+        tampered = hlcvs.copy()
+        tampered[0, 0, 0] = 999.0
+        np.save(os.path.join(str(cache_dir), "hlcvs.npy"), tampered)
+
+        repaired_hlcvs = np.ones((10, 1, 4), dtype=np.float64)
+        save_coins_hlcvs_to_cache(
+            cfg,
+            coins,
+            repaired_hlcvs,
+            "binance",
+            mss,
+            btc_usd,
+            timestamps,
+            warmup_minutes=1000,
+        )
+
+        loaded = np.load(os.path.join(str(cache_dir), "hlcvs.npy"))
+        assert float(loaded[0, 0, 0]) == 1.0
+        assert load_coins_hlcvs_from_cache(cfg, "binance", warmup_minutes=1000) is not None
 
     def test_save_with_compression(self, tmp_path, monkeypatch):
         """cache_meta.json is written even with compressed cache."""
@@ -565,7 +705,7 @@ class TestDescriptiveDirResolution:
     """Verify descriptive cache dirs resolve via hash suffix without breaking legacy paths."""
 
     def test_load_resolves_descriptive_dir_by_hash_suffix(self, tmp_path, monkeypatch):
-        cfg = _base_config()
+        cfg = _allow_legacy_cache(_base_config())
         cache_hash = get_cache_hash(cfg, "binance")
         coins = ["BTC/USDT:USDT"]
         dir_name = _build_hlcvs_cache_dir_name(

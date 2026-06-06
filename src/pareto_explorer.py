@@ -11,7 +11,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 
-from config.limits import normalize_limit_entries, parse_limit_cli_entries
+from config.limits import (
+    normalize_limit_entries,
+    parse_limit_cli_entries,
+    resolve_aggregate_mode,
+    resolve_limit_stat,
+)
+from config.metrics import resolve_metric_value
 from config.scoring import (
     ObjectiveSpec,
     default_objective_goal,
@@ -20,6 +26,7 @@ from config.scoring import (
     objective_spec_by_metric,
 )
 from metrics_schema import flatten_metric_stats
+from pareto_core import detect_latest_pareto_dir
 
 
 METHOD_ALIASES = {
@@ -249,16 +256,6 @@ def _score_label_and_value(result: SelectionResult) -> tuple[str, str]:
     return "Score", f"{float(result.score):.6f}"
 
 
-def detect_latest_pareto_dir(root: str | os.PathLike[str] = "optimize_results") -> Optional[Path]:
-    base = Path(root).expanduser()
-    if not base.is_dir():
-        return None
-    candidates = [path for path in base.glob("*/pareto") if path.is_dir()]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime).resolve()
-
-
 def resolve_pareto_directory(path: str | os.PathLike[str]) -> Path:
     raw = Path(path).expanduser()
     if raw.is_dir():
@@ -293,12 +290,14 @@ def _parse_key_value_pairs(raw_pairs: Iterable[str], *, value_name: str) -> Dict
 
 
 def _resolve_candidate_metric_value(candidate: ParetoCandidate, metric: str) -> Optional[float]:
-    if metric in candidate.objectives:
-        return float(candidate.objectives[metric])
-    if metric in candidate.aggregated_values:
-        return float(candidate.aggregated_values[metric])
+    value = resolve_metric_value(candidate.objectives, metric)
+    if value is not None:
+        return float(value)
+    value = resolve_metric_value(candidate.aggregated_values, metric)
+    if value is not None:
+        return float(value)
     mean_key = f"{metric}_mean"
-    value = candidate.stats_flat.get(mean_key)
+    value = resolve_metric_value(candidate.stats_flat, mean_key)
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return float(value)
     return None
@@ -326,16 +325,19 @@ def build_parser() -> argparse.ArgumentParser:
             "  lexicographic Strict priority order (--priority metric_a,metric_b,...).\n"
             "  outranking   Simplified PROMETHEE-style net flow selector.\n\n"
             "Limits are applied before selection. Repeat -l/--limit for multiple keep-conditions:\n"
-            "  -l 'adg_strategy_pnl_rebased>0.0'\n"
-            "  -l 'drawdown_worst_hsl<=0.35'\n"
-            "  --limits '[{\"metric\":\"drawdown_worst_hsl\",\"penalize_if\":\">\",\"value\":0.35}]'\n"
+            "  -l 'adg_strategy_eq>0.0'\n"
+            "  -l 'drawdown_worst_strategy_eq<=0.35'\n"
+            "  --limits '[{\"metric\":\"drawdown_worst_strategy_eq\",\"penalize_if\":\">\",\"value\":0.35}]'\n"
         ),
     )
     parser.add_argument(
         "path",
         nargs="?",
         type=str,
-        help="Pareto directory or optimization run directory. Defaults to the newest optimize_results/.../pareto.",
+        help=(
+            "Pareto directory or optimization run directory. Defaults to the "
+            "lexicographically latest optimize_results/<run>/pareto with JSON candidates."
+        ),
     )
     parser.add_argument(
         "-m",
@@ -405,21 +407,32 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _extract_suite_metrics(
     entry: Mapping[str, Any],
+    aggregate_cfg: Mapping[str, Any] | None = None,
 ) -> tuple[Dict[str, float], Dict[str, float]]:
     aggregated_values: Dict[str, float] = {}
     stats_flat: Dict[str, float] = {}
     suite_metrics = entry.get("suite_metrics")
     if not isinstance(suite_metrics, Mapping):
         return stats_flat, aggregated_values
+    effective_aggregate_cfg = (
+        aggregate_cfg
+        if aggregate_cfg is not None
+        else entry.get("backtest", {}).get("aggregate")
+        if isinstance(entry.get("backtest"), Mapping)
+        else None
+    )
 
     if "metrics" in suite_metrics:
         for metric, payload in suite_metrics["metrics"].items():
             if not isinstance(payload, Mapping):
                 continue
             aggregated = payload.get("aggregated")
+            stats = payload.get("stats") or {}
+            if aggregated is None and isinstance(stats, Mapping):
+                mode = resolve_aggregate_mode(str(metric), effective_aggregate_cfg)
+                aggregated = stats.get(mode, stats.get("mean"))
             if isinstance(aggregated, (int, float)) and math.isfinite(float(aggregated)):
                 aggregated_values[str(metric)] = float(aggregated)
-            stats = payload.get("stats") or {}
             if isinstance(stats, Mapping):
                 stats_flat.update(flatten_metric_stats({str(metric): dict(stats)}))
         return stats_flat, aggregated_values
@@ -432,6 +445,14 @@ def _extract_suite_metrics(
         aggregated = aggregate.get("aggregated") or {}
         if isinstance(aggregated, Mapping):
             for metric, value in aggregated.items():
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    aggregated_values[str(metric)] = float(value)
+        elif isinstance(stats, Mapping):
+            for metric, metric_stats in stats.items():
+                if not isinstance(metric_stats, Mapping):
+                    continue
+                mode = resolve_aggregate_mode(str(metric), effective_aggregate_cfg)
+                value = metric_stats.get(mode, metric_stats.get("mean"))
                 if isinstance(value, (int, float)) and math.isfinite(float(value)):
                     aggregated_values[str(metric)] = float(value)
     return stats_flat, aggregated_values
@@ -447,10 +468,8 @@ def _extract_objectives(entry: Mapping[str, Any]) -> Dict[str, float]:
 
     if isinstance(objective_payload, Mapping):
         for idx, spec in enumerate(scoring_specs):
-            value = None
-            if spec.metric in objective_payload:
-                value = objective_payload.get(spec.metric)
-            else:
+            value = resolve_metric_value(objective_payload, spec.metric)
+            if value is None:
                 legacy_key = f"w_{idx}"
                 if legacy_key in objective_payload:
                     value = from_engine_value(spec, float(objective_payload[legacy_key]))
@@ -470,11 +489,12 @@ def _extract_objectives(entry: Mapping[str, Any]) -> Dict[str, float]:
     for spec in scoring_specs:
         if spec.metric in objectives:
             continue
-        if spec.metric in aggregated_values:
-            objectives[spec.metric] = aggregated_values[spec.metric]
+        value = resolve_metric_value(aggregated_values, spec.metric)
+        if value is not None:
+            objectives[spec.metric] = float(value)
             continue
         metric_key = f"{spec.metric}_mean"
-        value = stats_flat.get(metric_key)
+        value = resolve_metric_value(stats_flat, metric_key)
         if isinstance(value, (int, float)) and math.isfinite(float(value)):
             objectives[spec.metric] = float(value)
     return objectives
@@ -493,7 +513,11 @@ def load_candidates(path: str | os.PathLike[str]) -> tuple[Path, List[ParetoCand
     for entry_path in json_paths:
         with open(entry_path) as f:
             entry = json.load(f)
+        if not isinstance(entry, Mapping):
+            continue
         specs = extract_objective_specs(entry)
+        if not specs:
+            continue
         metrics = [spec.metric for spec in specs]
         if baseline_specs is None:
             baseline_specs = specs
@@ -527,7 +551,11 @@ def load_candidates(path: str | os.PathLike[str]) -> tuple[Path, List[ParetoCand
             )
         )
 
-    assert baseline_specs is not None
+    if baseline_specs is None:
+        raise ValueError(
+            f"No Pareto candidate JSON files found in {pareto_dir}; "
+            "JSON artifacts without optimize.scoring were ignored."
+        )
     return pareto_dir, candidates, baseline_specs
 
 
@@ -697,16 +725,31 @@ def _normalize_reference_targets(
     return np.array(target_values, dtype=float)
 
 
-def _resolve_limit_value(candidate: ParetoCandidate, entry: Mapping[str, Any]) -> Optional[float]:
+def _resolve_limit_value(
+    candidate: ParetoCandidate,
+    entry: Mapping[str, Any],
+    aggregate_cfg: Mapping[str, Any] | None = None,
+) -> Optional[float]:
     metric = str(entry.get("metric", "")).strip()
     if not metric:
         return None
-    raw_stat = entry.get("stat")
-    if raw_stat is not None:
-        key = f"{metric}_{str(raw_stat).strip().lower()}"
-        value = candidate.stats_flat.get(key)
-        return float(value) if isinstance(value, (int, float)) and math.isfinite(float(value)) else None
-    return _resolve_candidate_metric_value(candidate, metric)
+    stat = resolve_limit_stat(
+        dict(entry),
+        aggregate_cfg=dict(aggregate_cfg) if aggregate_cfg else None,
+    )
+    if "stat" not in entry:
+        value = resolve_metric_value(candidate.aggregated_values, metric)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+    key = f"{metric}_{stat}"
+    value = resolve_metric_value(candidate.stats_flat, key)
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    if "stat" not in entry:
+        fallback = _resolve_candidate_metric_value(candidate, metric)
+        if isinstance(fallback, (int, float)) and math.isfinite(float(fallback)):
+            return float(fallback)
+    return None
 
 
 def _limit_rejects(entry: Mapping[str, Any], value: float) -> bool:
@@ -747,12 +790,17 @@ def filter_candidates(
     enabled_limits = [entry for entry in normalized_limits if bool(entry.get("enabled", True))]
     if not enabled_limits:
         return list(candidates), enabled_limits
+    aggregate_cfg = None
+    if candidates:
+        backtest_cfg = candidates[0].entry.get("backtest")
+        if isinstance(backtest_cfg, Mapping):
+            aggregate_cfg = backtest_cfg.get("aggregate")
 
     filtered: List[ParetoCandidate] = []
     for candidate in candidates:
         rejected = False
         for entry in enabled_limits:
-            value = _resolve_limit_value(candidate, entry)
+            value = _resolve_limit_value(candidate, entry, aggregate_cfg)
             if value is None:
                 continue
             if _limit_rejects(entry, value):
@@ -1178,7 +1226,8 @@ def run_from_args(args: argparse.Namespace) -> SelectionResult:
         latest = detect_latest_pareto_dir()
         if latest is None:
             raise FileNotFoundError(
-                "No pareto path provided and no optimize_results/.../pareto directory was found."
+                "No pareto path provided and no valid optimize_results/<run>/pareto directory "
+                "with at least one *.json candidate was found."
             )
         raw_path = str(latest)
     pareto_dir, candidates, scoring_specs = load_candidates(raw_path)

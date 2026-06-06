@@ -1,7 +1,14 @@
 import json
 from copy import deepcopy
 
-from config_utils import clean_config, dump_config, get_template_config, load_config, strip_config_metadata
+from config_utils import (
+    clean_config,
+    dump_config,
+    get_template_config,
+    load_config,
+    sanitize_prepared_config_for_dump,
+    strip_config_metadata,
+)
 
 
 def test_clean_config_removes_internal_sections_and_keeps_user_values():
@@ -67,6 +74,33 @@ def test_strip_config_metadata_removes_known_keys_recursively():
     assert stripped["nested"]["value"] == 5
 
 
+def test_sanitize_prepared_config_for_dump_removes_analysis_and_metadata():
+    config = {
+        "analysis": {"adg": 0.1},
+        "_raw": {"bot": {}},
+        "_raw_effective": {"bot": {}},
+        "_transform_log": ["normalize"],
+        "_coins_sources": {"approved_coins": "all"},
+        "disable_plotting": "all",
+        "backtest": {
+            "cache_dir": "tmp/cache",
+            "coins": {"binance": ["BTC"]},
+        },
+        "bot": {"long": {"n_positions": 3}, "short": {"n_positions": 0}},
+    }
+
+    sanitized = sanitize_prepared_config_for_dump(config)
+
+    assert "analysis" not in sanitized
+    assert "_raw" not in sanitized
+    assert "_raw_effective" not in sanitized
+    assert "_transform_log" not in sanitized
+    assert "_coins_sources" not in sanitized
+    assert "disable_plotting" not in sanitized
+    assert "cache_dir" not in sanitized["backtest"]
+    assert "coins" not in sanitized["backtest"]
+
+
 def test_dump_config_clean_preserves_backtest_aggregate_overrides(tmp_path):
     cfg_path = tmp_path / "in.json"
     out_path = tmp_path / "out.json"
@@ -103,6 +137,8 @@ def test_dump_config_clean_preserves_backtest_aggregate_overrides(tmp_path):
 
     assert dumped["backtest"]["aggregate"]["adg_pnl"] == "max"
     assert dumped["backtest"]["aggregate"]["default"] == "mean"
+    assert "drawdown_worst_strategy_eq" not in dumped["backtest"]["aggregate"]
+    assert "position_held_days_max" not in dumped["backtest"]["aggregate"]
 
 
 def test_clean_config_preserves_backtest_aggregate_overrides():
@@ -114,3 +150,13 @@ def test_clean_config_preserves_backtest_aggregate_overrides():
 
     assert cleaned["backtest"]["aggregate"]["adg_pnl"] == "max"
     assert cleaned["backtest"]["aggregate"]["default"] == "mean"
+    assert "drawdown_worst_strategy_eq" not in cleaned["backtest"]["aggregate"]
+    assert "position_held_days_max" not in cleaned["backtest"]["aggregate"]
+
+
+def test_clean_config_preserves_sparse_backtest_aggregate():
+    config = {"backtest": {"aggregate": {"default": "mean"}}}
+
+    cleaned = clean_config(config)
+
+    assert cleaned["backtest"]["aggregate"] == {"default": "mean"}

@@ -1,12 +1,22 @@
-use crate::types::{Analysis, Equities, Fill};
+use crate::types::{Analysis, Equities, Fill, OrderType};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
 const MS_PER_DAY: u64 = 86_400_000;
 const MS_PER_HOUR: u64 = 3_600_000;
+const OMEGA_RATIO_CAP: f64 = 1_000.0;
+const OMEGA_RATIO_EPS: f64 = 1e-12;
 
 fn fallback_timestamp_ms(index: usize) -> u64 {
     (index as u64) * 60_000
+}
+
+fn fill_timestamp_ms(fill: &Fill) -> u64 {
+    if fill.timestamp_ms > 0 {
+        fill.timestamp_ms
+    } else {
+        fallback_timestamp_ms(fill.index)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -82,11 +92,7 @@ pub fn analyze_equity_series(equities: &[f64], timestamps_ms: &[u64]) -> EquityS
                     (gains, losses + ret.abs())
                 }
             });
-    let omega_ratio = if losses_sum != 0.0 {
-        gains_sum / losses_sum
-    } else {
-        f64::INFINITY
-    };
+    let omega_ratio = calc_omega_ratio(gains_sum, losses_sum);
     let expected_shortfall_1pct = mean_worst_1pct_abs(&daily_eqs_mins_pct_change);
     EquitySeriesMetrics {
         gain,
@@ -96,6 +102,25 @@ pub fn analyze_equity_series(equities: &[f64], timestamps_ms: &[u64]) -> EquityS
         sortino_ratio,
         omega_ratio,
         expected_shortfall_1pct,
+    }
+}
+
+fn calc_omega_ratio(gains_sum: f64, losses_sum: f64) -> f64 {
+    if losses_sum <= OMEGA_RATIO_EPS {
+        if gains_sum > OMEGA_RATIO_EPS {
+            OMEGA_RATIO_CAP
+        } else {
+            0.0
+        }
+    } else {
+        let ratio = gains_sum / losses_sum;
+        if ratio.is_finite() {
+            ratio.min(OMEGA_RATIO_CAP)
+        } else if gains_sum > OMEGA_RATIO_EPS {
+            OMEGA_RATIO_CAP
+        } else {
+            0.0
+        }
     }
 }
 
@@ -126,7 +151,7 @@ fn analyze_backtest_basic(
     timestamps_ms: &[u64],
     exposures_series: &[f64],
 ) -> Analysis {
-    if fills.len() <= 1 {
+    if fills.is_empty() {
         return Analysis::default();
     }
     // Calculate daily equities
@@ -134,6 +159,13 @@ fn analyze_backtest_basic(
     let mut daily_eqs_mins = Vec::new(); // stores min equity of each day
 
     let use_timestamps = !timestamps_ms.is_empty() && timestamps_ms.len() == equities.len();
+    let analysis_end_ts = if use_timestamps {
+        timestamps_ms.last().copied()
+    } else {
+        equities.len().checked_sub(1).map(fallback_timestamp_ms)
+    }
+    .or_else(|| fills.last().map(fill_timestamp_ms))
+    .unwrap_or(0);
     let mut current_day = if use_timestamps {
         (timestamps_ms[0] / MS_PER_DAY) as usize
     } else {
@@ -261,11 +293,7 @@ fn analyze_backtest_basic(
                     (gains, losses + ret.abs())
                 }
             });
-    let omega_ratio = if losses_sum != 0.0 {
-        gains_sum / losses_sum
-    } else {
-        f64::INFINITY
-    };
+    let omega_ratio = calc_omega_ratio(gains_sum, losses_sum);
 
     // Calculate Expected Shortfall (99%)
     let expected_shortfall_1pct = if daily_eqs_mins_pct_change.is_empty() {
@@ -292,36 +320,10 @@ fn analyze_backtest_basic(
             / worst_n as f64
     };
 
-    // Calculate drawdowns
-    let drawdowns_daily = calc_drawdowns(&daily_eqs_mins);
-    let drawdown_worst_mean_1pct = if drawdowns_daily.is_empty() {
-        0.0
-    } else {
-        let mut sorted_drawdowns = drawdowns_daily.clone();
-        sorted_drawdowns.sort_by(|a, b| {
-            a.partial_cmp(b).unwrap_or_else(|| {
-                if a.is_nan() && b.is_nan() {
-                    Ordering::Equal
-                } else if a.is_nan() {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            })
-        });
-        let cutoff_index = std::cmp::max(1, (sorted_drawdowns.len() as f64 * 0.01) as usize);
-        let worst_n = std::cmp::min(cutoff_index, sorted_drawdowns.len());
-        if worst_n == 0 {
-            0.0
-        } else {
-            sorted_drawdowns[..worst_n]
-                .iter()
-                .map(|x| x.abs())
-                .sum::<f64>()
-                / worst_n as f64
-        }
-    };
     let drawdowns_full = calc_drawdowns(equities);
+    let daily_worst_drawdowns =
+        daily_worst_signed_drawdowns(&drawdowns_full, timestamps_ms, equities.len());
+    let drawdown_worst_mean_1pct = mean_worst_1pct_abs(&daily_worst_drawdowns);
     let drawdown_worst = if drawdowns_full.is_empty() {
         0.0
     } else {
@@ -485,11 +487,7 @@ fn analyze_backtest_basic(
             "short"
         };
         let key = format!("{}_{}", fill.coin, side);
-        let fill_ts = if fill.timestamp_ms > 0 {
-            fill.timestamp_ms
-        } else {
-            fallback_timestamp_ms(fill.index)
-        };
+        let fill_ts = fill_timestamp_ms(fill);
 
         // Record the opening time if the position is new
         if !positions_opened.contains_key(&key) {
@@ -526,13 +524,11 @@ fn analyze_backtest_basic(
     }
 
     // Add unchanged durations and total durations for remaining open positions
-    let last_ts = fills.last().map_or(0u64, |f| {
-        if f.timestamp_ms > 0 {
-            f.timestamp_ms
-        } else {
-            fallback_timestamp_ms(f.index)
-        }
-    });
+    let last_ts = fills
+        .last()
+        .map(fill_timestamp_ms)
+        .map(|fill_ts| analysis_end_ts.max(fill_ts))
+        .unwrap_or(analysis_end_ts);
     for (key, &start_idx) in positions_opened.iter() {
         durations_ms.push(last_ts.saturating_sub(start_idx)); // Total duration for open positions
         if let Some(&last_time) = last_fill_time.get(key) {
@@ -586,6 +582,68 @@ fn analyze_backtest_basic(
     } else {
         0.0
     };
+    let position_held_days_mean = position_held_hours_mean / 24.0;
+    let position_held_days_max = position_held_hours_max / 24.0;
+    let position_held_days_median = position_held_hours_median / 24.0;
+    let position_unchanged_days_max = position_unchanged_hours_max / 24.0;
+    // Entry interval tracking: collect normal initial entry fills per coin+side
+    // and compute gaps between consecutive initial entries for the same coin+side.
+    let mut initial_entry_times: HashMap<String, Vec<u64>> = HashMap::new();
+    for fill in fills {
+        let is_initial_entry = matches!(
+            fill.order_type,
+            OrderType::EntryInitialNormalLong | OrderType::EntryInitialNormalShort
+        );
+        if is_initial_entry {
+            let side = if fill.order_type.is_long() {
+                "long"
+            } else {
+                "short"
+            };
+            let key = format!("{}_{}", fill.coin, side);
+            let ts = if fill.timestamp_ms > 0 {
+                fill.timestamp_ms
+            } else {
+                fallback_timestamp_ms(fill.index)
+            };
+            initial_entry_times
+                .entry(key)
+                .or_insert_with(Vec::new)
+                .push(ts);
+        }
+    }
+    let mut entry_intervals_ms: Vec<u64> = Vec::new();
+    for (_key, mut times) in initial_entry_times {
+        times.sort_unstable();
+        for window in times.windows(2) {
+            entry_intervals_ms.push(window[1].saturating_sub(window[0]));
+        }
+    }
+    let (
+        entry_interval_hours_mean,
+        entry_interval_hours_median,
+        entry_interval_hours_p95,
+        entry_interval_hours_p99,
+        entry_interval_hours_max,
+    ) = if !entry_intervals_ms.is_empty() {
+        let mut sorted = entry_intervals_ms;
+        sorted.sort_unstable();
+        let mid = sorted.len() / 2;
+        let median = if sorted.len() % 2 == 0 {
+            (sorted[mid - 1] as f64 + sorted[mid] as f64) / (2.0 * MS_PER_HOUR as f64)
+        } else {
+            sorted[mid] as f64 / MS_PER_HOUR as f64
+        };
+        (
+            sorted.iter().sum::<u64>() as f64 / (sorted.len() as f64 * MS_PER_HOUR as f64),
+            median,
+            percentile_sorted_u64(&sorted, 95.0) / MS_PER_HOUR as f64,
+            percentile_sorted_u64(&sorted, 99.0) / MS_PER_HOUR as f64,
+            *sorted.last().unwrap() as f64 / MS_PER_HOUR as f64,
+        )
+    } else {
+        (0.0, 0.0, 0.0, 0.0, 0.0)
+    };
     let (win_rate, trade_loss_max, trade_loss_mean, trade_loss_median) =
         if completed_trades.is_empty() {
             (0.0, 0.0, 0.0, 0.0)
@@ -632,7 +690,10 @@ fn analyze_backtest_basic(
         },
         false,
     );
-    let peak_recovery_hours_pnl = calc_peak_recovery_hours_pnl(fills);
+    let final_timestamp_ms = Some(analysis_end_ts);
+    let peak_recovery_hours_pnl = calc_peak_recovery_hours_pnl(fills, final_timestamp_ms);
+    let peak_recovery_days_equity = peak_recovery_hours_equity / 24.0;
+    let peak_recovery_days_pnl = peak_recovery_hours_pnl / 24.0;
 
     let mut analysis = Analysis::default();
     analysis.adg = adg;
@@ -667,6 +728,15 @@ fn analyze_backtest_basic(
     analysis.position_held_hours_max = position_held_hours_max;
     analysis.position_held_hours_median = position_held_hours_median;
     analysis.position_unchanged_hours_max = position_unchanged_hours_max;
+    analysis.position_held_days_mean = position_held_days_mean;
+    analysis.position_held_days_max = position_held_days_max;
+    analysis.position_held_days_median = position_held_days_median;
+    analysis.position_unchanged_days_max = position_unchanged_days_max;
+    analysis.entry_interval_hours_mean = entry_interval_hours_mean;
+    analysis.entry_interval_hours_median = entry_interval_hours_median;
+    analysis.entry_interval_hours_p95 = entry_interval_hours_p95;
+    analysis.entry_interval_hours_p99 = entry_interval_hours_p99;
+    analysis.entry_interval_hours_max = entry_interval_hours_max;
     analysis.win_rate = win_rate;
     analysis.trade_loss_max = trade_loss_max;
     analysis.trade_loss_mean = trade_loss_mean;
@@ -677,6 +747,8 @@ fn analyze_backtest_basic(
     analysis.volume_pct_per_day_avg = volume_pct_per_day_avg;
     analysis.peak_recovery_hours_equity = peak_recovery_hours_equity;
     analysis.peak_recovery_hours_pnl = peak_recovery_hours_pnl;
+    analysis.peak_recovery_days_equity = peak_recovery_days_equity;
+    analysis.peak_recovery_days_pnl = peak_recovery_days_pnl;
     analysis.total_wallet_exposure_max = twe_max;
     analysis.total_wallet_exposure_mean = twe_mean;
     analysis.total_wallet_exposure_median = twe_median;
@@ -911,10 +983,14 @@ pub fn analyze_backtest(
                     "long" => {
                         analysis.high_exposure_hours_mean_long = hrs_mean;
                         analysis.high_exposure_hours_max_long = hrs_max;
+                        analysis.high_exposure_days_mean_long = hrs_mean / 24.0;
+                        analysis.high_exposure_days_max_long = hrs_max / 24.0;
                     }
                     "short" => {
                         analysis.high_exposure_hours_mean_short = hrs_mean;
                         analysis.high_exposure_hours_max_short = hrs_max;
+                        analysis.high_exposure_days_mean_short = hrs_mean / 24.0;
+                        analysis.high_exposure_days_max_short = hrs_max / 24.0;
                     }
                     _ => {}
                 }
@@ -1044,6 +1120,25 @@ fn median(values: &[f64]) -> f64 {
     }
 }
 
+fn percentile_sorted_u64(sorted: &[u64], percentile: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0] as f64;
+    }
+    let pct = percentile.clamp(0.0, 100.0);
+    let rank = (pct / 100.0) * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        sorted[lower] as f64
+    } else {
+        let weight = rank - lower as f64;
+        sorted[lower] as f64 + (sorted[upper] as f64 - sorted[lower] as f64) * weight
+    }
+}
+
 fn calc_sharpe_and_sortino(values: &[f64], mean_val: f64) -> (f64, f64) {
     if values.is_empty() {
         return (0.0, 0.0);
@@ -1092,6 +1187,41 @@ fn calc_drawdowns(equity_series: &[f64]) -> Vec<f64> {
     }
 
     drawdowns
+}
+
+fn daily_worst_signed_drawdowns(
+    drawdowns: &[f64],
+    timestamps_ms: &[u64],
+    expected_len: usize,
+) -> Vec<f64> {
+    if drawdowns.is_empty() {
+        return Vec::new();
+    }
+
+    let use_timestamps = !timestamps_ms.is_empty() && timestamps_ms.len() == expected_len;
+    let mut daily_worst = Vec::new();
+    let mut current_day = if use_timestamps {
+        (timestamps_ms[0] / MS_PER_DAY) as usize
+    } else {
+        0
+    };
+    let mut current_worst = drawdowns[0];
+    for (i, &drawdown) in drawdowns.iter().enumerate() {
+        let day = if use_timestamps {
+            (timestamps_ms[i] / MS_PER_DAY) as usize
+        } else {
+            i / 1440
+        };
+        if day > current_day {
+            daily_worst.push(current_worst);
+            current_day = day;
+            current_worst = drawdown;
+        } else {
+            current_worst = current_worst.min(drawdown);
+        }
+    }
+    daily_worst.push(current_worst);
+    daily_worst
 }
 
 /// Calculates the normalized total variation (sum of absolute first differences divided by net equity gain)
@@ -1149,7 +1279,7 @@ fn calc_peak_recovery_hours(
     (max_duration_ms as f64) / MS_PER_HOUR as f64
 }
 
-fn calc_peak_recovery_hours_pnl(fills: &[Fill]) -> f64 {
+fn calc_peak_recovery_hours_pnl(fills: &[Fill], final_timestamp_ms: Option<u64>) -> f64 {
     if fills.is_empty() {
         return 0.0;
     }
@@ -1172,7 +1302,7 @@ fn calc_peak_recovery_hours_pnl(fills: &[Fill]) -> f64 {
         } else {
             fallback_timestamp_ms(fill.index)
         };
-        cumulative += fill.pnl;
+        cumulative += fill.pnl + fill.fee_paid;
         if cumulative > peak {
             let duration_ms = ts.saturating_sub(peak_ts);
             if duration_ms > max_duration_ms {
@@ -1181,6 +1311,9 @@ fn calc_peak_recovery_hours_pnl(fills: &[Fill]) -> f64 {
             peak = cumulative;
             peak_ts = ts;
         }
+    }
+    if let Some(final_ts) = final_timestamp_ms {
+        max_duration_ms = max_duration_ms.max(final_ts.saturating_sub(peak_ts));
     }
 
     (max_duration_ms as f64) / MS_PER_HOUR as f64
@@ -1365,6 +1498,89 @@ mod tests {
     }
 
     #[test]
+    fn omega_ratio_caps_positive_no_loss_days() {
+        let timestamps = vec![0, MS_PER_DAY, MS_PER_DAY * 2];
+        let equities = vec![100.0, 110.0, 121.0];
+
+        let metrics = analyze_equity_series(&equities, &timestamps);
+
+        assert_eq!(metrics.omega_ratio, OMEGA_RATIO_CAP);
+        assert!(metrics.omega_ratio.is_finite());
+    }
+
+    #[test]
+    fn omega_ratio_is_zero_when_no_days_move() {
+        let timestamps = vec![0, MS_PER_DAY, MS_PER_DAY * 2];
+        let equities = vec![100.0, 100.0, 100.0];
+
+        let metrics = analyze_equity_series(&equities, &timestamps);
+
+        assert_eq!(metrics.omega_ratio, 0.0);
+    }
+
+    #[test]
+    fn backtest_analysis_omega_ratio_caps_positive_no_loss_days() {
+        let timestamps = vec![0, MS_PER_DAY, MS_PER_DAY * 2];
+        let equities = vec![100.0, 110.0, 121.0];
+        let exposures_series: Vec<f64> = vec![];
+        let fills = vec![make_trade_fill(
+            0,
+            timestamps[0],
+            "BTC",
+            0.0,
+            0.1,
+            0.1,
+            100.0,
+            true,
+        )];
+
+        let analysis = analyze_backtest_basic(&fills, &equities, &timestamps, &exposures_series);
+
+        assert_eq!(analysis.omega_ratio, OMEGA_RATIO_CAP);
+        assert!(analysis.omega_ratio.is_finite());
+    }
+
+    #[test]
+    fn position_duration_metrics_include_open_tail_to_backtest_end() {
+        let start = 1_740_000_000_000_u64;
+        let timestamps: Vec<u64> = (0..=10).map(|i| start + i * MS_PER_DAY).collect();
+        let equities: Vec<f64> = vec![10000.0; timestamps.len()];
+        let exposures_series: Vec<f64> = vec![];
+        let fills = vec![
+            make_trade_fill(0, timestamps[0], "BTC", 0.0, 0.1, 0.1, 1000.0, true),
+            make_trade_fill(1, timestamps[1], "BTC", 0.0, 0.1, 0.2, 1000.0, true),
+        ];
+
+        let analysis = analyze_backtest(&fills, &equities, &timestamps, &exposures_series);
+
+        assert!((analysis.position_held_days_max - 10.0).abs() < 1e-12);
+        assert!((analysis.position_unchanged_days_max - 9.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn single_open_fill_position_duration_uses_backtest_end() {
+        let start = 1_740_000_000_000_u64;
+        let timestamps: Vec<u64> = (0..=3).map(|i| start + i * MS_PER_DAY).collect();
+        let equities: Vec<f64> = vec![10000.0; timestamps.len()];
+        let exposures_series: Vec<f64> = vec![];
+        let fills = vec![make_trade_fill(
+            0,
+            timestamps[0],
+            "BTC",
+            0.0,
+            0.1,
+            0.1,
+            1000.0,
+            true,
+        )];
+
+        let analysis = analyze_backtest(&fills, &equities, &timestamps, &exposures_series);
+
+        assert!((analysis.position_held_days_max - 3.0).abs() < 1e-12);
+        assert!((analysis.position_unchanged_days_max - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_total_wallet_exposure_max_short_only() {
         // For short-only configs, twe_net is always negative.
         // total_wallet_exposure_max should report the maximum absolute exposure.
@@ -1466,10 +1682,10 @@ mod tests {
     }
 
     #[test]
-    fn test_peak_recovery_hours_pnl_uses_gross_pnl_not_fees() {
+    fn test_peak_recovery_hours_pnl_uses_net_pnl_and_open_tail() {
         let interval_ms: u64 = 3_600_000;
         let start_ts: u64 = 1_700_000_000_000;
-        let equities: Vec<f64> = vec![10000.0; 3];
+        let equities: Vec<f64> = vec![10000.0; 4];
         let timestamps: Vec<u64> = (0..equities.len())
             .map(|i| start_ts + (i as u64) * interval_ms)
             .collect();
@@ -1478,7 +1694,7 @@ mod tests {
         let mut f0 = make_fill(0, -0.1);
         f0.timestamp_ms = timestamps[0];
         f0.pnl = 10.0;
-        f0.fee_paid = -100.0;
+        f0.fee_paid = 0.0;
 
         let mut f1 = make_fill(1, -0.1);
         f1.timestamp_ms = timestamps[1];
@@ -1493,10 +1709,58 @@ mod tests {
         let analysis =
             analyze_backtest(&vec![f0, f1, f2], &equities, &timestamps, &exposures_series);
         assert!(
-            (analysis.peak_recovery_hours_pnl - 2.0).abs() < 1e-9,
-            "Expected gross pnl recovery of 2.0h, got {}",
+            (analysis.peak_recovery_hours_pnl - 3.0).abs() < 1e-9,
+            "Expected net pnl open-tail recovery of 3.0h, got {}",
             analysis.peak_recovery_hours_pnl
         );
+        assert!(
+            (analysis.peak_recovery_days_pnl - 0.125).abs() < 1e-9,
+            "Expected net pnl open-tail recovery of 0.125d, got {}",
+            analysis.peak_recovery_days_pnl
+        );
+    }
+
+    #[test]
+    fn test_drawdown_worst_mean_1pct_uses_full_curve_daily_worst() {
+        let fills = vec![make_fill(0, -0.1), make_fill(1, -0.1)];
+        let equities = vec![100.0, 50.0, 110.0, 109.0];
+        let timestamps = vec![0, MS_PER_HOUR, MS_PER_DAY, MS_PER_DAY + MS_PER_HOUR];
+        let exposures_series: Vec<f64> = vec![];
+
+        let analysis = analyze_backtest(&fills, &equities, &timestamps, &exposures_series);
+
+        assert!((analysis.drawdown_worst - 0.5).abs() < 1e-12);
+        assert!((analysis.drawdown_worst_mean_1pct - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_entry_interval_hours_ignore_partial_initial_entries() {
+        let balance = 10000.0;
+        let mut partial_long =
+            make_trade_fill(60, MS_PER_HOUR, "BTC", 0.0, 0.02, 0.12, balance, true);
+        partial_long.order_type = OrderType::EntryInitialPartialLong;
+        let mut partial_long_later =
+            make_trade_fill(660, 11 * MS_PER_HOUR, "BTC", 0.0, 0.02, 0.12, balance, true);
+        partial_long_later.order_type = OrderType::EntryInitialPartialLong;
+
+        let fills = vec![
+            make_trade_fill(0, 0, "BTC", 0.0, 0.1, 0.1, balance, true),
+            partial_long,
+            make_trade_fill(600, 10 * MS_PER_HOUR, "BTC", 0.0, 0.1, 0.1, balance, true),
+            partial_long_later,
+            make_trade_fill(1500, 25 * MS_PER_HOUR, "BTC", 0.0, 0.1, 0.1, balance, true),
+        ];
+        let equities: Vec<f64> = vec![balance; 1600];
+        let timestamps: Vec<u64> = (0..1600).map(|i| (i as u64) * 60_000).collect();
+        let exposures: Vec<f64> = vec![];
+
+        let analysis = analyze_backtest(&fills, &equities, &timestamps, &exposures);
+
+        assert!((analysis.entry_interval_hours_mean - 12.5).abs() < 1e-9);
+        assert!((analysis.entry_interval_hours_median - 12.5).abs() < 1e-9);
+        assert!((analysis.entry_interval_hours_p95 - 14.75).abs() < 1e-9);
+        assert!((analysis.entry_interval_hours_p99 - 14.95).abs() < 1e-9);
+        assert!((analysis.entry_interval_hours_max - 15.0).abs() < 1e-9);
     }
 
     #[test]

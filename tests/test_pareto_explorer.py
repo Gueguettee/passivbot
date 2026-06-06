@@ -9,7 +9,6 @@ import pytest
 
 from pareto_explorer import (
     build_parser,
-    detect_latest_pareto_dir,
     filter_candidates,
     load_candidates,
     run_from_args,
@@ -42,6 +41,115 @@ def _write_candidate(
         "metrics": {
             "objectives": objectives,
             "stats": stats,
+        },
+    }
+    with open(path / f"{name}.json", "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _write_suite_candidate(
+    path: Path,
+    name: str,
+    *,
+    adg_mean: float,
+    adg_min: float,
+    recovery_mean: float,
+    recovery_max: float,
+    drawdown_mean: float,
+    drawdown_max: float,
+) -> None:
+    payload = {
+        "optimize": {
+            "scoring": [
+                {"metric": "adg_strategy_pnl_rebased", "goal": "max"},
+                {"metric": "peak_recovery_hours_hsl", "goal": "min"},
+                {"metric": "drawdown_worst_hsl", "goal": "min"},
+            ]
+        },
+        "backtest": {
+            "aggregate": {
+                "default": "mean",
+                "peak_recovery_hours_hsl": "mean",
+                "drawdown_worst_hsl": "max",
+            }
+        },
+        "suite_metrics": {
+            "aggregate": {
+                "stats": {
+                    "adg_strategy_pnl_rebased": {
+                        "mean": adg_mean,
+                        "min": adg_min,
+                        "max": max(adg_mean, adg_min),
+                        "std": 0.0,
+                    },
+                    "peak_recovery_hours_hsl": {
+                        "mean": recovery_mean,
+                        "min": recovery_mean,
+                        "max": recovery_max,
+                        "std": 0.0,
+                    },
+                    "drawdown_worst_hsl": {
+                        "mean": drawdown_mean,
+                        "min": drawdown_mean,
+                        "max": drawdown_max,
+                        "std": 0.0,
+                    },
+                },
+                "aggregated": {
+                    "adg_strategy_pnl_rebased": adg_mean,
+                    "peak_recovery_hours_hsl": recovery_mean,
+                    "drawdown_worst_hsl": drawdown_max,
+                },
+            }
+        },
+    }
+    with open(path / f"{name}.json", "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _write_fill_suite_candidate(
+    path: Path,
+    name: str,
+    *,
+    adg: float,
+    p95_gap: float,
+    p99_gap: float,
+) -> None:
+    payload = {
+        "optimize": {
+            "scoring": [
+                {"metric": "adg_strategy_eq", "goal": "max"},
+                {"metric": "fills_gap_p99_hours", "goal": "min"},
+            ]
+        },
+        "suite_metrics": {
+            "metrics": {
+                "adg_strategy_eq": {
+                    "stats": {"mean": adg, "min": adg, "max": adg, "std": 0.0},
+                    "aggregated": adg,
+                    "scenarios": {},
+                },
+                "fills_gap_p95_hours": {
+                    "stats": {
+                        "mean": p95_gap,
+                        "min": p95_gap,
+                        "max": p95_gap,
+                        "std": 0.0,
+                    },
+                    "aggregated": p95_gap,
+                    "scenarios": {},
+                },
+                "fills_gap_p99_hours": {
+                    "stats": {
+                        "mean": p99_gap,
+                        "min": p99_gap,
+                        "max": p99_gap,
+                        "std": 0.0,
+                    },
+                    "aggregated": p99_gap,
+                    "scenarios": {},
+                },
+            }
         },
     }
     with open(path / f"{name}.json", "w") as f:
@@ -87,22 +195,23 @@ def test_load_candidates_accepts_run_or_pareto_dir(sample_pareto_dir: Path):
     assert [spec.metric for spec in specs_from_run] == ["metric_a", "metric_b", "metric_c"]
 
 
-def test_detect_latest_pareto_dir_selects_newest(tmp_path: Path):
-    older = tmp_path / "optimize_results" / "older" / "pareto"
-    newer = tmp_path / "optimize_results" / "newer" / "pareto"
-    older.mkdir(parents=True)
-    newer.mkdir(parents=True)
-    older.touch()
-    newer.touch()
-    older.parent.touch()
-    newer.parent.touch()
-    older_dir = older.resolve()
-    newer_dir = newer.resolve()
-    os.utime(older_dir, (1000, 1000))
-    os.utime(newer_dir, (2000, 2000))
+def test_load_candidates_ignores_non_candidate_json_artifacts(sample_pareto_dir: Path):
+    (sample_pareto_dir / "selection.json").write_text(
+        json.dumps({"selected_count": 4, "selected": []}) + "\n",
+        encoding="utf-8",
+    )
 
-    resolved = detect_latest_pareto_dir(tmp_path / "optimize_results")
-    assert resolved == newer_dir
+    pareto_dir, candidates, specs = load_candidates(sample_pareto_dir)
+
+    assert pareto_dir == sample_pareto_dir.resolve()
+    assert len(candidates) == 4
+    assert [candidate.path.name for candidate in candidates] == [
+        "a_extreme.json",
+        "b_extreme.json",
+        "balanced.json",
+        "c_extreme.json",
+    ]
+    assert [spec.metric for spec in specs] == ["metric_a", "metric_b", "metric_c"]
 
 
 def test_filter_candidates_with_cli_keep_condition(sample_pareto_dir: Path):
@@ -114,6 +223,73 @@ def test_filter_candidates_with_cli_keep_condition(sample_pareto_dir: Path):
     )
     assert len(limits) == 1
     assert sorted(candidate.path.stem for candidate in filtered) == ["a_extreme", "balanced"]
+
+
+def test_filter_candidates_uses_suite_aggregate_defaults_for_omitted_stat(tmp_path: Path):
+    pareto_dir = tmp_path / "run" / "pareto"
+    pareto_dir.mkdir(parents=True)
+    _write_suite_candidate(
+        pareto_dir,
+        "passes_by_aggregate_defaults",
+        adg_mean=0.02,
+        adg_min=-0.05,
+        recovery_mean=4000.0,
+        recovery_max=9000.0,
+        drawdown_mean=0.4,
+        drawdown_max=0.7,
+    )
+    _write_suite_candidate(
+        pareto_dir,
+        "fails_drawdown_max",
+        adg_mean=0.03,
+        adg_min=0.01,
+        recovery_mean=3000.0,
+        recovery_max=3500.0,
+        drawdown_mean=0.5,
+        drawdown_max=0.9,
+    )
+    _pareto_dir, candidates, _specs = load_candidates(pareto_dir)
+
+    filtered, limits = filter_candidates(
+        candidates,
+        limits_payload=None,
+        limit_entries=[
+            "adg_strategy_pnl_rebased>0.0",
+            "peak_recovery_hours_hsl<5000",
+            "drawdown_worst_hsl<0.8",
+        ],
+    )
+
+    assert len(limits) == 3
+    assert [candidate.path.stem for candidate in filtered] == ["passes_by_aggregate_defaults"]
+
+
+def test_filter_candidates_explicit_stat_overrides_suite_aggregate_defaults(tmp_path: Path):
+    pareto_dir = tmp_path / "run" / "pareto"
+    pareto_dir.mkdir(parents=True)
+    _write_suite_candidate(
+        pareto_dir,
+        "strict_failure",
+        adg_mean=0.02,
+        adg_min=-0.05,
+        recovery_mean=4000.0,
+        recovery_max=9000.0,
+        drawdown_mean=0.4,
+        drawdown_max=0.7,
+    )
+    _pareto_dir, candidates, _specs = load_candidates(pareto_dir)
+
+    filtered, _limits = filter_candidates(
+        candidates,
+        limits_payload=None,
+        limit_entries=[
+            "adg_strategy_pnl_rebased>0.0 stat=min",
+            "peak_recovery_hours_hsl<5000 stat=max",
+            "drawdown_worst_hsl<0.8 stat=max",
+        ],
+    )
+
+    assert filtered == []
 
 
 def test_select_candidate_knee_prefers_balanced_candidate(sample_pareto_dir: Path):
@@ -213,8 +389,10 @@ def test_run_from_args_prints_summary(sample_pareto_dir: Path, capsys):
 
 def test_run_from_args_uses_latest_pareto_dir_when_path_omitted(tmp_path: Path, monkeypatch, capsys):
     root = tmp_path / "optimize_results"
-    older = root / "older" / "pareto"
-    newer = root / "newer" / "pareto"
+    older_run = "2026-04-28T09_00_00_older"
+    newer_run = "2026-04-28T10_00_00_newer"
+    older = root / older_run / "pareto"
+    newer = root / newer_run / "pareto"
     older.mkdir(parents=True)
     newer.mkdir(parents=True)
     _write_candidate(older, "older_balanced", {"metric_a": 0.6, "metric_b": 0.6, "metric_c": 0.6})
@@ -238,8 +416,11 @@ def test_run_from_args_uses_latest_pareto_dir_when_path_omitted(tmp_path: Path, 
     result = run_from_args(args)
     captured = capsys.readouterr().out
     assert str(newer.resolve()) not in captured
-    assert "optimize_results/newer/pareto" in captured
-    assert "Backtest command: passivbot backtest optimize_results/newer/pareto/newer_balanced.json" in captured
+    assert f"optimize_results/{newer_run}/pareto" in captured
+    assert (
+        f"Backtest command: passivbot backtest "
+        f"optimize_results/{newer_run}/pareto/newer_balanced.json"
+    ) in captured
     assert result.candidate.path.stem == "newer_balanced"
 
 
@@ -293,6 +474,36 @@ def test_select_candidate_accepts_non_scoring_metric_from_stats(sample_pareto_di
     assert result.candidate.path.stem == "balanced"
     assert "sharpe_ratio_strategy_pnl_rebased" in result.objective_values
     assert result.objective_values["sharpe_ratio_strategy_pnl_rebased"] == pytest.approx(1.4)
+
+
+def test_select_candidate_accepts_non_scoring_fill_metric_from_suite_metrics(tmp_path: Path):
+    pareto_dir = tmp_path / "run" / "pareto"
+    pareto_dir.mkdir(parents=True)
+    _write_fill_suite_candidate(
+        pareto_dir,
+        "low_p95_gap",
+        adg=0.01,
+        p95_gap=12.0,
+        p99_gap=80.0,
+    )
+    _write_fill_suite_candidate(
+        pareto_dir,
+        "high_p95_gap",
+        adg=0.01,
+        p95_gap=48.0,
+        p99_gap=80.0,
+    )
+
+    _pareto_dir, candidates, specs = load_candidates(pareto_dir)
+    result = select_candidate(
+        candidates,
+        specs,
+        method="ideal",
+        objectives_arg="adg_strategy_eq,fills_gap_p95_hours",
+    )
+
+    assert result.candidate.path.stem == "low_p95_gap"
+    assert result.objective_values["fills_gap_p95_hours"] == pytest.approx(12.0)
 
 
 def test_run_from_args_formats_goal_for_non_scoring_metric(sample_pareto_dir: Path, capsys):

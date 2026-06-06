@@ -66,6 +66,7 @@ from legacy_data_migrator import (
     merge_duplicate_symbol_directories,
     normalize_ccxt_volume_to_base,
 )
+from utils import symbol_to_coin
 
 # Suppress portalocker's "timeout has no effect in blocking mode" warning
 warnings.filterwarnings(
@@ -78,8 +79,39 @@ ONE_MIN_MS = 60_000
 
 _LOCK_TIMEOUT_SECONDS = 10.0
 _LOCK_STALE_SECONDS = 180.0
+
+
+def _log_symbol(symbol: Any) -> str:
+    """Return compact symbol labels for operator-facing candle logs."""
+    if symbol is None:
+        return "unknown"
+    sym = str(symbol)
+    return symbol_to_coin(sym, verbose=False) or sym
+
+
 _LOCK_BACKOFF_INITIAL = 0.1
 _LOCK_BACKOFF_MAX = 2.0
+_GATEIO_RECENT_1M_LIMIT_CANDLES = 9_990
+
+
+def _ensure_legacy_ohlcv_cache_base(cache_dir: str) -> str:
+    """Create the legacy daily-shard cache root, repairing stale symlinks left by v2 migration."""
+    cache_base = Path(cache_dir) / "ohlcv"
+    try:
+        cache_base.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        if cache_base.is_symlink() and not cache_base.exists():
+            target = os.readlink(cache_base)
+            cache_base.unlink()
+            cache_base.mkdir(parents=True, exist_ok=True)
+            logging.info(
+                "removed dangling legacy OHLCV cache symlink %s -> %s; created local directory",
+                cache_base,
+                target,
+            )
+        else:
+            raise
+    return str(cache_base)
 
 # See: https://github.com/enarjord/passivbot/issues/547
 # True if running on Windows (used for file/path compatible names)
@@ -116,6 +148,11 @@ GAP_REASON_NO_ARCHIVE = "no_archive"
 GAP_REASON_FETCH_FAILED = "fetch_failed"
 GAP_REASON_MANUAL = "manual"
 GAP_REASON_NO_TRADES = "no_trades"
+
+
+_FIRST_OHLCV_EXCHANGE_CACHE_ALIASES = {
+    "binance": "binanceusdm",
+}
 
 
 CANDLE_DTYPE = np.dtype(
@@ -560,12 +597,16 @@ class CandlestickManager:
         remote_fetch_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         # Optional global concurrency limiter for remote ccxt calls
         max_concurrent_requests: int | None = None,
+        # Optional minimum spacing between ccxt OHLCV calls from this manager.
+        remote_fetch_min_interval_ms: float | None = None,
         lock_timeout_seconds: float | None = None,
         # Archive fetching: if False, only use ccxt REST API even if archives are available.
         # Useful for live bots where archives may timeout; backtester enables by default.
         archive_enabled: bool = True,
         # Optional list of symbols to log per-page OHLCV ranges (debugging pagination).
         page_debug_symbols: Optional[Iterable[str]] = None,
+        # Optional live shutdown hook. If it returns True, in-flight warmup/fetch loops abort.
+        stop_requested_callback: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.exchange = exchange
         # If no explicit exchange_name provided, infer from ccxt instance id
@@ -586,7 +627,7 @@ class CandlestickManager:
         self.max_disk_candles_per_symbol_per_tf = int(max_disk_candles_per_symbol_per_tf)
         # Archive fetching: if False, only use ccxt REST API
         self.archive_enabled = bool(archive_enabled)
-        # Debug levels: 0=warnings, 1=network-only, 2=full debug, 3=trace
+        # Debug levels: 0=warnings, 1=network summaries, 2=debug, 3=trace/firehose
         try:
             dbg = int(float(debug))
         except Exception:
@@ -597,6 +638,8 @@ class CandlestickManager:
         except Exception:
             self._progress_log_interval_seconds = 0.0
         self._progress_last_log: Dict[Tuple[str, str, str], float] = {}
+        self._skipped_trailing_gap_summary: Dict[Tuple[str, str], Dict[str, int]] = {}
+        self._skipped_trailing_gap_summary_last_log: float = time.monotonic()
         self._warning_last_log: Dict[str, float] = {}  # throttle repeated warnings
         self._warning_throttle_seconds: float = 300.0  # 5 minutes between repeated warnings
         self._persist_batch_observer: Optional[
@@ -607,6 +650,8 @@ class CandlestickManager:
         self._strict_gaps_summary_last_log: float = 0.0
         self._strict_gaps_summary_interval: float = 900.0  # 15 minutes
         self._remote_fetch_callback = remote_fetch_callback
+        self._stop_requested_callback = stop_requested_callback
+        self._now_ms_callback: Optional[Callable[[], int]] = None
         # Cache of legacy shard paths per (exchange, symbol, tf)
         self._legacy_shard_paths_cache: Dict[Tuple[str, str, str], Dict[str, str]] = {}
         # Cache for legacy day quality decisions: (symbol, tf, date_key) -> legacy_is_complete
@@ -619,7 +664,8 @@ class CandlestickManager:
         self._index_mtime: Dict[str, Optional[float]] = {}
         # Cache for EMA computations: per symbol -> {(metric, span, tf): (value, end_ts, computed_at_ms)}
         self._ema_cache: Dict[str, Dict[Tuple[str, int, str], Tuple[float, int, int]]] = {}
-        # Cache for current (in-progress) minute close per symbol: symbol -> (price, updated_ms)
+        # Compatibility attribute retained for older monitor/tool code.  The
+        # candlestick manager no longer owns current in-progress prices.
         self._current_close_cache: Dict[str, Tuple[float, int]] = {}
         # Cache for fetched higher-timeframe windows to avoid duplicate remote calls (LRU per symbol)
         # Keyed per symbol -> OrderedDict[(tf_str, start_ts, end_ts) -> (array, fetched_at_ms)]
@@ -663,8 +709,7 @@ class CandlestickManager:
         # Standardize cache directory names (e.g., binanceusdm -> binance),
         # migrate any legacy data from historical_data/ to caches/ohlcv/,
         # and merge any duplicate symbol directories from inconsistent sanitization
-        ohlcv_cache_base = os.path.join(self.cache_dir, "ohlcv")
-        os.makedirs(ohlcv_cache_base, exist_ok=True)
+        ohlcv_cache_base = _ensure_legacy_ohlcv_cache_base(self.cache_dir)
         historical_data_path = os.path.join(
             os.path.dirname(os.path.abspath(self.cache_dir)),
             "historical_data",
@@ -723,6 +768,17 @@ class CandlestickManager:
         self._rate_limit_until: float = 0.0
         self._rate_limit_lock = asyncio.Lock()
         self._rate_limit_count: int = 0
+        self._remote_fetch_spacing_lock = asyncio.Lock()
+        try:
+            self._remote_fetch_min_interval_ms = max(
+                0.0,
+                float(remote_fetch_min_interval_ms)
+                if remote_fetch_min_interval_ms is not None
+                else 0.0,
+            )
+        except Exception:
+            self._remote_fetch_min_interval_ms = 0.0
+        self._remote_fetch_last_started_ms: int = 0
 
         # Persistent HTTP session for archive fetches (created lazily)
         self._http_session: Optional["aiohttp.ClientSession"] = None
@@ -738,6 +794,7 @@ class CandlestickManager:
         self._record_payload_gaps_as_known = False
         self._ccxt_since_exclusive = False
         self._ccxt_limit_probe_done = False
+        self._gateio_recent_window_clip_warned: set[str] = set()
         if isinstance(self._ex_id, str) and "bitget" in self._ex_id.lower():
             # Bitget often serves 1m klines with 200 limit per page
             self._ccxt_limit_default = 200
@@ -775,6 +832,33 @@ class CandlestickManager:
             except Exception:
                 self._page_debug_symbols = set()
 
+    def set_stop_requested_callback(self, callback: Optional[Callable[[], bool]]) -> None:
+        """Install a shutdown hook used by live bots to abort non-critical candle work."""
+        self._stop_requested_callback = callback
+
+    def _shutdown_requested(self) -> bool:
+        callback = getattr(self, "_stop_requested_callback", None)
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    def _raise_if_shutdown_requested(self, stage: str) -> None:
+        if self._shutdown_requested():
+            self._log("debug", "shutdown_abort", stage=stage)
+            raise asyncio.CancelledError(f"candlestick manager shutdown during {stage}")
+
+    async def _sleep_interruptible(self, seconds: float, *, stage: str) -> None:
+        remaining = max(0.0, float(seconds))
+        while remaining > 0.0:
+            self._raise_if_shutdown_requested(stage)
+            chunk = min(remaining, 0.25)
+            await asyncio.sleep(chunk)
+            remaining -= chunk
+        self._raise_if_shutdown_requested(stage)
+
     # ----- Logging -----
 
     def _setup_logging(self) -> None:
@@ -798,6 +882,10 @@ class CandlestickManager:
         self._synth_candle_batch_mode = True
         self._synth_candle_batch.clear()
 
+    def _sparse_ohlcv_gaps_are_expected(self) -> bool:
+        exid = (self._ex_id or "").lower() if isinstance(self._ex_id, str) else ""
+        return "kucoin" in exid
+
     def flush_synth_candle_batch(self) -> None:
         """Log aggregated zero-candle synthesis summary and exit batch mode."""
         self._synth_candle_batch_mode = False
@@ -805,9 +893,10 @@ class CandlestickManager:
             return
         total_symbols = len(self._synth_candle_batch)
         total_candles = sum(v.get("count", 0) for v in self._synth_candle_batch.values())
-        # Use WARNING only for large amounts of synthesized candles (>1000), otherwise INFO
-        # This is expected behavior on illiquid pairs during warmup
-        log_fn = self.log.warning if total_candles > 1000 else self.log.info
+        # KuCoin futures commonly omits no-trade minutes. Large zero-volume synthesis
+        # batches are expected there and should be visible without looking like data corruption.
+        sparse_expected = self._sparse_ohlcv_gaps_are_expected()
+        log_fn = self.log.info if sparse_expected or total_candles <= 1000 else self.log.warning
 
         def _fmt_range(min_ts: Optional[int], max_ts: Optional[int]) -> str:
             try:
@@ -829,12 +918,19 @@ class CandlestickManager:
             symbol, meta = next(iter(self._synth_candle_batch.items()))
             count = int(meta.get("count", 0))
             rng = _fmt_range(meta.get("min_ts"), meta.get("max_ts"))
+            suffix = (
+                " | expected on sparse KuCoin no-trade minutes"
+                if sparse_expected
+                else ""
+            )
             log_fn(
-                "[candle] synthesized %d zero-candle%s for %s at %s (no data for requested minutes)",
+                "[candle] synthesized %d zero-candle%s for %s at %s "
+                "(no data for requested minutes)%s",
                 count,
                 "s" if count > 1 else "",
-                symbol,
+                _log_symbol(symbol),
                 rng,
+                suffix,
             )
         else:
             # Log top symbols by synthesized count (limit to keep logs concise)
@@ -848,17 +944,24 @@ class CandlestickManager:
             for sym, meta in sorted_syms[:top_n]:
                 count = int(meta.get("count", 0))
                 rng = _fmt_range(meta.get("min_ts"), meta.get("max_ts"))
-                top_parts.append(f"{sym}:{count}@{rng}")
+                top_parts.append(f"{_log_symbol(sym)}:{count}@{rng}")
             extra = total_symbols - min(top_n, total_symbols)
             top_str = ", ".join(top_parts)
             if extra > 0:
                 top_str = f"{top_str} (+{extra} more)"
+            suffix = (
+                " | expected on sparse KuCoin no-trade minutes"
+                if sparse_expected
+                else ""
+            )
             log_fn(
-                "[candle] synthesized %d zero-candle%s across %d symbols (no data for requested minutes) top=%s",
+                "[candle] synthesized %d zero-candle%s across %d symbols "
+                "(no data for requested minutes) top=%s%s",
                 total_candles,
                 "s" if total_candles > 1 else "",
                 total_symbols,
                 top_str,
+                suffix,
             )
         self._synth_candle_batch.clear()
 
@@ -878,7 +981,7 @@ class CandlestickManager:
             symbol, count = next(iter(self._candle_replace_batch.items()))
             self.log.info(
                 "[candle] %s: real data replaced %d synthetic candle%s, EMA cache invalidated",
-                symbol,
+                _log_symbol(symbol),
                 count,
                 "s" if count > 1 else "",
             )
@@ -930,6 +1033,22 @@ class CandlestickManager:
         self._held_fetch_locks.clear()
         for record in records:
             self._release_lock_sync(record)
+
+    def _now_ms(self) -> int:
+        """Return this manager's time source.
+
+        Live bots use UTC wall time. Fake-live replay installs a scenario-time
+        callback so completed-candle/EMA windows advance with the fake exchange.
+        """
+        callback = getattr(self, "_now_ms_callback", None)
+        if callback is not None:
+            try:
+                now = int(callback())
+                if now > 0:
+                    return now
+            except Exception:
+                pass
+        return _utc_now_ms()
 
     def _release_lock_sync(self, record: _LockRecord) -> None:
         try:
@@ -1081,17 +1200,55 @@ class CandlestickManager:
         for k, v in fields.items():
             if k.endswith("_ts") and isinstance(v, (int, np.integer)):
                 parts.append(f"{k}={self._fmt_ts(int(v))}")
+            elif k == "symbol":
+                parts.append(f"{k}={_log_symbol(v)}")
             else:
                 parts.append(f"{k}={v}")
         msg = " ".join(base + parts)
         if level == "debug":
-            # Apply debug filtering: level 0 -> drop; level 1 -> only ccxt_* events; level 2 -> all
+            # Apply filtering: level 0 -> drop; level 1 -> network summaries;
+            # level 2 -> actionable debug; level 3 -> trace/firehose.
             if self.debug_level <= 0:
                 return
             is_network = isinstance(event, str) and (
                 event.startswith("ccxt_") or event.startswith("archive_")
             )
             if self.debug_level == 1 and not is_network:
+                return
+            # Storage/cache hot paths are useful only when explicitly running TRACE-level
+            # candle diagnostics. At normal DEBUG they can dominate live logs.
+            high_volume_events = {
+                "disk_load_done",
+                "disk_load_plan",
+                "disk_load_progress",
+                "get_candles_check_refresh",
+                "get_candles_present_decision",
+                "ccxt_fetch_ohlcv",
+                "ccxt_fetch_ohlcv_ok",
+                "ccxt_fetch_paginated_done",
+                "ccxt_fetch_progress",
+                "fetch_lock_acquired",
+                "fetch_lock_reentrant",
+                "get_candles_present_inner",
+                "historical_missing_spans",
+                "historical_missing_spans_coalesced",
+                "index_cached",
+                "index_rebuild_range",
+                "index_reload",
+                "large_span_check",
+                "large_span_needs_gap_fill",
+                "legacy_index_built",
+                "load_from_disk",
+                "refresh_fetch",
+                "refresh_skip_since",
+                "runtime_synthetic_gap_materialized",
+                "ttl_bypass_missing_coverage",
+                "ttl_skip_trailing_present_gap",
+            }
+            if event in high_volume_events:
+                if self.debug_level < 3:
+                    return
+                self.log.log(int(getattr(logging, "TRACE", 5)), msg)
                 return
             self.log.debug(msg)
         elif level == "info":
@@ -1112,6 +1269,50 @@ class CandlestickManager:
         self._progress_last_log[key] = now
         self._log("debug", event, **fields)
 
+    def _record_skipped_trailing_gap(
+        self,
+        *,
+        symbol: Optional[str],
+        requested_end_ts: int,
+        actual_end_ts: int,
+        skipped_minutes: int,
+    ) -> None:
+        """Aggregate open-tail skip diagnostics instead of logging per EMA call."""
+        if self.debug_level <= 0:
+            return
+        try:
+            caller = get_caller_name()
+        except Exception:
+            caller = "-"
+        key = (_log_symbol(symbol) if symbol else "-", caller)
+        item = self._skipped_trailing_gap_summary.setdefault(
+            key, {"count": 0, "max_minutes": 0, "latest_requested": 0, "latest_actual": 0}
+        )
+        item["count"] += 1
+        item["max_minutes"] = max(int(item["max_minutes"]), int(skipped_minutes))
+        item["latest_requested"] = max(int(item["latest_requested"]), int(requested_end_ts))
+        item["latest_actual"] = max(int(item["latest_actual"]), int(actual_end_ts))
+        now = time.monotonic()
+        total = sum(int(v["count"]) for v in self._skipped_trailing_gap_summary.values())
+        if total < 250 and (now - self._skipped_trailing_gap_summary_last_log) < 300.0:
+            return
+        self._skipped_trailing_gap_summary_last_log = now
+        top_items = sorted(
+            self._skipped_trailing_gap_summary.items(),
+            key=lambda kv: (-int(kv[1]["count"]), -int(kv[1]["max_minutes"])),
+        )[:8]
+        details = "; ".join(
+            f"{sym} caller={caller} count={data['count']} max_gap={data['max_minutes']}m"
+            for (sym, caller), data in top_items
+        )
+        self.log.debug(
+            "[candle] skipped trailing gap summary | total=%d groups=%d%s",
+            total,
+            len(self._skipped_trailing_gap_summary),
+            f" | {details}" if details else "",
+        )
+        self._skipped_trailing_gap_summary.clear()
+
     def _log_persistent_gap_summary(self) -> None:
         """Log accumulated persistent gap summary if any, throttled to once per 30 min."""
         if not hasattr(self, "_persistent_gap_summary") or not self._persistent_gap_summary:
@@ -1123,7 +1324,9 @@ class CandlestickManager:
         self._persistent_gap_summary_last_log = now
         summary = self._persistent_gap_summary
         total = sum(summary.values())
-        symbols = ", ".join(f"{s}:{c}" for s, c in sorted(summary.items())[:5])
+        symbols = ", ".join(
+            f"{_log_symbol(s)}:{c}" for s, c in sorted(summary.items())[:5]
+        )
         if len(summary) > 5:
             symbols += f", +{len(summary) - 5} more"
         self.log.info(
@@ -1235,7 +1438,7 @@ class CandlestickManager:
             meta = idx.setdefault("meta", {})
             try:
                 last_ts = 0
-                inception_ts: Optional[int] = None
+                observed_start_ts: Optional[int] = None
                 for shard_meta in shards.values():
                     if not isinstance(shard_meta, dict):
                         continue
@@ -1244,11 +1447,17 @@ class CandlestickManager:
                         last_ts = max(last_ts, int(mt))
                     mi = shard_meta.get("min_ts")
                     if mi is not None:
-                        inception_ts = int(mi) if inception_ts is None else min(inception_ts, int(mi))
+                        observed_start_ts = (
+                            int(mi)
+                            if observed_start_ts is None
+                            else min(observed_start_ts, int(mi))
+                        )
                 meta["last_final_ts"] = int(last_ts)
-                meta["inception_ts"] = inception_ts
+                meta["observed_start_ts"] = observed_start_ts
+                meta["inception_ts"] = observed_start_ts
             except Exception:
                 meta["last_final_ts"] = 0
+                meta["observed_start_ts"] = None
                 meta["inception_ts"] = None
             return int(removed)
         except Exception:
@@ -1290,12 +1499,35 @@ class CandlestickManager:
                 idx = {"shards": {}, "meta": {}}
             idx.setdefault("shards", {})
             meta = idx.setdefault("meta", {})
+            legacy_history_bounds = (
+                "observed_start_ts" not in meta and "authoritative_start_ts" not in meta
+            )
             meta.setdefault("known_gaps", [])  # list of [start_ts, end_ts]
             meta.setdefault("last_refresh_ms", 0)
             meta.setdefault("last_final_ts", 0)
-            meta.setdefault("inception_ts", None)  # first known candle timestamp
+            observed_start_ts = meta.get("observed_start_ts", meta.get("inception_ts"))
+            meta["observed_start_ts"] = int(observed_start_ts) if observed_start_ts is not None else None
+            meta["inception_ts"] = meta["observed_start_ts"]  # legacy alias for earliest observed candle
+            meta.setdefault("authoritative_start_ts", None)
+            meta.setdefault("authoritative_start_source", None)
             meta.setdefault("inception_ts_probe_ms", 0)
             meta.setdefault("inception_ts_probe_end_ts", 0)
+            migrated_pre_inception = False
+            if legacy_history_bounds and meta.get("authoritative_start_ts") is None:
+                legacy_authoritative_start = self._infer_legacy_authoritative_start_ts(meta)
+                if legacy_authoritative_start is not None:
+                    meta["authoritative_start_ts"] = int(legacy_authoritative_start)
+                    meta["authoritative_start_source"] = "legacy_pre_inception_gap"
+                else:
+                    original_gaps = list(meta.get("known_gaps", []))
+                    retained_gaps = []
+                    for gap in original_gaps:
+                        if isinstance(gap, dict) and str(gap.get("reason", "")) == "pre_inception":
+                            migrated_pre_inception = True
+                            continue
+                        retained_gaps.append(gap)
+                    if migrated_pre_inception:
+                        meta["known_gaps"] = retained_gaps
 
             # Keep index consistent if shard files were deleted.
             removed = self._prune_missing_shards_from_index(idx)
@@ -1309,6 +1541,8 @@ class CandlestickManager:
                 )
             self._index[key] = idx
             self._index_mtime[key] = current_mtime
+            if migrated_pre_inception:
+                self._save_index(symbol, tf=tf_norm)
             self._log(
                 "debug",
                 "index_reload",
@@ -1323,10 +1557,33 @@ class CandlestickManager:
         # Ensure meta keys even for cached entries (in case earlier versions lacked them)
         idx.setdefault("shards", {})
         meta = idx.setdefault("meta", {})
+        legacy_history_bounds = (
+            "observed_start_ts" not in meta and "authoritative_start_ts" not in meta
+        )
         meta.setdefault("known_gaps", [])
         meta.setdefault("last_refresh_ms", 0)
         meta.setdefault("last_final_ts", 0)
-        meta.setdefault("inception_ts", None)  # first known candle timestamp
+        observed_start_ts = meta.get("observed_start_ts", meta.get("inception_ts"))
+        migrated_pre_inception = False
+        meta["observed_start_ts"] = int(observed_start_ts) if observed_start_ts is not None else None
+        meta["inception_ts"] = meta["observed_start_ts"]
+        meta.setdefault("authoritative_start_ts", None)
+        meta.setdefault("authoritative_start_source", None)
+        if legacy_history_bounds and meta.get("authoritative_start_ts") is None:
+            legacy_authoritative_start = self._infer_legacy_authoritative_start_ts(meta)
+            if legacy_authoritative_start is not None:
+                meta["authoritative_start_ts"] = int(legacy_authoritative_start)
+                meta["authoritative_start_source"] = "legacy_pre_inception_gap"
+            else:
+                original_gaps = list(meta.get("known_gaps", []))
+                retained_gaps = []
+                for gap in original_gaps:
+                    if isinstance(gap, dict) and str(gap.get("reason", "")) == "pre_inception":
+                        migrated_pre_inception = True
+                        continue
+                    retained_gaps.append(gap)
+                if migrated_pre_inception:
+                    meta["known_gaps"] = retained_gaps
 
         # Keep cached index consistent if shard files were deleted while running.
         removed = self._prune_missing_shards_from_index(idx)
@@ -1340,6 +1597,8 @@ class CandlestickManager:
             )
         self._index[key] = idx
         self._index_mtime[key] = current_mtime
+        if migrated_pre_inception:
+            self._save_index(symbol, tf=tf_norm)
         if current_mtime is not None:
             self._log("debug", "index_cached", symbol=symbol, timeframe=tf_norm, mtime=current_mtime)
         return idx
@@ -2121,88 +2380,20 @@ class CandlestickManager:
         }
 
     def _materialize_runtime_synthetic_gap(self, symbol: str, through_ts: int) -> int:
-        """Fill finalized-minute gaps in memory only (never persisted to disk).
+        """Deprecated open-tail synthetic materialization path.
 
-        Returns number of synthesized candles added to in-memory cache.
+        Open-ended tail gaps are intentionally not synthesized.  Synthetic zero
+        candles are allowed only for bounded gaps where a real candle exists both
+        before and after the missing span; that is handled by `standardize_gaps()`
+        on the returned runtime array.
         """
-        through_ts = _floor_minute(int(through_ts))
-        if through_ts <= 0:
-            return 0
-
-        arr = _ensure_dtype(self._cache.get(symbol, np.empty((0,), dtype=CANDLE_DTYPE)))
-        if arr.size == 0:
-            # Try loading a broader historical slice so we can seed from last known close.
-            try:
-                seed_start = max(0, through_ts - 30 * 24 * 60 * ONE_MIN_MS)
-                loaded = self._load_from_disk(symbol, seed_start, through_ts, timeframe="1m")
-                if isinstance(loaded, np.ndarray) and loaded.size:
-                    arr = _ensure_dtype(loaded)
-            except Exception as exc:
-                self._log(
-                    "debug",
-                    "runtime_synthetic_seed_load_failed",
-                    symbol=symbol,
-                    error=str(exc),
-                )
-        if arr.size == 0:
-            return 0
-
-        arr = np.sort(arr, order="ts")
-        ts_arr = arr["ts"].astype(np.int64, copy=False)
-        idx = int(np.searchsorted(ts_arr, through_ts, side="right")) - 1
-        if idx < 0:
-            return 0
-
-        last_ts = int(ts_arr[idx])
-        if last_ts >= through_ts:
-            return 0
-
-        # Cap synthesis burst to avoid building enormous in-memory runs if a symbol has
-        # been inactive for a very long time.
-        max_synth = max(1, min(self.max_memory_candles_per_symbol, 24 * 60))
-        first_synth_ts = max(last_ts + ONE_MIN_MS, through_ts - (max_synth - 1) * ONE_MIN_MS)
-        if first_synth_ts > through_ts:
-            return 0
-
-        prev_close = float(arr[idx]["c"])
-        if not math.isfinite(prev_close):
-            return 0
-
-        synth_ts = np.arange(first_synth_ts, through_ts + ONE_MIN_MS, ONE_MIN_MS, dtype=np.int64)
-        if synth_ts.size == 0:
-            return 0
-
-        synth = np.empty((synth_ts.shape[0],), dtype=CANDLE_DTYPE)
-        synth["ts"] = synth_ts
-        synth["o"] = prev_close
-        synth["h"] = prev_close
-        synth["l"] = prev_close
-        synth["c"] = prev_close
-        synth["bv"] = 0.0
-
-        merged = self._merge_overwrite(arr, synth)
-        self._cache[symbol] = merged
-        try:
-            self._enforce_memory_retention(symbol)
-        except Exception as exc:
-            self._log(
-                "debug",
-                "runtime_synthetic_retention_enforcement_failed",
-                symbol=symbol,
-                error=str(exc),
-            )
-        self._track_synthetic_timestamps(symbol, synth_ts.tolist())
-
         self._log(
             "debug",
-            "runtime_synthetic_gap_materialized",
+            "runtime_synthetic_open_tail_skipped",
             symbol=symbol,
-            synthesized=int(synth_ts.shape[0]),
-            first_ts=int(synth_ts[0]),
-            last_ts=int(synth_ts[-1]),
-            seed_last_real_ts=last_ts,
+            through_ts=_floor_minute(int(through_ts)),
         )
-        return int(synth_ts.shape[0])
+        return 0
 
     def _invalidate_ema_cache(self, symbol: str) -> None:
         """Invalidate all cached EMA values for a symbol, forcing recomputation."""
@@ -2260,6 +2451,46 @@ class CandlestickManager:
         merged = combo[keep]
         # Enforce in-memory retention: keep only the latest N candles per symbol (applied by caller after assign)
         return merged
+
+    def _latest_cached_ts_before(
+        self, symbol: str, before_ts: int, *, timeframe: str
+    ) -> Optional[int]:
+        """Return latest known cached candle timestamp before `before_ts` without remote fetch."""
+        tf_norm = self._normalize_timeframe_arg(timeframe, None)
+        threshold = int(before_ts)
+        best: Optional[int] = None
+        if tf_norm == "1m":
+            try:
+                cached = self._cache.get(symbol)
+                if cached is not None and cached.size:
+                    arr = _ensure_dtype(cached)
+                    ts = arr["ts"].astype(np.int64, copy=False)
+                    prior = ts[ts < threshold]
+                    if prior.size:
+                        best = int(np.max(prior))
+            except Exception:
+                pass
+        try:
+            idx = self._ensure_symbol_index(symbol, timeframe=tf_norm)
+            meta_last = idx.get("meta", {}).get("last_final_ts")
+            if meta_last is not None:
+                meta_i = int(meta_last)
+                if 0 < meta_i < threshold:
+                    best = meta_i if best is None else max(best, meta_i)
+            shards = idx.get("shards", {})
+            if isinstance(shards, dict):
+                for shard_meta in shards.values():
+                    if not isinstance(shard_meta, dict):
+                        continue
+                    max_ts = shard_meta.get("max_ts")
+                    if max_ts is None:
+                        continue
+                    max_i = int(max_ts)
+                    if 0 < max_i < threshold:
+                        best = max_i if best is None else max(best, max_i)
+        except Exception:
+            pass
+        return best
 
     # ----- Known gap helpers -----
 
@@ -2704,6 +2935,219 @@ class CandlestickManager:
             "timeframe": tf_norm,
         }
 
+    def get_completed_candle_health(
+        self,
+        symbol: str,
+        windows: Optional[Dict[str, int]] = None,
+        *,
+        now_ms: Optional[int] = None,
+        max_span_log: int = 3,
+    ) -> Dict[str, Any]:
+        """Return read-only diagnostics for completed-candle coverage.
+
+        This method never fetches remote data and never includes the current
+        in-progress timeframe bucket. It inspects disk cache plus runtime 1m
+        cache and reports whether the requested completed candle windows are
+        covered.
+        """
+        ts_now = _utc_now_ms() if now_ms is None else int(now_ms)
+        requested = windows or {"1m": 1, "15m": 1, "1h": 1}
+        normalized_windows: Dict[str, Dict[str, Any]] = {}
+        for tf_raw, raw_spec in requested.items():
+            tf_norm = self._normalize_timeframe_arg(str(tf_raw), None)
+            required = True
+            count_raw = raw_spec
+            if isinstance(raw_spec, dict):
+                count_raw = raw_spec.get("candles", raw_spec.get("required_candles", 1))
+                required = bool(raw_spec.get("required", True))
+            try:
+                count = int(math.ceil(float(count_raw)))
+            except Exception:
+                count = 1
+            normalized_windows[tf_norm] = {"candles": max(1, count), "required": required}
+
+        tf_reports: Dict[str, Dict[str, Any]] = {}
+        overall_ok = True
+        for tf_norm, spec in sorted(
+            normalized_windows.items(), key=lambda item: _tf_to_ms(item[0])
+        ):
+            required_candles = int(spec["candles"])
+            required = bool(spec["required"])
+            step_ms = _tf_to_ms(tf_norm)
+            if step_ms <= 0:
+                step_ms = ONE_MIN_MS
+            latest_expected = (ts_now // step_ms) * step_ms - step_ms
+            if latest_expected < 0:
+                start_ts = 0
+                end_ts = -1
+            else:
+                end_ts = int(latest_expected)
+                start_ts = int(max(0, end_ts - (required_candles - 1) * step_ms))
+
+            disk_arr = np.empty((0,), dtype=CANDLE_DTYPE)
+            runtime_arr = np.empty((0,), dtype=CANDLE_DTYPE)
+            combined = np.empty((0,), dtype=CANDLE_DTYPE)
+            if end_ts >= start_ts:
+                try:
+                    loaded = self._load_from_disk(symbol, start_ts, end_ts, timeframe=tf_norm)
+                    if loaded is not None and loaded.size:
+                        disk_arr = self._slice_ts_range(_ensure_dtype(loaded), start_ts, end_ts)
+                except Exception as exc:
+                    self._log(
+                        "debug",
+                        "candle_health_disk_load_failed",
+                        symbol=symbol,
+                        timeframe=tf_norm,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    disk_arr = np.empty((0,), dtype=CANDLE_DTYPE)
+
+                if step_ms == ONE_MIN_MS:
+                    try:
+                        cached = self._cache.get(symbol)
+                        if cached is not None and cached.size:
+                            runtime_arr = self._slice_ts_range(
+                                _ensure_dtype(cached), start_ts, end_ts
+                            )
+                    except Exception as exc:
+                        self._log(
+                            "debug",
+                            "candle_health_runtime_cache_failed",
+                            symbol=symbol,
+                            timeframe=tf_norm,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
+                        runtime_arr = np.empty((0,), dtype=CANDLE_DTYPE)
+                combined = self._merge_overwrite(disk_arr, runtime_arr)
+                combined = self._slice_ts_range(combined, start_ts, end_ts, assume_sorted=True)
+
+            missing = (
+                []
+                if end_ts < start_ts
+                else (
+                    self._missing_spans(combined, start_ts, end_ts)
+                    if step_ms == ONE_MIN_MS
+                    else self._missing_spans_step(combined, start_ts, end_ts, step_ms)
+                )
+            )
+            missing_candles = int(sum((e - s) // step_ms + 1 for s, e in missing))
+            last_cached_ts: Optional[int] = None
+            if combined.size:
+                last_cached_ts = int(np.max(combined["ts"].astype(np.int64)))
+            last_disk_ts: Optional[int] = None
+            if disk_arr.size:
+                last_disk_ts = int(np.max(disk_arr["ts"].astype(np.int64)))
+            last_runtime_ts: Optional[int] = None
+            if runtime_arr.size:
+                last_runtime_ts = int(np.max(runtime_arr["ts"].astype(np.int64)))
+
+            synthetic_count = 0
+            if step_ms == ONE_MIN_MS:
+                try:
+                    synthetic_count = int(
+                        sum(
+                            1
+                            for ts in self._synthetic_timestamps.get(symbol, set())
+                            if int(start_ts) <= int(ts) <= int(end_ts)
+                        )
+                    )
+                except Exception:
+                    synthetic_count = 0
+
+            top_spans = [
+                {
+                    "start_ts": int(s),
+                    "end_ts": int(e),
+                    "start": self._fmt_ts(int(s)),
+                    "end": self._fmt_ts(int(e)),
+                    "candles": int((e - s) // step_ms + 1),
+                }
+                for s, e in missing[: max(1, int(max_span_log))]
+            ]
+            last_refresh_ms = self.get_last_refresh_ms(symbol) if step_ms == ONE_MIN_MS else 0
+            gap_summary = (
+                self.get_gap_summary(symbol)
+                if step_ms == ONE_MIN_MS
+                else {
+                    "total_gaps": 0,
+                    "total_minutes": 0,
+                    "persistent_gaps": 0,
+                    "retryable_gaps": 0,
+                    "by_reason": {},
+                    "gaps": [],
+                }
+            )
+            coverage_ok = len(missing) == 0
+            open_tail_gap = bool(
+                missing and end_ts >= start_ts and int(missing[-1][1]) >= int(end_ts)
+            )
+            if open_tail_gap and last_cached_ts is None and end_ts >= start_ts:
+                prior_cached_ts = self._latest_cached_ts_before(
+                    symbol, start_ts, timeframe=tf_norm
+                )
+                if prior_cached_ts is not None:
+                    last_cached_ts = int(prior_cached_ts)
+                    if last_disk_ts is None:
+                        last_disk_ts = int(prior_cached_ts)
+            tail_gap_candles = 0
+            if open_tail_gap:
+                if last_cached_ts is None:
+                    tail_gap_candles = int((end_ts - start_ts) // step_ms) + 1
+                else:
+                    tail_gap_candles = int(max(0, (end_ts - int(last_cached_ts)) // step_ms))
+            overall_ok = overall_ok and (coverage_ok or not required)
+            tf_reports[tf_norm] = {
+                "timeframe": tf_norm,
+                "required": bool(required),
+                "period_ms": int(step_ms),
+                "required_candles": int(required_candles),
+                "start_ts": int(start_ts),
+                "end_ts": int(end_ts),
+                "latest_expected_ts": int(latest_expected),
+                "current_in_progress_excluded": True,
+                "coverage_ok": bool(coverage_ok),
+                "loaded_rows": int(combined.shape[0]),
+                "disk_loaded_rows": int(disk_arr.shape[0]),
+                "runtime_loaded_rows": int(runtime_arr.shape[0]),
+                "missing_spans": missing,
+                "missing_spans_preview": top_spans,
+                "missing_candles": int(missing_candles),
+                "open_tail_gap": bool(open_tail_gap),
+                "tail_gap_candles": int(tail_gap_candles),
+                "tail_gap_age_ms": (
+                    int(max(0, latest_expected - int(last_cached_ts)))
+                    if open_tail_gap and last_cached_ts is not None and latest_expected >= 0
+                    else None
+                ),
+                "last_cached_ts": last_cached_ts,
+                "last_cached_age_ms": (
+                    int(max(0, latest_expected - last_cached_ts))
+                    if last_cached_ts is not None and latest_expected >= 0
+                    else None
+                ),
+                "last_disk_ts": last_disk_ts,
+                "last_runtime_ts": last_runtime_ts,
+                "last_refresh_ms": int(last_refresh_ms),
+                "refresh_age_ms": (
+                    int(max(0, ts_now - int(last_refresh_ms))) if int(last_refresh_ms) > 0 else None
+                ),
+                "runtime_synthetic_count": int(synthetic_count),
+                "known_gaps_total": int(gap_summary.get("total_gaps", 0)),
+                "known_gaps_minutes": int(gap_summary.get("total_minutes", 0)),
+                "known_gaps_persistent": int(gap_summary.get("persistent_gaps", 0)),
+                "known_gaps_retryable": int(gap_summary.get("retryable_gaps", 0)),
+                "known_gaps_by_reason": dict(gap_summary.get("by_reason", {}) or {}),
+            }
+
+        return {
+            "symbol": symbol,
+            "generated_ms": int(ts_now),
+            "ok": bool(overall_ok),
+            "timeframes": tf_reports,
+        }
+
     def rebuild_index_for_range(
         self,
         symbol: str,
@@ -2783,7 +3227,7 @@ class CandlestickManager:
 
         # Guard against corrupted refresh timestamps that prevent updates.
         meta = idx.setdefault("meta", {})
-        now = _utc_now_ms()
+        now = self._now_ms()
         try:
             last_refresh = int(meta.get("last_refresh_ms", 0) or 0)
         except Exception:
@@ -2857,33 +3301,162 @@ class CandlestickManager:
         self._index[symbol] = idx
         self._save_index(symbol)
 
-    # ----- Inception tracking -----
+    # ----- Coverage / history-bound tracking -----
+
+    def _infer_legacy_authoritative_start_ts(self, meta: Dict[str, Any]) -> Optional[int]:
+        """Infer authoritative lower bound from legacy inception/pre_inception metadata.
+
+        Old caches used `inception_ts` both as earliest observed candle and as an implicit
+        lower bound when paired with persistent `pre_inception` gaps immediately preceding it.
+        Preserve that learned boundary during migration instead of dropping it.
+        """
+        try:
+            observed_start = meta.get("observed_start_ts", meta.get("inception_ts"))
+            if observed_start is None:
+                return None
+            observed_start = int(observed_start)
+            cutoff_end = observed_start - ONE_MIN_MS
+            for gap in meta.get("known_gaps", []):
+                if not isinstance(gap, dict):
+                    continue
+                if str(gap.get("reason", "")) != "pre_inception":
+                    continue
+                try:
+                    gap_end = int(gap.get("end_ts"))
+                    gap_start = int(gap.get("start_ts"))
+                    retry_count = int(gap.get("retry_count", 0))
+                except Exception:
+                    continue
+                if retry_count < _GAP_MAX_RETRIES:
+                    continue
+                if gap_start < observed_start and gap_end >= cutoff_end:
+                    return observed_start
+        except Exception:
+            return None
+        return None
 
     def _get_inception_ts(self, symbol: str) -> Optional[int]:
-        """Return the known inception timestamp (first candle) for this symbol, or None."""
+        """Return earliest observed candle timestamp for this symbol, or None.
+
+        Historically this field was also used as an authoritative exchange-history lower bound.
+        It now tracks only local observed coverage, while authoritative clipping uses
+        ``authoritative_start_ts``.
+        """
         idx = self._ensure_symbol_index(symbol)
         try:
-            val = idx.get("meta", {}).get("inception_ts")
+            meta = idx.get("meta", {})
+            val = meta.get("observed_start_ts", meta.get("inception_ts"))
             return int(val) if val is not None else None
         except Exception:
             return None
 
     def _set_inception_ts(self, symbol: str, ts: int, *, save: bool = True) -> None:
-        """Set the inception timestamp for this symbol (only if earlier than current or unset)."""
+        """Set earliest observed candle timestamp for this symbol."""
         idx = self._ensure_symbol_index(symbol)
         meta = idx.setdefault("meta", {})
-        current = meta.get("inception_ts")
+        current = meta.get("observed_start_ts", meta.get("inception_ts"))
         # Only update if unset or if new ts is earlier
         if current is None or int(ts) < int(current):
-            meta["inception_ts"] = int(ts)
+            observed_ts = int(ts)
+            meta["observed_start_ts"] = observed_ts
+            meta["inception_ts"] = observed_ts  # legacy alias
+            auth_current = meta.get("authoritative_start_ts")
+            auth_updated = False
+            if auth_current is not None and observed_ts < int(auth_current):
+                meta["authoritative_start_ts"] = observed_ts
+                meta["authoritative_start_source"] = "observed_data"
+                auth_updated = True
             self._index[f"{symbol}::1m"] = idx
             if save:
                 self._save_index(symbol)
-            # If we previously marked ranges as "pre_inception" (persistent), but we now
-            # discovered earlier real data, that metadata becomes stale and can block
-            # future repair/refetch. Trim/remove it best-effort.
+            if auth_updated:
+                # If we previously marked ranges as pre-inception but later observed earlier
+                # real data, that authoritative lower bound became stale.
+                try:
+                    self._prune_pre_inception_gaps(symbol, observed_ts, save=save)
+                except Exception as exc:
+                    self._log(
+                        "warning",
+                        "prune_pre_inception_gaps_failed",
+                        symbol=symbol,
+                        error=str(exc),
+                    )
+            self._log(
+                "debug",
+                "inception_ts_updated",
+                symbol=symbol,
+                old_ts=current,
+                new_ts=observed_ts,
+            )
+
+    def _first_ohlcv_cache_path(self) -> Path:
+        return Path(self.cache_dir) / "first_ohlcv_timestamps_unified_exchange_specific.json"
+
+    def _first_ohlcv_cache_exchange_name(self) -> str:
+        exchange_name = str(self.exchange_name or self._ex_id or "").lower()
+        return _FIRST_OHLCV_EXCHANGE_CACHE_ALIASES.get(exchange_name, exchange_name)
+
+    def _lookup_cached_authoritative_start_ts(self, symbol: str) -> Optional[int]:
+        cache_path = self._first_ohlcv_cache_path()
+        if not cache_path.exists():
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            coin = symbol.split("/")[0].strip()
+            exchange_name = self._first_ohlcv_cache_exchange_name()
+            value = data.get(coin, {}).get(exchange_name)
+            return int(value) if value is not None and float(value) > 0.0 else None
+        except Exception:
+            return None
+
+    def _get_authoritative_start_ts(self, symbol: str) -> Optional[int]:
+        """Return authoritative exchange-history lower bound, if known."""
+        idx = self._ensure_symbol_index(symbol)
+        meta = idx.setdefault("meta", {})
+        try:
+            value = meta.get("authoritative_start_ts")
+            if value is not None:
+                return int(value)
+        except Exception:
+            pass
+
+        cached = self._lookup_cached_authoritative_start_ts(symbol)
+        if cached is not None:
+            self._set_authoritative_start_ts(
+                symbol,
+                cached,
+                source="exchange_specific_cache",
+                save=True,
+            )
+            idx = self._ensure_symbol_index(symbol)
+            value = idx.get("meta", {}).get("authoritative_start_ts")
+            return int(value) if value is not None else None
+        return None
+
+    def _set_authoritative_start_ts(
+        self, symbol: str, ts: int, *, source: str, save: bool = True
+    ) -> None:
+        """Persist authoritative exchange-history lower bound for this symbol."""
+        idx = self._ensure_symbol_index(symbol)
+        meta = idx.setdefault("meta", {})
+        observed_start = self._get_inception_ts(symbol)
+        authoritative_ts = int(ts)
+        authoritative_source = str(source)
+        if observed_start is not None and observed_start < authoritative_ts:
+            authoritative_ts = int(observed_start)
+            authoritative_source = "observed_data"
+        current = meta.get("authoritative_start_ts")
+        if current is None or authoritative_ts < int(current):
+            meta["authoritative_start_ts"] = authoritative_ts
+            meta["authoritative_start_source"] = authoritative_source
+            self._index[f"{symbol}::1m"] = idx
+            if save:
+                self._save_index(symbol)
             try:
-                self._prune_pre_inception_gaps(symbol, int(ts), save=save)
+                self._prune_pre_inception_gaps(symbol, authoritative_ts, save=save)
             except Exception as exc:
                 self._log(
                     "warning",
@@ -2891,13 +3464,6 @@ class CandlestickManager:
                     symbol=symbol,
                     error=str(exc),
                 )
-            self._log(
-                "debug",
-                "inception_ts_updated",
-                symbol=symbol,
-                old_ts=current,
-                new_ts=int(ts),
-            )
 
     def _prune_pre_inception_gaps(self, symbol: str, inception_ts: int, *, save: bool = True) -> None:
         """Trim/remove known gaps with reason='pre_inception' now covered by real data."""
@@ -3013,12 +3579,37 @@ class CandlestickManager:
         When a rate limit is hit, all concurrent requests should pause to avoid
         the thundering herd problem where they all retry simultaneously.
         """
+        self._raise_if_shutdown_requested("rate_limit_backoff")
         now = time.time()
         if now < self._rate_limit_until:
             wait_time = self._rate_limit_until - now
             if wait_time > 0:
                 self._log("debug", "rate_limit_global_wait", wait_seconds=round(wait_time, 2))
-                await asyncio.sleep(wait_time)
+                await self._sleep_interruptible(wait_time, stage="rate_limit_backoff")
+
+    async def _apply_remote_fetch_spacing(self, *, symbol: str, tf: str) -> None:
+        """Pace ccxt OHLCV calls from this manager to avoid local request bursts."""
+        self._raise_if_shutdown_requested("remote_fetch_spacing")
+        interval_ms = float(getattr(self, "_remote_fetch_min_interval_ms", 0.0) or 0.0)
+        if interval_ms <= 0.0:
+            return
+        async with self._remote_fetch_spacing_lock:
+            self._raise_if_shutdown_requested("remote_fetch_spacing")
+            now_ms = _utc_now_ms()
+            last_started_ms = int(getattr(self, "_remote_fetch_last_started_ms", 0) or 0)
+            wait_ms = int(last_started_ms + interval_ms - now_ms)
+            if wait_ms > 0:
+                self._log(
+                    "debug",
+                    "remote_fetch_spacing_wait",
+                    symbol=symbol,
+                    tf=tf,
+                    wait_ms=wait_ms,
+                    interval_ms=int(interval_ms),
+                )
+                await self._sleep_interruptible(wait_ms / 1000.0, stage="remote_fetch_spacing")
+                now_ms = _utc_now_ms()
+            self._remote_fetch_last_started_ms = int(now_ms)
 
     async def _set_global_rate_limit(self, backoff_seconds: float = 5.0) -> None:
         """Set a global rate limit backoff that affects all concurrent requests."""
@@ -3046,6 +3637,7 @@ class CandlestickManager:
         tf: Optional[str] = None,
     ) -> list:
         """Fetch a single OHLCV page from ccxt, with basic retry/backoff."""
+        self._raise_if_shutdown_requested("ccxt_fetch_ohlcv_once")
         if self.exchange is None:
             return []
         # Determine method to call (exchange instance or module)
@@ -3060,6 +3652,7 @@ class CandlestickManager:
         backoff = 1.0 if is_bybit else 0.5
         backoff_cap = 20.0 if is_bybit else 8.0
         for attempt in range(max_attempts):
+            self._raise_if_shutdown_requested("ccxt_fetch_ohlcv_once")
             # Wait for global rate limit backoff if one is active
             await self._apply_rate_limit_backoff()
             try:
@@ -3075,6 +3668,7 @@ class CandlestickManager:
                         and "okx" not in exid
                         and "bybit" not in exid
                         and "kucoin" not in exid
+                        and "gateio" not in exid
                     ):
                         params["until"] = int(end_exclusive_ms) - 1
 
@@ -3084,6 +3678,7 @@ class CandlestickManager:
                     params.setdefault("category", "linear")
 
                 tf_norm = self._normalize_timeframe_arg(timeframe, tf, default=self._ccxt_timeframe)
+                await self._apply_remote_fetch_spacing(symbol=symbol, tf=tf_norm)
                 t0 = time.monotonic()
                 self._emit_remote_fetch(
                     {
@@ -3187,8 +3782,8 @@ class CandlestickManager:
                         "error_repr": err_repr,
                     }
                 )
-                self._log(
-                    "warning",
+                self._throttled_warning(
+                    f"ccxt_fetch_ohlcv_failed:{symbol}:{tf}:{err_type}",
                     "ccxt_fetch_ohlcv_failed",
                     symbol=symbol,
                     tf=str(tf) if tf is not None else None,
@@ -3227,7 +3822,7 @@ class CandlestickManager:
                     )
                 ):
                     sleep_s = max(sleep_s, 2.0)
-                await asyncio.sleep(sleep_s)
+                await self._sleep_interruptible(sleep_s, stage="ccxt_fetch_ohlcv_retry")
                 backoff = min(backoff * 2.0, backoff_cap)
         return []
 
@@ -3306,6 +3901,7 @@ class CandlestickManager:
         """
         if self.exchange is None:
             return np.empty((0,), dtype=CANDLE_DTYPE)
+        self._raise_if_shutdown_requested("fetch_ohlcv_paginated")
         since_start = int(since_ms)
         since = int(since_ms)
         end_excl = int(end_exclusive_ms)
@@ -3322,6 +3918,7 @@ class CandlestickManager:
         prev_last_ts: Optional[int] = None
         total_span = max(1, end_excl - since_start)
         while since < end_excl:
+            self._raise_if_shutdown_requested("fetch_ohlcv_paginated")
             # Bitget auto-probe: try a larger limit once to see if the API supports it.
             probe_limit = None
             if (
@@ -3428,7 +4025,11 @@ class CandlestickManager:
                     on_batch(arr)
                 except Exception as on_batch_err:
                     self.log.error(
-                        "on_batch callback failed; stopping pagination",
+                        "on_batch callback failed; stopping pagination | symbol=%s timeframe=%s error_type=%s error=%s",
+                        symbol,
+                        tf_norm,
+                        type(on_batch_err).__name__,
+                        on_batch_err,
                         extra={
                             "symbol": symbol,
                             "timeframe": tf_norm,
@@ -3468,8 +4069,12 @@ class CandlestickManager:
                 break
             since = new_since
             prev_last_ts = last_ts
-        self.log.debug(
-            f"paginated fetch done exchange={self._ex_id} symbol={symbol} tf={tf_norm} rows={sum(a.shape[0] for a in all_rows) if all_rows else 0}"
+        self._log(
+            "debug",
+            "ccxt_fetch_paginated_done",
+            symbol=symbol,
+            tf=tf_norm,
+            rows=sum(a.shape[0] for a in all_rows) if all_rows else 0,
         )
         if not all_rows:
             return np.empty((0,), dtype=CANDLE_DTYPE)
@@ -3485,6 +4090,7 @@ class CandlestickManager:
         end_ts: Optional[int] = None,
         strict: bool = False,
         fill_leading_gaps: bool = False,
+        fill_trailing_gaps: bool = True,
         assume_sorted: bool = False,
         symbol: Optional[str] = None,
     ) -> np.ndarray:
@@ -3505,6 +4111,10 @@ class CandlestickManager:
             If False (default), do NOT synthesize candles before the first real data point.
             This prevents creating fake flat data when data doesn't exist at start_ts.
             If True, forward-fill from first available candle to fill leading gaps.
+        fill_trailing_gaps : bool
+            If False, do NOT synthesize an open-ended tail after the last real candle.
+            Missing spans are synthesized only when bounded by real candles before
+            and after the gap.
         assume_sorted : bool
             If True, skip sorting (caller guarantees array is already sorted by ts).
         """
@@ -3543,7 +4153,21 @@ class CandlestickManager:
                 )
             effective_lo = _floor_minute(first_real_ts)
 
-        expected = np.arange(effective_lo, hi + ONE_MIN_MS, ONE_MIN_MS, dtype=np.int64)
+        effective_hi = hi
+        if not fill_trailing_gaps and last_real_ts < hi:
+            trailing_gap_minutes = (hi - last_real_ts) // ONE_MIN_MS
+            if trailing_gap_minutes > 0:
+                self._record_skipped_trailing_gap(
+                    symbol=symbol,
+                    requested_end_ts=hi,
+                    actual_end_ts=last_real_ts,
+                    skipped_minutes=int(trailing_gap_minutes),
+                )
+            effective_hi = _floor_minute(last_real_ts)
+        if effective_hi < effective_lo:
+            return np.empty((0,), dtype=CANDLE_DTYPE)
+
+        expected = np.arange(effective_lo, effective_hi + ONE_MIN_MS, ONE_MIN_MS, dtype=np.int64)
         # Map from ts to row index in a
         pos = {int(t): i for i, t in enumerate(ts_arr)}
 
@@ -3551,16 +4175,16 @@ class CandlestickManager:
             # In strict mode: do not synthesize zero-candles.
             # If there are gaps, log a warning and return whatever real candles exist in range.
             i0 = int(np.searchsorted(ts_arr, effective_lo, side="left"))
-            i1 = int(np.searchsorted(ts_arr, hi, side="right"))
+            i1 = int(np.searchsorted(ts_arr, effective_hi, side="right"))
             missing_count = 0
             try:
-                expected_len = int((hi - effective_lo) // ONE_MIN_MS) + 1
+                expected_len = int((effective_hi - effective_lo) // ONE_MIN_MS) + 1
                 slice_ts = ts_arr[i0:i1].astype(np.int64, copy=False)
                 if slice_ts.size:
                     # Missing at head + tail + internal gaps (but NOT leading gaps if not filling)
                     if fill_leading_gaps:
                         missing_count += int((int(slice_ts[0]) - effective_lo) // ONE_MIN_MS)
-                    missing_count += int((hi - int(slice_ts[-1])) // ONE_MIN_MS)
+                    missing_count += int((effective_hi - int(slice_ts[-1])) // ONE_MIN_MS)
                     if slice_ts.size > 1:
                         diffs = np.diff(slice_ts)
                         gaps = diffs[diffs > ONE_MIN_MS]
@@ -3683,16 +4307,30 @@ class CandlestickManager:
                             "%Y-%m-%dT%H:%M"
                         )
                         ts_info = f"{first_dt} to {last_dt}"
-                    # Use DEBUG for individual gap warnings - the batch summary at startup is enough at WARNING
-                    # Only use WARNING for truly exceptional situations (gaps > 1000 candles during live operation)
-                    log_fn = self.log.warning if synthesized_count > 1000 else self.log.debug
+                    # KuCoin futures returns sparse no-trade minutes, so even large individual
+                    # synthetic runs are expected. Other exchanges keep WARNING for large gaps.
+                    sparse_expected = self._sparse_ohlcv_gaps_are_expected()
+                    log_fn = (
+                        self.log.debug
+                        if sparse_expected
+                        else self.log.warning
+                        if synthesized_count > 1000
+                        else self.log.debug
+                    )
+                    suffix = (
+                        " | expected on sparse KuCoin no-trade minutes"
+                        if sparse_expected
+                        else ""
+                    )
                     log_fn(
-                        "[candle] %s: synthesized %d zero-candle%s at %s (no data for requested minutes) using prev_close=%.6f",
-                        symbol,
+                        "[candle] %s: synthesized %d zero-candle%s at %s "
+                        "(no data for requested minutes) using prev_close=%.6f%s",
+                        _log_symbol(symbol),
                         synthesized_count,
                         "s" if synthesized_count > 1 else "",
                         ts_info,
                         prev_close if prev_close is not None else 0.0,
+                        suffix,
                     )
 
         if not out_rows:
@@ -4285,137 +4923,59 @@ class CandlestickManager:
         except Exception:
             allow_pre_inception_for_stock_perp = False
 
-        # Skip fetches before known inception date - but don't trust inception_ts blindly.
-        # If inception_ts would skip the entire requested range, attempt a light probe
-        # before treating it as authoritative.
-        inception_ts = self._get_inception_ts(symbol)
+        # Clip/skip only when we know an authoritative lower bound for exchange-available
+        # history. Earliest cached shard is observed local coverage, not proof of
+        # exchange inception, so it must not suppress earlier backfills.
+        authoritative_start_ts = self._get_authoritative_start_ts(symbol)
         if (
-            inception_ts is not None
-            and start_ts < inception_ts
+            authoritative_start_ts is not None
+            and start_ts < authoritative_start_ts
             and not allow_pre_inception_for_stock_perp
         ):
-            if inception_ts > end_ts:
-                updated = False
-                shard_min = self._get_min_shard_ts(symbol)
-                if shard_min is not None and shard_min < inception_ts:
-                    self._log(
-                        "info",
-                        "inception_ts_updated_from_shards",
-                        symbol=symbol,
-                        cached_inception_ts=inception_ts,
-                        shard_min_ts=shard_min,
-                    )
-                    self._set_inception_ts(symbol, shard_min, save=True)
-                    inception_ts = self._get_inception_ts(symbol)
-                    updated = True
-
-                # If no shard evidence, do a soft archive probe (throttled) for end_ts day.
-                probed = False
-                probe_hit = False
-                if not updated and self._archive_supported():
-                    now = _utc_now_ms()
-                    last_probe_ms, last_probe_end_ts = self._get_inception_probe_meta(symbol)
-                    probe_cooldown_ms = 6 * 60 * 60 * 1000  # 6 hours
-                    if (now - last_probe_ms) > probe_cooldown_ms or int(end_ts) > int(
-                        last_probe_end_ts
-                    ):
-                        day_key = self._date_key(end_ts)
-                        _, day_end = self._date_range_of_key(day_key)
-                        archive_freshness_hours = 72
-                        archive_cutoff_ms = _utc_now_ms() - (archive_freshness_hours * 3600 * 1000)
-                        if day_end <= archive_cutoff_ms:
-                            probed = True
-                            try:
-                                self._log(
-                                    "debug",
-                                    "inception_ts_probe_start",
-                                    symbol=symbol,
-                                    day=day_key,
-                                )
-                                arr = await self._archive_fetch_day(symbol, day_key)
-                            except Exception as exc:
-                                arr = None
-                                self._log(
-                                    "warning",
-                                    "inception_ts_probe_failed",
-                                    symbol=symbol,
-                                    day=day_key,
-                                    error=str(exc),
-                                )
-                            if isinstance(arr, np.ndarray) and arr.size:
-                                probe_hit = True
-                                try:
-                                    self._persist_batch(
-                                        symbol,
-                                        arr,
-                                        timeframe="1m",
-                                        merge_cache=True,
-                                        last_refresh_ms=now,
-                                        defer_index=True,
-                                        skip_memory_retention=True,
-                                    )
-                                    self.flush_deferred_index(symbol, tf="1m")
-                                except Exception as exc:
-                                    self._log(
-                                        "warning",
-                                        "inception_ts_probe_persist_failed",
-                                        symbol=symbol,
-                                        day=day_key,
-                                        error=str(exc),
-                                    )
-                                inception_ts = self._get_inception_ts(symbol)
-                                updated = inception_ts is not None
-                            # Record probe attempt regardless of outcome
-                            self._set_inception_probe_meta(symbol, now, int(end_ts), save=True)
-                # If inception_ts still excludes the whole range, mark pre_inception gaps and return
-                if inception_ts is not None and inception_ts > end_ts:
-                    pre_inception_end = min(inception_ts - ONE_MIN_MS, end_ts)
-                    if start_ts <= pre_inception_end:
-                        retry_count = (
-                            _GAP_MAX_RETRIES
-                            if probed and not probe_hit
-                            else max(0, _GAP_MAX_RETRIES - 1)
-                        )
-                        self._add_known_gap(
-                            symbol,
-                            start_ts,
-                            pre_inception_end,
-                            reason="pre_inception",
-                            retry_count=retry_count,
-                        )
-                        self._log(
-                            "debug",
-                            "skip_pre_inception_fetch",
-                            symbol=symbol,
-                            original_start=start_ts,
-                            inception_ts=inception_ts,
-                            clipped_start=inception_ts,
-                        )
-                    return  # Nothing left to fetch
-
-            if inception_ts is not None and start_ts < inception_ts:
-                # inception_ts is within the requested range - trust it and clip
-                pre_inception_end = min(inception_ts - ONE_MIN_MS, end_ts)
+            if authoritative_start_ts > end_ts:
+                pre_inception_end = min(authoritative_start_ts - ONE_MIN_MS, end_ts)
                 if start_ts <= pre_inception_end:
                     self._add_known_gap(
                         symbol,
                         start_ts,
                         pre_inception_end,
                         reason="pre_inception",
-                        retry_count=_GAP_MAX_RETRIES,  # Mark as persistent immediately
+                        retry_count=_GAP_MAX_RETRIES,
                     )
                     self._log(
-                        "debug",
+                        "warning",
                         "skip_pre_inception_fetch",
                         symbol=symbol,
                         original_start=start_ts,
-                        inception_ts=inception_ts,
-                        clipped_start=inception_ts,
+                        original_end=end_ts,
+                        authoritative_start_ts=authoritative_start_ts,
+                        uncovered_start=start_ts,
+                        uncovered_end=pre_inception_end,
                     )
-                # Clip to inception date
-                start_ts = inception_ts
-                if start_ts > end_ts:
-                    return  # Nothing left to fetch
+                return
+
+            pre_inception_end = min(authoritative_start_ts - ONE_MIN_MS, end_ts)
+            if start_ts <= pre_inception_end:
+                self._add_known_gap(
+                    symbol,
+                    start_ts,
+                    pre_inception_end,
+                    reason="pre_inception",
+                    retry_count=_GAP_MAX_RETRIES,
+                )
+                self._log(
+                    "warning",
+                    "skip_pre_inception_fetch",
+                    symbol=symbol,
+                    original_start=start_ts,
+                    original_end=end_ts,
+                    authoritative_start_ts=authoritative_start_ts,
+                    uncovered_start=start_ts,
+                    uncovered_end=pre_inception_end,
+                )
+            start_ts = authoritative_start_ts
+            if start_ts > end_ts:
+                return  # Nothing left to fetch
 
         day_map = self._date_keys_between(start_ts, end_ts)
         shard_paths = self._iter_shard_paths(symbol, tf="1m")
@@ -4737,6 +5297,7 @@ class CandlestickManager:
         fill_leading_gaps: bool = False,
         skip_historical_gap_fill: bool = False,
         max_lookback_candles: Optional[int] = None,
+        allow_remote_fetch: bool = True,
     ) -> np.ndarray:
         """Return candles in inclusive range [start_ts, end_ts].
 
@@ -4755,14 +5316,18 @@ class CandlestickManager:
           recent data is sufficient and filling old gaps wastes time.
         - If `max_lookback_candles` is set: clamp start_ts so the request spans
           at most that many candles ending at end_ts (per timeframe).
+        - If `allow_remote_fetch` is False: serve only local memory/disk data and
+          do not call exchange/archive fetchers. This is used for non-critical
+          live forager candidates where cache misses should not block trading.
         """
+        self._raise_if_shutdown_requested("get_candles")
         if max_age_ms is not None and max_age_ms < 0:
             raise ValueError("max_age_ms cannot be negative")
 
         # Force refetch: clear known gaps in the requested range
         if force_refetch_gaps:
             # Compute actual range first
-            now = _utc_now_ms()
+            now = self._now_ms()
             eff_end = end_ts if end_ts is not None else _floor_minute(now)
             eff_start = (
                 start_ts
@@ -4787,7 +5352,7 @@ class CandlestickManager:
             # parse timeframe to ms (bucket size)
             period_ms = _tf_to_ms(out_tf)
             if period_ms > ONE_MIN_MS and self.exchange is not None:
-                now = _utc_now_ms()
+                now = self._now_ms()
                 finalized_end = (int(now) // period_ms) * period_ms - period_ms
                 if end_ts is None:
                     end_ts = finalized_end
@@ -4876,6 +5441,13 @@ class CandlestickManager:
                             self._tf_range_cache[symbol] = sym_cache
                             return out_disk
 
+                if not allow_remote_fetch:
+                    return (
+                        self._slice_ts_range(disk_arr, start_ts, end_ts)
+                        if isinstance(disk_arr, np.ndarray) and disk_arr.size
+                        else np.empty((0,), dtype=CANDLE_DTYPE)
+                    )
+
                 end_excl = int(end_ts) + period_ms
 
                 async with self._acquire_fetch_lock(symbol, out_tf):
@@ -4959,7 +5531,7 @@ class CandlestickManager:
                     self._tf_range_cache[symbol] = sym_cache
                     return out
 
-        now = _utc_now_ms()
+        now = self._now_ms()
         if end_ts is None:
             # Use last completed minute as inclusive end (exclude current in-progress minute)
             end_ts = _floor_minute(now) - ONE_MIN_MS
@@ -4988,7 +5560,9 @@ class CandlestickManager:
         allow_fetch_present = True
         skip_present_fetch_due_to_ttl = False
         latest_finalized = _floor_minute(now) - ONE_MIN_MS
-        if end_ts >= latest_finalized and self.exchange is not None:
+        if not allow_remote_fetch:
+            allow_fetch_present = False
+        if allow_remote_fetch and end_ts >= latest_finalized and self.exchange is not None:
             if max_age_ms == 0:
                 self._log(
                     "debug",
@@ -5059,22 +5633,41 @@ class CandlestickManager:
         fully_covered = _is_fully_covered(sub, start_ts, end_ts)
         if skip_present_fetch_due_to_ttl and not fully_covered:
             # TTL says data is fresh, but coverage is incomplete for requested range.
-            # Allow present fetch/gap fill to try and repair missing spans.
+            # Allow present fetch/gap fill to repair real older gaps, but do not
+            # defeat TTL for the normal one-candle tail gap seen at minute boundaries.
             allow_fetch_present = True
             try:
                 missing_now = self._missing_spans(sub, start_ts, end_ts)
-                self._log(
-                    "debug",
-                    "ttl_bypass_missing_coverage",
-                    symbol=symbol,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                    max_age_ms=max_age_ms,
-                    last_refresh_ms=self._get_last_refresh_ms(symbol),
-                    missing_spans=len(missing_now),
+                trailing_one_candle_gap = (
+                    len(missing_now) == 1
+                    and int(missing_now[0][0]) == int(end_ts)
+                    and int(missing_now[0][1]) == int(end_ts)
+                    and end_ts >= latest_finalized
                 )
+                if trailing_one_candle_gap:
+                    allow_fetch_present = False
+                    self._log(
+                        "debug",
+                        "ttl_skip_trailing_present_gap",
+                        symbol=symbol,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        max_age_ms=max_age_ms,
+                        last_refresh_ms=self._get_last_refresh_ms(symbol),
+                    )
+                else:
+                    self._log(
+                        "debug",
+                        "ttl_bypass_missing_coverage",
+                        symbol=symbol,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        max_age_ms=max_age_ms,
+                        last_refresh_ms=self._get_last_refresh_ms(symbol),
+                        missing_spans=len(missing_now),
+                    )
             except Exception:
-                pass
+                allow_fetch_present = True
 
         # For historical ranges, if we don't have shards for all days yet, fetch
         # exactly the range and persist shards for future calls.
@@ -5099,6 +5692,8 @@ class CandlestickManager:
                 sub_size=sub.size if hasattr(sub, "size") else 0,
             )
         if (
+            allow_remote_fetch
+            and
             self.exchange is not None
             and span_minutes > large_span_threshold
             and not fully_covered
@@ -5128,15 +5723,16 @@ class CandlestickManager:
                 fully_covered = _is_fully_covered(sub, start_ts, end_ts)
 
         # Treat ranges ending exactly at the latest finalized minute as present-touching
-        # UNLESS the span is large (>2 days) and not fully covered - then treat as historical
-        # to trigger gap filling via CCXT. This fixes warmup requests that span 31 days but
-        # were skipping gap detection because end_ts == latest_finalized.
+        # for trailing synthesis purposes.  Large warmup windows may still need historical
+        # gap fetches, but that must not grant permission to synthesize an unbounded tail.
         historical = end_ts < end_finalized
+        fetch_historical_gaps = historical
         if (
             not historical
             and span_minutes > large_span_threshold
             and not fully_covered
             and self.exchange is not None
+            and allow_remote_fetch
         ):
             self._log(
                 "debug",
@@ -5145,8 +5741,13 @@ class CandlestickManager:
                 span_minutes=int(span_minutes),
                 fully_covered=fully_covered,
             )
-            historical = True
-        if self.exchange is not None and historical and not skip_historical_gap_fill:
+            fetch_historical_gaps = True
+        if (
+            allow_remote_fetch
+            and self.exchange is not None
+            and fetch_historical_gaps
+            and not skip_historical_gap_fill
+        ):
             # If the requested historical window is not fully covered in memory,
             # attempt to fetch unknown missing spans, regardless of shard presence.
             # Skip this if skip_historical_gap_fill is set (e.g., live warmup where
@@ -5164,6 +5765,31 @@ class CandlestickManager:
                         gap_end = min(end_ts, earliest - ONE_MIN_MS)
                         if adj_start_ts <= gap_end:
                             self._add_known_gap(symbol, int(adj_start_ts), int(gap_end))
+                        adj_start_ts = max(adj_start_ts, earliest)
+                if "gateio" in exid:
+                    earliest = int(
+                        end_finalized - ONE_MIN_MS * (_GATEIO_RECENT_1M_LIMIT_CANDLES - 1)
+                    )
+                    if adj_start_ts < earliest:
+                        gap_end = min(end_ts, earliest - ONE_MIN_MS)
+                        if adj_start_ts <= gap_end:
+                            self._record_verified_gap(
+                                symbol,
+                                int(adj_start_ts),
+                                int(gap_end),
+                                reason=GAP_REASON_NO_ARCHIVE,
+                            )
+                        if symbol not in self._gateio_recent_window_clip_warned:
+                            self._log(
+                                "warning",
+                                "gateio_ohlcv_recent_window_clipped",
+                                symbol=symbol,
+                                requested_start_ts=int(start_ts),
+                                requested_end_ts=int(end_ts),
+                                earliest_fetchable_ts=int(earliest),
+                                reason="gateio_public_1m_ohlcv_recent_window",
+                            )
+                            self._gateio_recent_window_clip_warned.add(symbol)
                         adj_start_ts = max(adj_start_ts, earliest)
 
                 # Skip fetch if all missing spans are already known persistent gaps
@@ -5372,13 +5998,16 @@ class CandlestickManager:
                             )
                             sub = self._slice_ts_range(arr, start_ts, end_ts) if arr.size else arr
                             still_missing = self._missing_spans(sub, start_ts, end_ts)
-                            # Re-fetch inception_ts after archive prefetch (may have been discovered)
-                            inception_ts = self._get_inception_ts(symbol)
+                            # Re-fetch authoritative lower bound after archive prefetch.
+                            authoritative_start_ts = self._get_authoritative_start_ts(symbol)
                             for s, e in still_missing:
                                 if not span_in_persistent_gap(s, e):
-                                    # If gap is before known inception, mark as pre_inception
-                                    # immediately (no retries, no warning)
-                                    if inception_ts is not None and e < inception_ts:
+                                    # Only mark pre_inception when we know a real authoritative
+                                    # lower bound for exchange-available history.
+                                    if (
+                                        authoritative_start_ts is not None
+                                        and e < authoritative_start_ts
+                                    ):
                                         self._add_known_gap(
                                             symbol,
                                             s,
@@ -5446,6 +6075,9 @@ class CandlestickManager:
 
                             def _persist_present_batch(batch: np.ndarray) -> None:
                                 nonlocal persisted_batches
+                                batch = self._slice_ts_range(_ensure_dtype(batch), start_ts, end_ts)
+                                if not batch.size:
+                                    return
                                 persisted_batches = True
                                 self._persist_batch(
                                     symbol,
@@ -5468,6 +6100,7 @@ class CandlestickManager:
                                     fetch_start,
                                     end_excl,
                                 )
+                            fetched = self._slice_ts_range(_ensure_dtype(fetched), start_ts, end_ts)
                             if fetched.size and not persisted_batches:
                                 self._persist_batch(
                                     symbol,
@@ -5522,6 +6155,9 @@ class CandlestickManager:
 
                     def _persist_tail_batch(batch: np.ndarray) -> None:
                         nonlocal persisted_batches
+                        batch = self._slice_ts_range(_ensure_dtype(batch), start_ts, end_ts)
+                        if not batch.size:
+                            return
                         persisted_batches = True
                         self._persist_batch(
                             symbol,
@@ -5544,6 +6180,7 @@ class CandlestickManager:
                             fetch_start,
                             end_excl_range,
                         )
+                    fetched = self._slice_ts_range(_ensure_dtype(fetched), start_ts, end_ts)
                     if fetched.size == 0:
                         break
                     if not persisted_batches:
@@ -5602,6 +6239,9 @@ class CandlestickManager:
 
                         def _persist_gap_batch(batch: np.ndarray) -> None:
                             nonlocal persisted_batches
+                            batch = self._slice_ts_range(_ensure_dtype(batch), start_ts, end_ts)
+                            if not batch.size:
+                                return
                             persisted_batches = True
                             self._persist_batch(
                                 symbol,
@@ -5626,6 +6266,7 @@ class CandlestickManager:
                             )
                         attempts += 1
                         attempted.append((s, e))
+                        fetched = self._slice_ts_range(_ensure_dtype(fetched), start_ts, end_ts)
                         if fetched.size:
                             if not persisted_batches:
                                 self._persist_batch(
@@ -5647,16 +6288,6 @@ class CandlestickManager:
                     for ms, me in still_missing:
                         if not (e < ms or s > me):
                             self._add_known_gap(symbol, max(s, ms), min(e, me))
-
-        # Present-touching runtime path: if there were no trades in completed minutes,
-        # materialize zero-volume candles in RAM (not persisted).
-        if self.exchange is not None and not strict and end_ts >= latest_finalized:
-            synth_through = min(int(end_ts), int(latest_finalized))
-            if synth_through >= int(start_ts):
-                synthesized = self._materialize_runtime_synthetic_gap(symbol, synth_through)
-                if synthesized > 0:
-                    arr = _ensure_dtype(self._cache.get(symbol, np.empty((0,), dtype=CANDLE_DTYPE)))
-                    sub = self._slice_ts_range(arr, start_ts, end_ts) if arr.size else arr
 
         # Standardize gaps: synthesize zero-candles where missing.
         # To help seed forward-fill, include one candle before start_ts if available.
@@ -5681,6 +6312,7 @@ class CandlestickManager:
             end_ts=end_ts,
             strict=strict,
             fill_leading_gaps=fill_leading_gaps,
+            fill_trailing_gaps=end_ts < latest_finalized,
             assume_sorted=True,
             symbol=symbol,
         )
@@ -5691,241 +6323,69 @@ class CandlestickManager:
 
         return result
 
-    async def get_current_close(self, symbol: str, max_age_ms: Optional[int] = None) -> float:
-        """Return latest close of the current in-progress minute for `symbol`.
+    async def get_latest_completed_close(
+        self, symbol: str, max_age_ms: Optional[int] = None
+    ) -> float:
+        """Return the close of the latest completed 1m candle for `symbol`.
 
-        Prefers candles over tickers:
-        - Cached current close within TTL
-        - Fresh in-memory current-minute candle
-        - get_candles for the current minute
-        - As last resort: fetch_ticker
-        - Fallback: last finalized cached close
+        CandlestickManager is completed-candle-only.  It does not fetch, cache,
+        merge, or persist current in-progress candles, and it does not use ticker
+        endpoints as live price truth.  Current bid/ask/last belongs in
+        MarketSnapshotProvider.
         """
         if max_age_ms is not None and max_age_ms < 0:
             raise ValueError("max_age_ms cannot be negative")
-        now = _utc_now_ms()
-        end_current = _floor_minute(now)
-
-        # 1) TTL cache
-        if max_age_ms is not None and max_age_ms > 0:
-            prev = self._current_close_cache.get(symbol)
-            if prev is not None:
-                price, updated = prev
-                if (now - int(updated)) <= int(max_age_ms):
-                    self._log("debug", "get_current_close_cache_hit", symbol=symbol)
-                    return float(price)
-
-        price: Optional[float] = None
-
-        # 2) In-memory current-minute candle fresh enough
-        try:
-            arr = self._cache.get(symbol)
-            if arr is not None and arr.size:
-                arr_sorted = np.sort(_ensure_dtype(arr), order="ts")
-                last_ts = int(arr_sorted[-1]["ts"])
-                if last_ts == end_current:
-                    fresh_enough = True
-                    if max_age_ms is not None and max_age_ms > 0:
-                        last_refresh = self._get_last_refresh_ms(symbol)
-                        fresh_enough = (now - int(last_refresh)) <= int(max_age_ms)
-                    if fresh_enough:
-                        price = float(arr_sorted[-1]["c"])
-                        self._current_close_cache[symbol] = (price, now)
-                        self._log("debug", "get_current_close_mem_candle", symbol=symbol)
-                        return price
-        except Exception:
-            pass
-
-        # 3) Use candles API to get current minute
-        got = None
-        try:
-            self._log(
-                "debug",
-                "get_current_close_via_candles",
-                symbol=symbol,
-                start_ts=end_current,
-                end_ts=end_current,
-            )
-            got = await self.get_candles(
-                symbol,
-                start_ts=end_current,
-                end_ts=end_current,
-                max_age_ms=max_age_ms,
-                timeframe=None,
-                strict=False,
-            )
-            if got is not None and got.size:
-                got_sorted = np.sort(_ensure_dtype(got), order="ts")
-                price = float(got_sorted[-1]["c"])
-                self._current_close_cache[symbol] = (price, now)
-                self._log("debug", "get_current_close_from_candles", symbol=symbol)
-                return price
-        except Exception:
-            pass
-
-        if got is None or got.size == 0:
-            try:
-                last_ref = self._get_last_refresh_ms(symbol)
-            except Exception:
-                last_ref = 0
-            # If we have a recent refresh (or TTL not enforced), fall back to last finalized candle
-            # to avoid redundant tail fetches. Treat max_age_ms=None as no TTL barrier.
-            ttl_ok = True
-            if max_age_ms is not None and max_age_ms > 0:
-                ttl_ok = (now - int(last_ref)) <= int(max_age_ms)
-            if last_ref and ttl_ok:
-                last_final = int(end_current - ONE_MIN_MS)
-                if last_final >= 0:
-                    try:
-                        got_prev = await self.get_candles(
-                            symbol,
-                            start_ts=last_final,
-                            end_ts=last_final,
-                            max_age_ms=max_age_ms,
-                            timeframe=None,
-                            strict=False,
-                        )
-                        if got_prev is not None and got_prev.size:
-                            got_prev_sorted = np.sort(_ensure_dtype(got_prev), order="ts")
-                            price = float(got_prev_sorted[-1]["c"])
-                            self._current_close_cache[symbol] = (price, now)
-                            self._log(
-                                "debug",
-                                "get_current_close_from_candles_finalized",
-                                symbol=symbol,
-                                ts=int(got_prev_sorted[-1]["ts"]),
-                            )
-                            return price
-                    except Exception:
-                        pass
-
-        # 3b) Directly fetch a small tail window via OHLCV (with cross-process lock) and merge to cache
-        if self.exchange is not None:
-            try:
-                async with self._acquire_fetch_lock(symbol, "1m"):
-                    now_locked = _utc_now_ms()
-                    end_current_locked = _floor_minute(now_locked)
-                    last_final_locked = end_current_locked - ONE_MIN_MS
-
-                    # Refresh cache from disk before deciding to fetch
-                    try:
-                        self._load_from_disk(
-                            symbol, last_final_locked, end_current_locked, timeframe="1m"
-                        )
-                    except Exception:
-                        pass
-
-                    arr_cache = self._cache.get(symbol)
-                    if arr_cache is not None and arr_cache.size:
-                        arr_sorted = np.sort(_ensure_dtype(arr_cache), order="ts")
-                        last_ts = int(arr_sorted[-1]["ts"])
-                        if last_ts >= end_current_locked:
-                            price = float(arr_sorted[-1]["c"])
-                            self._current_close_cache[symbol] = (price, now_locked)
-                            self._set_last_refresh_meta(symbol, last_refresh_ms=now_locked)
-                            self._log(
-                                "debug",
-                                "get_current_close_mem_candle_locked",
-                                symbol=symbol,
-                            )
-                            return price
-                        if last_ts >= last_final_locked:
-                            price = float(arr_sorted[-1]["c"])
-                            self._current_close_cache[symbol] = (price, now_locked)
-                            self._log(
-                                "debug",
-                                "get_current_close_from_candles_finalized_locked",
-                                symbol=symbol,
-                                ts=last_ts,
-                            )
-                            return price
-
-                    n = int(self.overlap_candles) if getattr(self, "overlap_candles", 0) else 1
-                    if n <= 0:
-                        n = 1
-                    try:
-                        n = int(min(max(1, n), int(self._ccxt_limit_default)))
-                    except Exception:
-                        n = max(1, n)
-                    since_tail = max(0, int(end_current_locked) - ONE_MIN_MS * (n - 1))
-                    self._log(
-                        "debug",
-                        "ccxt_fetch_ohlcv_tail_for_current_close",
-                        symbol=symbol,
-                        tf="1m",
-                        since_ts=since_tail,
-                        limit=n,
-                    )
-                    rows = await self._ccxt_fetch_ohlcv_once(
-                        symbol,
-                        since_ms=since_tail,
-                        limit=n,
-                        end_exclusive_ms=None,
-                        timeframe="1m",
-                    )
-                    arr = self._normalize_ccxt_ohlcv(rows)
-                    if arr.size:
-                        price = float(arr[-1]["c"])
-                        merged = self._merge_overwrite(self._ensure_symbol_cache(symbol), arr)
-                        self._cache[symbol] = merged
-                        try:
-                            self._enforce_memory_retention(symbol)
-                            self._save_range(symbol, arr, timeframe="1m")
-                        except Exception:
-                            pass
-                        self._set_last_refresh_meta(symbol, last_refresh_ms=now_locked)
-                        self._current_close_cache[symbol] = (price, now_locked)
-                        self._log(
-                            "debug",
-                            "get_current_close_from_direct_ohlcv",
-                            symbol=symbol,
-                            rows=arr.shape[0],
-                        )
-                        return price
-            except Exception:
-                pass
-
-        # 4) Last resort: ticker
-        if self.exchange is not None:
-            try:
-                if hasattr(self.exchange, "fetch_ticker"):
-                    self._log("debug", "ccxt_fetch_ticker", symbol=symbol)
-                    if getattr(self, "_net_sem", None) is not None:
-                        async with self._net_sem:  # type: ignore[attr-defined]
-                            t = await self.exchange.fetch_ticker(symbol)
-                    else:
-                        t = await self.exchange.fetch_ticker(symbol)
-                    self._log(
-                        "debug",
-                        "ccxt_fetch_ticker_ok",
-                        symbol=symbol,
-                        last=(t.get("last") if isinstance(t, dict) else None),
-                        close=(t.get("close") if isinstance(t, dict) else None),
-                    )
-                    price = float(t.get("last") or t.get("bid") or t.get("ask")) if t else None
-                    if price is not None:
-                        self._current_close_cache[symbol] = (price, now)
-                        return price
-            except Exception:
-                pass
-
-        # 5) Fallback to last cached finalized candle
-        if price is None:
-            arr2 = self._cache.get(symbol)
-            if arr2 is not None and arr2.size:
-                arr2 = np.sort(_ensure_dtype(arr2), order="ts")
-                price = float(arr2[-1]["c"])
-                self._log("debug", "get_current_close_from_cache_finalized", symbol=symbol)
-
-        if price is None:
+        now = self._now_ms()
+        last_final = _floor_minute(now) - ONE_MIN_MS
+        if last_final < 0:
             return float("nan")
+        got = await self.get_candles(
+            symbol,
+            start_ts=last_final,
+            end_ts=last_final,
+            max_age_ms=max_age_ms,
+            timeframe=None,
+            strict=False,
+        )
+        if got is None or got.size == 0:
+            return float("nan")
+        got_sorted = np.sort(_ensure_dtype(got), order="ts")
+        if int(got_sorted[-1]["ts"]) > int(last_final):
+            raise RuntimeError(
+                f"candlestick manager returned in-progress candle for {symbol}: "
+                f"ts={int(got_sorted[-1]['ts'])} last_final={int(last_final)}"
+            )
+        price = float(got_sorted[-1]["c"])
+        self._log(
+            "debug",
+            "get_latest_completed_close",
+            symbol=symbol,
+            ts=int(got_sorted[-1]["ts"]),
+        )
+        return price
 
-        self._current_close_cache[symbol] = (float(price), int(now))
-        return float(price)
+    async def get_current_close(self, symbol: str, max_age_ms: Optional[int] = None) -> float:
+        """Compatibility alias for get_latest_completed_close().
+
+        Live current price truth must use ticker/market snapshots, not
+        CandlestickManager.  This method intentionally returns completed-candle
+        close only despite its legacy name.
+        """
+        return await self.get_latest_completed_close(symbol, max_age_ms=max_age_ms)
 
     def set_current_close(self, symbol: str, price: float, timestamp_ms: int) -> None:
-        """Inject a price into the current-close cache (e.g. from a bulk API call)."""
-        self._current_close_cache[symbol] = (float(price), int(timestamp_ms))
+        """Deprecated no-op.
+
+        Current price cache injection belongs to MarketSnapshotProvider.  The
+        method is retained to avoid breaking older helpers during the staged
+        transition, but CandlestickManager ignores current/in-progress prices.
+        """
+        self._log(
+            "debug",
+            "set_current_close_ignored_completed_only",
+            symbol=symbol,
+            timestamp_ms=int(timestamp_ms),
+        )
 
     def is_rate_limited(self) -> bool:
         """Return True if a global rate-limit backoff is active."""
@@ -5962,11 +6422,168 @@ class CandlestickManager:
             out[i] = num / den
         return out
 
+    @staticmethod
+    def _normalize_spans_by_metric(
+        spans_by_metric: Dict[str, Any],
+    ) -> Dict[str, List[float]]:
+        normalized: Dict[str, List[float]] = {}
+        for metric_key, raw_spans in (spans_by_metric or {}).items():
+            if raw_spans is None:
+                spans_iter = []
+            elif isinstance(raw_spans, (int, float)):
+                spans_iter = [raw_spans]
+            else:
+                spans_iter = list(raw_spans)
+            spans: List[float] = []
+            for raw_span in spans_iter:
+                span = float(raw_span)
+                if not math.isfinite(span) or span <= 0.0:
+                    raise ValueError(
+                        f"projected open-tail EMA span must be finite and > 0.0; "
+                        f"metric={metric_key} span={raw_span!r}"
+                    )
+                spans.append(span)
+            if spans:
+                normalized[str(metric_key)] = sorted(set(spans))
+        return normalized
+
+    def _ema_metric_series(self, metric_key: str, arr: np.ndarray) -> np.ndarray:
+        if metric_key == "close":
+            return np.asarray(arr["c"], dtype=np.float64)
+        if metric_key == "volume":
+            return np.asarray(arr["bv"], dtype=np.float64)
+        if metric_key == "qv":
+            return (
+                np.asarray(arr["bv"], dtype=np.float64)
+                * (
+                    np.asarray(arr["h"], dtype=np.float64)
+                    + np.asarray(arr["l"], dtype=np.float64)
+                    + np.asarray(arr["c"], dtype=np.float64)
+                )
+                / 3.0
+            )
+        if metric_key == "log_range":
+            return np.log(
+                np.maximum(np.asarray(arr["h"], dtype=np.float64), 1e-12)
+                / np.maximum(np.asarray(arr["l"], dtype=np.float64), 1e-12)
+            )
+        raise KeyError(f"Unknown EMA metric_key {metric_key!r}")
+
+    async def get_projected_open_tail_ema_metrics(
+        self,
+        symbol: str,
+        spans_by_metric: Dict[str, Any],
+        *,
+        latest_expected_ts: int,
+        last_cached_ts: int,
+        max_tail_gap_ms: int,
+        timeframe: str = "1m",
+    ) -> Dict[str, Dict[float, float]]:
+        """Return provisional open-tail EMA metrics without mutating candle/EMA state.
+
+        Projection is intentionally stateless. Real candles and existing bounded
+        internal gap synthesis are used first; flat zero-volume rows are appended
+        only for the still-open tail of this single read.
+        """
+        period_ms = _tf_to_ms(timeframe)
+        if period_ms != ONE_MIN_MS:
+            raise ValueError("open-tail EMA projection currently supports only 1m candles")
+        latest_expected = _floor_minute(int(latest_expected_ts))
+        last_cached = _floor_minute(int(last_cached_ts))
+        max_tail_gap = int(max_tail_gap_ms)
+        if latest_expected < last_cached:
+            raise ValueError(
+                f"latest_expected_ts must be >= last_cached_ts for open-tail projection: "
+                f"latest_expected_ts={latest_expected} last_cached_ts={last_cached}"
+            )
+        tail_gap_ms = int(max(0, latest_expected - last_cached))
+        if max_tail_gap <= 0 or tail_gap_ms > max_tail_gap:
+            raise ValueError(
+                f"open-tail projection exceeds max_tail_gap_ms: "
+                f"tail_gap_ms={tail_gap_ms} max_tail_gap_ms={max_tail_gap}"
+            )
+
+        normalized = self._normalize_spans_by_metric(spans_by_metric)
+        if not normalized:
+            return {}
+        max_span = max(span for spans in normalized.values() for span in spans)
+        window_candles = max(1, int(math.ceil(max_span)))
+        start_ts = min(
+            int(latest_expected - ONE_MIN_MS * (window_candles - 1)),
+            last_cached,
+        )
+
+        before_cache_keys = set(self._ema_cache.get(symbol, {}).keys())
+        before_synthetic = set(self._synthetic_timestamps.get(symbol, set()))
+        arr = await self.get_candles(
+            symbol,
+            start_ts=start_ts,
+            end_ts=latest_expected,
+            max_age_ms=None,
+            timeframe="1m",
+            allow_remote_fetch=False,
+        )
+        # get_candles may legitimately record bounded internal synthetic gaps.
+        # Projection itself must not write EMA cache entries or open-tail synthetic timestamps.
+        if symbol in self._ema_cache:
+            after_cache_keys = set(self._ema_cache.get(symbol, {}).keys())
+            if after_cache_keys != before_cache_keys:
+                self._ema_cache[symbol] = {
+                    key: self._ema_cache[symbol][key]
+                    for key in before_cache_keys
+                    if key in self._ema_cache[symbol]
+                }
+        projected_open_tail: List[int] = []
+        if arr.size == 0:
+            raise RuntimeError(
+                f"open-tail projection unavailable for {symbol}: no local candles "
+                f"start_ts={start_ts} latest_expected_ts={latest_expected}"
+            )
+        arr = np.sort(_ensure_dtype(arr), order="ts")
+        newest_ts = int(arr[-1]["ts"])
+        if newest_ts > latest_expected:
+            arr = self._slice_ts_range(arr, start_ts, latest_expected, assume_sorted=True)
+            if arr.size == 0:
+                raise RuntimeError(
+                    f"open-tail projection unavailable for {symbol}: no candles after range clamp"
+                )
+            newest_ts = int(arr[-1]["ts"])
+        if newest_ts < latest_expected:
+            prev_close = float(arr[-1]["c"])
+            rows = []
+            for ts in range(newest_ts + ONE_MIN_MS, latest_expected + ONE_MIN_MS, ONE_MIN_MS):
+                rows.append((int(ts), prev_close, prev_close, prev_close, prev_close, 0.0))
+                projected_open_tail.append(int(ts))
+            if rows:
+                arr = np.concatenate([arr, np.array(rows, dtype=CANDLE_DTYPE)])
+
+        if projected_open_tail:
+            current_synthetic = set(self._synthetic_timestamps.get(symbol, set()))
+            self._synthetic_timestamps[symbol] = current_synthetic - set(projected_open_tail)
+            if not self._synthetic_timestamps[symbol]:
+                self._synthetic_timestamps.pop(symbol, None)
+        elif before_synthetic and symbol not in self._synthetic_timestamps:
+            self._synthetic_timestamps[symbol] = before_synthetic
+
+        out: Dict[str, Dict[float, float]] = {}
+        for metric_key, spans in normalized.items():
+            series = self._ema_metric_series(metric_key, arr)
+            metric_out: Dict[float, float] = {}
+            for span in spans:
+                span_candles = max(1, int(math.ceil(span)))
+                tail = series[-span_candles:] if series.shape[0] > span_candles else series
+                if tail.shape[0] == 0:
+                    metric_out[span] = float("nan")
+                else:
+                    metric_out[span] = float(self._ema(tail, span))
+            out[metric_key] = metric_out
+        return out
+
     async def _latest_finalized_range(
         self, span: float, *, period_ms: int = ONE_MIN_MS
     ) -> Tuple[int, int]:
         span_candles = max(1, int(math.ceil(float(span))))
-        now = _utc_now_ms()
+        now = self._now_ms()
         # Align to timeframe buckets and exclude current in-progress bucket
         end_floor = (int(now) // int(period_ms)) * int(period_ms)
         end_ts = int(end_floor - period_ms)
@@ -5981,6 +6598,7 @@ class CandlestickManager:
         *,
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
+        allow_remote_fetch: bool = True,
     ) -> float:
         """Return latest EMA of close over last `span` finalized candles.
 
@@ -5990,7 +6608,7 @@ class CandlestickManager:
         period_ms = _tf_to_ms(out_tf)
         start_ts, end_ts = await self._latest_finalized_range(span, period_ms=period_ms)
         # EMA result cache: reuse if end_ts unchanged and within TTL
-        now = _utc_now_ms()
+        now = self._now_ms()
         tf_key = str(period_ms)
         key = ("close", float(span), tf_key)
         cache = self._ema_cache.setdefault(symbol, {})
@@ -5999,7 +6617,12 @@ class CandlestickManager:
             if int(cached_end_ts) == int(end_ts) and (now - int(computed_at)) <= int(max_age_ms):
                 return float(val)
         arr = await self.get_candles(
-            symbol, start_ts=start_ts, end_ts=end_ts, max_age_ms=max_age_ms, timeframe=out_tf
+            symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            max_age_ms=max_age_ms,
+            timeframe=out_tf,
+            allow_remote_fetch=allow_remote_fetch,
         )
         if arr.size == 0:
             return float("nan")
@@ -6044,22 +6667,32 @@ class CandlestickManager:
         return float(min(vals)), float(max(vals))
 
     async def get_last_prices(self, symbols: List[str], max_age_ms: int = 10_000) -> Dict[str, float]:
-        """Return latest close for current minute per symbol.
+        """Return latest completed-candle close per symbol.
 
-        Uses get_current_close per symbol with TTL. Returns 0.0 on failure.
+        This is a completed-candle helper, not live price truth.  Callers that
+        need current bid/ask/last should use MarketSnapshotProvider.
         """
         out: Dict[str, float] = {}
         if not symbols:
             return out
 
+        ordered_symbols = list(dict.fromkeys(symbols))
+
         async def one(sym: str) -> float:
             try:
-                val = await self.get_current_close(sym, max_age_ms=max_age_ms)
+                val = await self.get_latest_completed_close(sym, max_age_ms=max_age_ms)
                 return float(val) if isinstance(val, (int, float)) else 0.0
-            except Exception:
+            except Exception as exc:
+                self._log(
+                    "debug",
+                    "get_last_prices_completed_close_failed",
+                    symbol=sym,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
                 return 0.0
 
-        tasks = {s: asyncio.create_task(one(s)) for s in symbols}
+        tasks = {s: asyncio.create_task(one(s)) for s in ordered_symbols}
         for s, t in tasks.items():
             out[s] = await t
         return out
@@ -6141,6 +6774,7 @@ class CandlestickManager:
         *,
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
+        allow_remote_fetch: bool = True,
     ) -> float:
         return await self._get_latest_ema_generic(
             symbol,
@@ -6148,6 +6782,7 @@ class CandlestickManager:
             max_age_ms,
             timeframe,
             tf=tf,
+            allow_remote_fetch=allow_remote_fetch,
             metric_key="volume",
             series_fn=lambda a: np.asarray(a["bv"], dtype=np.float64),
         )
@@ -6160,6 +6795,7 @@ class CandlestickManager:
         *,
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
+        allow_remote_fetch: bool = True,
     ) -> float:
         """Return latest EMA of quote volume over last `span` finalized candles.
 
@@ -6173,6 +6809,7 @@ class CandlestickManager:
             max_age_ms,
             timeframe,
             tf=tf,
+            allow_remote_fetch=allow_remote_fetch,
             metric_key="qv",
             series_fn=lambda a: (
                 np.asarray(a["bv"], dtype=np.float64)
@@ -6193,6 +6830,7 @@ class CandlestickManager:
         timeframe: Optional[str],
         *,
         tf: Optional[str] = None,
+        allow_remote_fetch: bool = True,
         metric_key: str,
         series_fn,
     ) -> float:
@@ -6204,7 +6842,7 @@ class CandlestickManager:
         out_tf = timeframe if timeframe is not None else tf
         period_ms = _tf_to_ms(out_tf)
         start_ts, end_ts = await self._latest_finalized_range(span, period_ms=period_ms)
-        now = _utc_now_ms()
+        now = self._now_ms()
         tf_key = str(period_ms)
         key = (metric_key, float(span), tf_key)
         cache = self._ema_cache.setdefault(symbol, {})
@@ -6213,7 +6851,12 @@ class CandlestickManager:
             if int(cached_end_ts) == int(end_ts) and (now - int(computed_at)) <= int(max_age_ms):
                 return float(val)
         arr = await self.get_candles(
-            symbol, start_ts=start_ts, end_ts=end_ts, max_age_ms=max_age_ms, timeframe=out_tf
+            symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            max_age_ms=max_age_ms,
+            timeframe=out_tf,
+            allow_remote_fetch=allow_remote_fetch,
         )
         if arr.size == 0:
             return float("nan")
@@ -6256,7 +6899,7 @@ class CandlestickManager:
                 start_ts = int(end_ts - period_ms * (lookback - 1))
             except Exception:
                 pass
-        now = _utc_now_ms()
+        now = self._now_ms()
         tf_key = str(period_ms)
 
         cache = self._ema_cache.setdefault(symbol, {})
@@ -6322,7 +6965,13 @@ class CandlestickManager:
                 # tail is a slice of sorted get_candles output, so assume_sorted=True
                 metric_start_ts = int(end_ts - period_ms * (span_candles - 1))
                 tail = self.standardize_gaps(
-                    tail, start_ts=metric_start_ts, end_ts=end_ts, strict=False, assume_sorted=True
+                    tail,
+                    start_ts=metric_start_ts,
+                    end_ts=end_ts,
+                    strict=False,
+                    fill_trailing_gaps=False,
+                    assume_sorted=True,
+                    symbol=symbol,
                 )
             if tail.size == 0:
                 out[metric_key] = float("nan")
@@ -6342,6 +6991,7 @@ class CandlestickManager:
         *,
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
+        allow_remote_fetch: bool = True,
     ) -> float:
         return await self._get_latest_ema_generic(
             symbol,
@@ -6349,6 +6999,7 @@ class CandlestickManager:
             max_age_ms,
             timeframe,
             tf=tf,
+            allow_remote_fetch=allow_remote_fetch,
             metric_key="log_range",
             series_fn=lambda a: np.log(
                 np.maximum(np.asarray(a["h"], dtype=np.float64), 1e-12)
@@ -6454,7 +7105,7 @@ class CandlestickManager:
         if self.exchange is None:
             return None
 
-        now = _utc_now_ms()
+        now = self._now_ms()
         end_exclusive = _floor_minute(now)
         if through_ts is not None:
             end_exclusive = min(end_exclusive, _floor_minute(int(through_ts)) + ONE_MIN_MS)
@@ -6547,6 +7198,9 @@ class CandlestickManager:
 
             def _persist_refresh_batch(batch: np.ndarray) -> None:
                 nonlocal persisted_batches
+                batch = self._slice_ts_range(_ensure_dtype(batch), since, end_exclusive - ONE_MIN_MS)
+                if not batch.size:
+                    return
                 persisted_batches = True
                 self._persist_batch(
                     symbol,
@@ -6565,9 +7219,12 @@ class CandlestickManager:
                 )
             except TypeError:
                 new_arr = await self._fetch_ohlcv_paginated(symbol, since, end_exclusive)
+            new_arr = self._slice_ts_range(_ensure_dtype(new_arr), since, end_exclusive - ONE_MIN_MS)
             if new_arr.size == 0:
-                # Keep finalized runtime candles contiguous even if there were no fills.
-                self._materialize_runtime_synthetic_gap(symbol, end_exclusive - ONE_MIN_MS)
+                # A missing open-ended tail is not synthesized. Record the successful
+                # empty poll to avoid repeated immediate refetches; future real candles
+                # will bound the gap and normal runtime standardization can replay it.
+                self._set_last_refresh_meta(symbol, now_fetch)
                 return None
             if not persisted_batches:
                 self._persist_batch(

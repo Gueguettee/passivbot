@@ -24,7 +24,7 @@ pytest tests/test_specific.py::test_name
 
 ```bash
 passivbot live -u {account_name}
-passivbot live path/to/config.json --debug-level {0-3}
+passivbot live path/to/config.json --log-level {warning|info|debug|trace|0-3}
 ```
 
 ## Backtest
@@ -53,9 +53,11 @@ cd passivbot-rust && cargo check --tests && cd ..
 
 ```bash
 passivbot tool pareto optimize_results/.../pareto
+passivbot tool pareto-compress optimize_results/.../pareto 8 --output-dir selected_pareto_8
 passivbot tool pareto-dash --data-root optimize_results
 passivbot tool verify-hlcvs-data
-passivbot tool streamline-json configs/examples/default_trailing_grid_long_npos10.json
+passivbot tool ohlcvs-doctor --repair-catalog
+passivbot tool streamline-json configs/examples/default_trailing_grid_long_npos7.json
 ```
 
 ## High-Signal Gotcha

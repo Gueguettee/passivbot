@@ -85,13 +85,19 @@ def _log_config(verbose: bool, level: int, message: str, *args) -> None:
 
 
 def _canonical_log_json(value: Any) -> str:
-    return json.dumps(sort_dict_keys(deepcopy(value)), sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        sort_dict_keys(deepcopy(value)), sort_keys=True, separators=(",", ":")
+    )
 
 
-def _format_optimize_limits_change_for_log(old_value: Any, new_value: Any) -> Optional[str]:
+def _format_optimize_limits_change_for_log(
+    old_value: Any, new_value: Any
+) -> Optional[str]:
     if not isinstance(old_value, list) or not isinstance(new_value, list):
         return None
-    if not all(isinstance(x, dict) for x in old_value) or not all(isinstance(x, dict) for x in new_value):
+    if not all(isinstance(x, dict) for x in old_value) or not all(
+        isinstance(x, dict) for x in new_value
+    ):
         return None
 
     old_counter = Counter(_canonical_log_json(entry) for entry in old_value)
@@ -118,7 +124,9 @@ def _format_optimize_limits_change_for_log(old_value: Any, new_value: Any) -> Op
     return " | ".join(parts)
 
 
-def _format_config_change_message(full_path: str, old_value: Any, new_value: Any) -> tuple[str, tuple[Any, ...]]:
+def _format_config_change_message(
+    full_path: str, old_value: Any, new_value: Any
+) -> tuple[str, tuple[Any, ...]]:
     if full_path == "optimize.limits":
         custom = _format_optimize_limits_change_for_log(old_value, new_value)
         if custom is not None:
@@ -165,6 +173,20 @@ FIELD_RUNTIME_RULES = {
             "optimize": "Coin Selection",
         },
     },
+    "live.forager_score_hysteresis_pct": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Coin Selection",
+            "optimize": "Coin Selection",
+        },
+    },
+    "live.initial_entry_exec_max_market_dist_pct": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+    },
     "live.hedge_mode": {
         "owner": "live",
         "consumed_by": {"live", "backtest", "optimize"},
@@ -201,6 +223,15 @@ FIELD_RUNTIME_RULES = {
             "optimize": "Backtest Runtime",
         },
     },
+    "live.max_warmup_minutes": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Date Range",
+            "optimize": "Backtest Runtime",
+        },
+    },
     "live.pnls_max_lookback_days": {
         "owner": "live",
         "consumed_by": {"live", "backtest", "optimize"},
@@ -213,22 +244,6 @@ FIELD_RUNTIME_RULES = {
 }
 
 OPTIMIZE_FIXED_BOT_RUNTIME_CLI_ARGS = {
-    "bot.long.entry_grid_inflation_enabled": {
-        "visible": ["--bot.long.entry_grid_inflation_enabled"],
-        "hidden": ["--bot_long_entry_grid_inflation_enabled"],
-        "type": str2bool,
-        "metavar": "Y/N",
-        "commands": {"optimize"},
-        "help": "Override bot.long.entry_grid_inflation_enabled for this optimize run.",
-    },
-    "bot.short.entry_grid_inflation_enabled": {
-        "visible": ["--bot.short.entry_grid_inflation_enabled"],
-        "hidden": ["--bot_short_entry_grid_inflation_enabled"],
-        "type": str2bool,
-        "metavar": "Y/N",
-        "commands": {"optimize"},
-        "help": "Override bot.short.entry_grid_inflation_enabled for this optimize run.",
-    },
     "bot.long.hsl_enabled": {
         "visible": ["--bot.long.hsl_enabled"],
         "hidden": ["--bot_long_hsl_enabled"],
@@ -251,7 +266,13 @@ OPTIMIZE_FIXED_BOT_RUNTIME_CLI_ARGS = {
         "type": str,
         "metavar": "VALUE",
         "commands": {"optimize"},
-        "choices": ["manual", "panic", "graceful_stop", "tp_only", "tp_only_with_active_entry_cancellation"],
+        "choices": [
+            "manual",
+            "panic",
+            "graceful_stop",
+            "tp_only",
+            "tp_only_with_active_entry_cancellation",
+        ],
         "help": "Override bot.long.hsl_orange_tier_mode for this optimize run.",
     },
     "bot.short.hsl_orange_tier_mode": {
@@ -260,7 +281,13 @@ OPTIMIZE_FIXED_BOT_RUNTIME_CLI_ARGS = {
         "type": str,
         "metavar": "VALUE",
         "commands": {"optimize"},
-        "choices": ["manual", "panic", "graceful_stop", "tp_only", "tp_only_with_active_entry_cancellation"],
+        "choices": [
+            "manual",
+            "panic",
+            "graceful_stop",
+            "tp_only",
+            "tp_only_with_active_entry_cancellation",
+        ],
         "help": "Override bot.short.hsl_orange_tier_mode for this optimize run.",
     },
     "bot.long.hsl_panic_close_order_type": {
@@ -358,7 +385,9 @@ def expand_PB_mode(mode: str) -> str:
         raise Exception(f"unknown passivbot mode {mode}")
 
 
-def apply_allowed_modifications(src, modifications, allowed_overrides, return_full=True):
+def apply_allowed_modifications(
+    src, modifications, allowed_overrides, return_full=True
+):
     return staged_apply_allowed_modifications(
         src, modifications, allowed_overrides, return_full=return_full
     )
@@ -390,7 +419,9 @@ def parse_overrides(config, verbose=True):
 
 
 def load_override_config(config, coin):
-    return staged_load_override_config(config, coin, config_loader=lambda path: load_config(path, verbose=False))
+    return staged_load_override_config(
+        config, coin, config_loader=lambda path: load_config(path, verbose=False)
+    )
 
 
 def parse_old_coin_flags(config) -> dict:
@@ -431,7 +462,9 @@ def detect_flavor(config: dict, template: dict) -> str:
     return detect_migration_flavor(config, template)
 
 
-def build_base_config_from_flavor(config: dict, template: dict, flavor: str, verbose: bool) -> dict:
+def build_base_config_from_flavor(
+    config: dict, template: dict, flavor: str, verbose: bool
+) -> dict:
     return build_migration_base_config_from_flavor(config, template, flavor, verbose)
 
 
@@ -498,7 +531,9 @@ def _hydrate_missing_template_fields(
     verbose: bool = True,
     tracker: Optional[ConfigTransformTracker] = None,
 ) -> None:
-    staged_hydrate_missing_template_fields(template, result, verbose=verbose, tracker=tracker)
+    staged_hydrate_missing_template_fields(
+        template, result, verbose=verbose, tracker=tracker
+    )
 
 
 def _normalize_position_counts(
@@ -523,7 +558,9 @@ def _apply_non_live_adjustments(
     )
 
 
-def format_config(config: dict, verbose=True, live_only=False, base_config_path: str = "") -> dict:
+def format_config(
+    config: dict, verbose=True, live_only=False, base_config_path: str = ""
+) -> dict:
     result = normalize_config(
         config,
         base_config_path=base_config_path,
@@ -565,21 +602,30 @@ def _clean_with_template(template_node, source_node, path: Path = ()):
     if isinstance(template_node, dict):
         source_dict = source_node if isinstance(source_node, dict) else {}
         if path in PARTIALLY_OPEN_CONFIG_PATHS:
+            if not isinstance(source_node, dict):
+                return _clean_with_template(template_node, None, ())
             cleaned = {}
             for key, value in source_dict.items():
                 if key in template_node:
-                    cleaned[key] = _clean_with_template(template_node[key], value, path + (key,))
+                    cleaned[key] = _clean_with_template(
+                        template_node[key], value, path + (key,)
+                    )
                 else:
                     cleaned[key] = _clean_dynamic_node(value)
-            for key, tmpl_value in template_node.items():
-                if key not in cleaned:
-                    cleaned[key] = _clean_with_template(tmpl_value, None, path + (key,))
+            if path == ("backtest", "aggregate") and "default" not in cleaned:
+                cleaned["default"] = _clean_with_template(
+                    template_node["default"],
+                    None,
+                    path + ("default",),
+                )
             return cleaned
         if not template_node:
             return _clean_dynamic_node(source_dict)
         result = {}
         for key, tmpl_value in template_node.items():
-            result[key] = _clean_with_template(tmpl_value, source_dict.get(key), path + (key,))
+            result[key] = _clean_with_template(
+                tmpl_value, source_dict.get(key), path + (key,)
+            )
         return result
     if isinstance(template_node, list):
         if isinstance(source_node, list):
@@ -606,7 +652,9 @@ def strip_config_metadata(config: dict, *, keys: Iterable[str] | None = None) ->
     Defaults to removing `_raw`, `_raw_effective`, and `_transform_log`.
     """
 
-    removal = set(keys or ("_raw", "_raw_effective", "_transform_log", "_coins_sources"))
+    removal = set(
+        keys or ("_raw", "_raw_effective", "_transform_log", "_coins_sources")
+    )
 
     def _strip(node):
         if isinstance(node, dict):
@@ -618,7 +666,24 @@ def strip_config_metadata(config: dict, *, keys: Iterable[str] | None = None) ->
     return _strip(config)
 
 
-def _limits_structurally_equal(raw_limits: Any, normalized_limits: List[Dict[str, Any]]) -> bool:
+def sanitize_prepared_config_for_dump(
+    config: dict, *, extra_keys: Iterable[str] | None = None
+) -> dict:
+    """
+    Return a prepared config stripped of runtime/metadata payload so the dumped artifact remains
+    clean and directly reusable.
+    """
+
+    removal = ["_raw", "_raw_effective", "_transform_log", "_coins_sources", "analysis"]
+    if extra_keys is not None:
+        removal.extend(extra_keys)
+    stripped = strip_config_metadata(config, keys=tuple(removal))
+    return clean_config(stripped)
+
+
+def _limits_structurally_equal(
+    raw_limits: Any, normalized_limits: List[Dict[str, Any]]
+) -> bool:
     if not isinstance(raw_limits, list) or len(raw_limits) != len(normalized_limits):
         return False
 
@@ -739,7 +804,7 @@ RESERVED_CLI_ARGS = {
         "help": (
             "Approved coins. Use CSV like BTC,ETH,XRP, the literal 'all', a path to a JSON "
             "coin list file, or a JSON/HJSON per-side object like "
-            "{\"long\":[\"BTC\"],\"short\":\"all\"}. Use coin tickers, not exchange symbols."
+            '{"long":["BTC"],"short":"all"}. Use coin tickers, not exchange symbols.'
         ),
     },
     "live.ignored_coins": {
@@ -766,6 +831,34 @@ RESERVED_CLI_ARGS = {
             "optimize": "Coin Selection",
         },
         "help": "Minimum coin age in days required before a coin is eligible to trade.",
+    },
+    "live.forager_score_hysteresis_pct": {
+        "visible": ["--forager-score-hysteresis-pct"],
+        "hidden": [
+            "--live.forager_score_hysteresis_pct",
+            "--live_forager_score_hysteresis_pct",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Coin Selection",
+            "backtest": "Coin Selection",
+            "optimize": "Coin Selection",
+        },
+        "help": "Forager incumbent score tolerance. Keeps an already-selected flat forager coin when a challenger score is within this fractional normalized-score gap.",
+    },
+    "live.initial_entry_exec_max_market_dist_pct": {
+        "visible": ["--initial-entry-exec-max-market-dist-pct"],
+        "hidden": [
+            "--live.initial_entry_exec_max_market_dist_pct",
+            "--live_initial_entry_exec_max_market_dist_pct",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live"},
+        "group": {"live": "Behavior"},
+        "help": "Executor-side distance gate for initial entry creations. Set to 0 to disable. Far initial entries are logged but not posted until they are near market.",
     },
     "live.filter_by_min_effective_cost": {
         "visible": ["--filter-by-min-effective-cost", "-fbmec"],
@@ -815,7 +908,10 @@ RESERVED_CLI_ARGS = {
             "backtest": "Backtest Runtime",
             "optimize": "Backtest Runtime",
         },
-        "help": "Allow or disallow market orders.",
+        "help": (
+            "Allow Rust to promote crossing/near-touch orders to live market orders. "
+            "Disabled by default; live exchange slippage controls apply."
+        ),
     },
     "live.market_order_near_touch_threshold": {
         "visible": ["--market-order-near-touch-threshold", "-montt"],
@@ -831,7 +927,10 @@ RESERVED_CLI_ARGS = {
             "backtest": "Backtest Runtime",
             "optimize": "Backtest Runtime",
         },
-        "help": "Distance threshold for allowing market orders near touch.",
+        "help": (
+            "Fractional distance threshold for promoting near-touch orders to market "
+            "when market orders are allowed; this is not a live slippage cap."
+        ),
     },
     "live.max_realized_loss_pct": {
         "visible": ["--max-realized-loss-pct", "-mrlp"],
@@ -858,15 +957,6 @@ RESERVED_CLI_ARGS = {
             "optimize": "Backtest Runtime",
         },
         "help": "How far into the past to fetch realized PnL history: 0=minimal lookback, positive=float days, 'all'=full history.",
-    },
-    "live.price_distance_threshold": {
-        "visible": ["--price-distance-threshold", "-pdt"],
-        "hidden": ["--live.price_distance_threshold", "--live_price_distance_threshold"],
-        "type": float,
-        "metavar": "FLOAT",
-        "commands": {"live"},
-        "group": {"live": "Behavior"},
-        "help": "Reject orders whose price is too far from the market.",
     },
     "live.time_in_force": {
         "visible": ["--time-in-force", "-tif"],
@@ -928,14 +1018,36 @@ RESERVED_CLI_ARGS = {
             "--backtest.candle_interval_minutes",
             "--backtest_candle_interval_minutes",
         ],
-        "type": float,
-        "metavar": "FLOAT",
+        "type": int,
+        "metavar": "INT",
         "commands": {"backtest", "optimize"},
         "group": {
             "backtest": "Backtest Runtime",
             "optimize": "Date Range",
         },
         "help": "Backtest candle interval in minutes.",
+    },
+    "backtest.hlcvs_data_dir": {
+        "visible": ["--hlcvs-data-dir"],
+        "hidden": ["--backtest.hlcvs_data_dir", "--backtest_hlcvs_data_dir"],
+        "type": str,
+        "metavar": "PATH",
+        "commands": {"backtest"},
+        "group": {"backtest": "Backtest Runtime"},
+        "help": "Use a specific final HLCV dataset directory instead of resolving by config hash.",
+    },
+    "backtest.hlcvs_data_override_mode": {
+        "visible": ["--hlcvs-data-override-mode"],
+        "hidden": [
+            "--backtest.hlcvs_data_override_mode",
+            "--backtest_hlcvs_data_override_mode",
+        ],
+        "type": str,
+        "metavar": "MODE",
+        "commands": {"backtest"},
+        "group": {"backtest": "Backtest Runtime"},
+        "choices": ("intersection", "dataset"),
+        "help": "How --hlcvs-data-dir chooses coins/range: intersection or dataset.",
     },
     "backtest.starting_balance": {
         "visible": ["--starting-balance", "-sb"],
@@ -1117,6 +1229,7 @@ def _argument_help_text(full_name: str, appendix: str) -> str:
 def _classify_live_argument(full_name: str, help_all: bool) -> Optional[str]:
     coin_selection = {
         "live.approved_coins",
+        "live.forager_score_hysteresis_pct",
         "live.ignored_coins",
         "live.minimum_coin_age_days",
     }
@@ -1128,8 +1241,8 @@ def _classify_live_argument(full_name: str, help_all: bool) -> Optional[str]:
         "live.leverage",
         "live.market_orders_allowed",
         "live.max_realized_loss_pct",
+        "live.initial_entry_exec_max_market_dist_pct",
         "live.order_match_tolerance_pct",
-        "live.price_distance_threshold",
     }
     runtime = {
         "live.execution_delay_seconds",
@@ -1158,7 +1271,6 @@ def _classify_backtest_argument(full_name: str, help_all: bool) -> Optional[str]
     }
     date_range = {
         "backtest.end_date",
-        "backtest.max_warmup_minutes",
         "backtest.start_date",
     }
     runtime = {
@@ -1222,7 +1334,6 @@ def _classify_optimize_argument(full_name: str, help_all: bool) -> Optional[str]
         "backtest.filter_by_min_effective_cost",
         "backtest.gap_tolerance_ohlcvs_minutes",
         "backtest.maker_fee_override",
-        "backtest.max_warmup_minutes",
         "backtest.ohlcv_source_dir",
         "backtest.starting_balance",
         "backtest.volume_normalization",
@@ -1323,11 +1434,13 @@ def add_reserved_arguments(
         if command is not None and commands is not None and command not in commands:
             continue
         visible_group = (
-            spec.get("group", {}).get(command)
-            if command is not None
-            else None
+            spec.get("group", {}).get(command) if command is not None else None
         )
-        container = group_map.get(visible_group, parser) if group_map and visible_group else parser
+        container = (
+            group_map.get(visible_group, parser)
+            if group_map and visible_group
+            else parser
+        )
 
         register_kwargs = dict(
             type=spec["type"],
@@ -1350,7 +1463,11 @@ def add_reserved_arguments(
             spec["hidden"],
             **register_kwargs,
         )
-        visible_shorts = [name[1:] for name in spec["visible"] if name.startswith("-") and not name.startswith("--")]
+        visible_shorts = [
+            name[1:]
+            for name in spec["visible"]
+            if name.startswith("-") and not name.startswith("--")
+        ]
         for short_name in visible_shorts:
             reserved_acronyms.add(short_name)
         reserved_keys.add(config_key)
@@ -1359,7 +1476,12 @@ def add_reserved_arguments(
 
 
 def add_config_arguments(
-    parser, config, *, command: Optional[str] = None, help_all: bool = False, group_map=None
+    parser,
+    config,
+    *,
+    command: Optional[str] = None,
+    help_all: bool = False,
+    group_map=None,
 ):
     """Add all CLI arguments for config parameters.
 
@@ -1430,7 +1552,9 @@ def add_arguments_recursively(
                 acronym = create_acronym(full_name, acronyms)
                 visible_group = classify_config_argument(full_name, command, help_all)
                 container = (
-                    group_map.get(visible_group, parser) if group_map and visible_group else parser
+                    group_map.get(visible_group, parser)
+                    if group_map and visible_group
+                    else parser
                 )
                 hidden_names = [f"--{full_name.replace('.', '_')}"]
                 if command is None or len(acronym) > 1:
@@ -1445,8 +1569,7 @@ def add_arguments_recursively(
                     default=None,
                     metavar="CSV",
                     help=(
-                        "Override "
-                        f"{full_name}."
+                        "Override " f"{full_name}."
                         if help_all or command is None
                         else argparse.SUPPRESS
                     ),
@@ -1475,7 +1598,12 @@ def add_arguments_recursively(
             if "limits" in full_name:
                 type_ = str
                 appendix = 'Example: "--loss_profit_ratio 0.5 --drawdown_worst 0.3333"'
-            elif any([x in full_name for x in ["approved_coins", "ignored_coins", "exchanges"]]):
+            elif any(
+                [
+                    x in full_name
+                    for x in ["approved_coins", "ignored_coins", "exchanges"]
+                ]
+            ):
                 type_ = comma_separated_values
                 appendix = "item1,item2,item3,..."
             elif "scoring" in full_name:
@@ -1498,7 +1626,11 @@ def add_arguments_recursively(
                     + appendix
                 )
             visible_group = classify_config_argument(full_name, command, help_all)
-            container = group_map.get(visible_group, parser) if group_map and visible_group else parser
+            container = (
+                group_map.get(visible_group, parser)
+                if group_map and visible_group
+                else parser
+            )
             hidden_names = [f"--{full_name.replace('.', '_')}"]
             if command is None or len(acronym) > 1:
                 hidden_names.append(f"-{acronym}")
@@ -1552,7 +1684,11 @@ def recursive_config_update(config, key, value, path=None, verbose=False):
                 )
                 _log_config(verbose, logging.INFO, message, *args)
                 config[current_key] = coerced_value
-                return {"path": full_path, "old": old_value, "new": deepcopy(coerced_value)}
+                return {
+                    "path": full_path,
+                    "old": old_value,
+                    "new": deepcopy(coerced_value),
+                }
             return None
         _log_config(verbose, logging.INFO, "added %s %s", full_path, value)
         config[current_key] = deepcopy(value)
@@ -1575,7 +1711,9 @@ def recursive_config_update(config, key, value, path=None, verbose=False):
     )
 
 
-def update_config_with_args(config, args, verbose=False, allowed_keys: Optional[set[str]] = None):
+def update_config_with_args(
+    config, args, verbose=False, allowed_keys: Optional[set[str]] = None
+):
     changed_keys = []
     diffs = []
     for key, value in vars(args).items():
@@ -1593,7 +1731,10 @@ def update_config_with_args(config, args, verbose=False, allowed_keys: Optional[
             )
             change = recursive_config_update(config, key, normalized, verbose=verbose)
             source_key = key.split(".")[-1]
-            config.setdefault("_coins_sources", {})[source_key] = deepcopy(normalized)
+            # Preserve the raw CLI source so live coin-list refreshes can re-read external files
+            # passed via CLI (e.g. `-s path/to/approved_coins.json`) instead of freezing the
+            # first parsed snapshot into `_coins_sources`.
+            config.setdefault("_coins_sources", {})[source_key] = deepcopy(value)
             if change:
                 changed_keys.append(key)
                 diffs.append(change)

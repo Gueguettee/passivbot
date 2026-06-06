@@ -73,8 +73,8 @@ from cli_utils import (
 )
 from config import load_input_config, load_prepared_config, prepare_config
 from config.access import get_optional_config_value, require_config_value
-from config.bot import normalize_forager_score_weights
 from config.limits import normalize_limit_entries, parse_limit_cli_entries
+from config.metrics import resolve_metric_value
 from config.scoring import (
     ObjectiveSpec,
     default_scoring_weights,
@@ -85,7 +85,7 @@ from config.scoring import (
 )
 from config.parse import load_raw_config as load_hjson_config
 from config.schema import get_template_config
-from warmup_utils import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes
+from warmup_utils import compute_backtest_warmup_minutes
 from config_utils import (
     format_bot_config,
     add_config_arguments,
@@ -100,11 +100,11 @@ from pure_funcs import (
     denumpyize,
     sort_dict_keys,
     calc_hash,
-    flatten,
     str2bool,
 )
 from utils import date_to_ts, ts_to_date, utc_ms, make_get_filepath, format_approved_ignored_coins
 from logging_setup import configure_logging, resolve_log_level
+from materialized_cache import release_materialized_payload
 from copy import deepcopy
 import gc
 import numpy as np
@@ -154,7 +154,6 @@ from limit_utils import expand_limit_checks, compute_limit_violation
 from pareto_store import ParetoStore
 import msgpack
 from typing import Sequence, Tuple, List, Dict, Any, Optional
-from itertools import permutations
 from shared_arrays import SharedArrayManager, attach_shared_array
 from ohlcv_utils import align_and_aggregate_hlcvs
 from optimize_suite import (
@@ -178,6 +177,11 @@ from optimization.backend_shared import cancel_pending_async_results, drain_asyn
 from optimization.config_adapter import extract_bounds_tuple_list_from_config
 from optimization.backends import get_backend_runner
 from optimization.config_adapter import get_optimization_key_paths, OPTIMIZABLE_BOT_KEY_PATHS
+from optimization.warmup import (
+    build_optimizer_vector_config,
+    compute_optimizer_per_coin_warmup_minutes,
+    stamp_warmup_metadata,
+)
 from optimization.shape import OptimizationShape, build_optimization_shape
 from optimization.deap_adapters import (
     mutPolynomialBoundedWrapper,
@@ -263,6 +267,81 @@ def _maybe_aggregate_backtest_data(hlcvs, timestamps, btc_usd_prices, mss, confi
         meta["effective_start_ts"] = int(timestamps[0])
         meta["effective_start_date"] = ts_to_date(int(timestamps[0]))
     return hlcvs, timestamps, btc_usd_prices
+
+
+def _stamp_optimizer_warmup(config: dict, mss: dict, coins: list[str]) -> None:
+    """
+    Overwrite ``mss[coin]["warmup_minutes"]`` and ``["trade_start_index"]``
+    with the worst-case warmup the optimizer's search space can actually
+    produce, computed from ``optimize.bounds`` rather than the template bot
+    values.
+
+    ``prepare_hlcvs_mss`` stamps those fields from
+    ``compute_per_coin_warmup_minutes(config)``, which reads ``bot.*``
+    directly and knows nothing about bounds. When a user's template bot has
+    large decorative values (e.g. ``entry_volatility_ema_span_hours=1690``)
+    but the bounds pin those fields low, every optimizer backtest ends up
+    trading on a window sized for the template — not for the search space.
+    This helper corrects the stamping by synthesizing a max-bounds
+    individual, running it through ``individual_to_config``, and recomputing
+    warmup from the resulting config.
+
+    Must be called *after* ``prepare_hlcvs_mss`` and *before* the Evaluator
+    reads ``mss``.
+    """
+    warmup_map = compute_optimizer_per_coin_warmup_minutes(config)
+    stamped = stamp_warmup_metadata(mss, coins, warmup_map)
+    if stamped:
+        summary = ", ".join(
+            f"{count}x(warmup={w},start={s})" for (w, s), count in stamped.items()
+        )
+        logging.info(
+            "Optimizer warmup stamped from bounds | %d coins | %s",
+            sum(stamped.values()),
+            summary,
+        )
+
+
+def _register_exchange_data(
+    exchange: str,
+    prepare_result: tuple,
+    config: dict,
+    *,
+    msss: dict,
+    hlcvs_specs: dict,
+    btc_usd_specs: dict,
+    timestamps_dict: dict,
+    array_manager: SharedArrayManager,
+) -> tuple[list[str], dict]:
+    """
+    Register one exchange's prepared data into the optimizer's shared-memory
+    pools. Consolidates the previously-duplicated setup logic for the
+    combined and per-exchange branches. No behavioral change from the
+    original inline code; see commit history for the fix that later hooks
+    into this helper.
+    """
+    coins, hlcvs, mss, _results_path, _cache_dir, btc_usd_prices, timestamps = prepare_result
+    prepared_hlcvs = hlcvs
+    hlcvs, timestamps, btc_usd_prices = _maybe_aggregate_backtest_data(
+        hlcvs, timestamps, btc_usd_prices, mss, config
+    )
+    _stamp_optimizer_warmup(config, mss, coins)
+    timestamps_dict[exchange] = (
+        None if timestamps is None else np.array(timestamps, dtype=np.int64, copy=True, order="C")
+    )
+    config["backtest"]["coins"][exchange] = coins
+    msss[exchange] = mss
+    validate_array(hlcvs, "hlcvs")
+    hlcvs_array = np.array(hlcvs, dtype=np.float64, copy=True, order="C")
+    hlcvs_spec, _ = array_manager.create_from(hlcvs_array)
+    hlcvs_specs[exchange] = hlcvs_spec
+    btc_usd_array = np.array(btc_usd_prices, dtype=np.float64, copy=True, order="C")
+    validate_array(btc_usd_array, f"btc_usd_data for {exchange}", allow_nan=False)
+    btc_usd_spec, _ = array_manager.create_from(btc_usd_array)
+    btc_usd_specs[exchange] = btc_usd_spec
+    release_materialized_payload(prepared_hlcvs)
+    release_materialized_payload(hlcvs)
+    return coins, mss
 
 
 class ResultRecorder:
@@ -364,15 +443,23 @@ _RECOVERABLE_BACKTEST_PANIC_PATTERNS = (
 
 
 def _format_objectives(
-    values: Sequence[float] | dict[str, float],
+    values: Sequence[float] | dict[str, Any],
     *,
     scoring_keys: Sequence[str] | None = None,
 ) -> str:
     if isinstance(values, dict):
-        order = list(scoring_keys or values.keys())
         parts = []
-        for key in order:
-            value = values.get(key)
+        if scoring_keys:
+            for idx, key in enumerate(scoring_keys):
+                value = resolve_metric_value(values, key)
+                if value is None:
+                    value = values.get(f"w_{idx}")
+                if value is None:
+                    continue
+                parts.append(f"{key}={float(value):.3g}")
+            if parts:
+                return "[" + ", ".join(parts) + "]"
+        for key, value in values.items():
             if value is None:
                 continue
             parts.append(f"{key}={float(value):.3g}")
@@ -384,12 +471,30 @@ def _format_objectives(
     return "[" + ", ".join(f"{float(v):.3g}" for v in values) + "]"
 
 
+def _format_available_metric_keys(metrics: dict[str, Any], *, limit: int = 20) -> str:
+    keys = sorted(str(key) for key in metrics)
+    if not keys:
+        return "<none>"
+    rendered = ", ".join(keys[:limit])
+    if len(keys) > limit:
+        rendered += f", ... ({len(keys) - limit} more)"
+    return rendered
+
+
 def _is_recoverable_backtest_candidate_error(exc: BaseException) -> bool:
     name = exc.__class__.__name__
-    if name != "PanicException":
-        return False
     message = str(exc)
-    return any(pattern in message for pattern in _RECOVERABLE_BACKTEST_PANIC_PATTERNS)
+    if name == "PanicException":
+        return any(pattern in message for pattern in _RECOVERABLE_BACKTEST_PANIC_PATTERNS)
+    if isinstance(exc, ValueError):
+        return "hard-stop evaluation failed" in message and any(
+            pattern in message
+            for pattern in (
+                "equity must be finite and > 0",
+                "peak_strategy_equity must be finite and > 0",
+            )
+        )
+    return False
 
 
 def _build_invalid_candidate_metrics(
@@ -643,43 +748,12 @@ def individual_to_config(individual, optimizer_overrides, overrides_list, templa
     """
     assume individual is already bound enforced (or will be after)
     """
-    config = deepcopy(template)
-    if key_paths is None:
-        key_paths = get_optimization_key_paths(config)
-    assert len(individual) == len(key_paths), (
-        f"individual length {len(individual)} does not match optimization key count {len(key_paths)}"
+    return build_optimizer_vector_config(
+        individual,
+        template,
+        key_paths=key_paths,
+        overrides_list=overrides_list,
     )
-    for value, (_, path) in zip(individual, key_paths):
-        target = config
-        for part in path[:-1]:
-            target = target[part]
-        target[path[-1]] = value
-    _apply_config_overrides(
-        config,
-        config.get("optimize", {}).get("fixed_runtime_overrides", {}),
-    )
-    for pside in ("long", "short"):
-        pside_cfg = config.get("bot", {}).get(pside, {})
-        if not isinstance(pside_cfg, dict):
-            continue
-        red_threshold = pside_cfg.get("hsl_red_threshold")
-        no_restart = pside_cfg.get("hsl_no_restart_drawdown_threshold")
-        if red_threshold is not None and no_restart is not None:
-            if float(no_restart) < float(red_threshold):
-                pside_cfg["hsl_no_restart_drawdown_threshold"] = float(red_threshold)
-    for pside in sorted(config["bot"]):
-        config = optimizer_overrides(overrides_list, config, pside)
-
-    for pside in ("long", "short"):
-        pside_cfg = config.get("bot", {}).get(pside, {})
-        if not isinstance(pside_cfg, dict) or "forager_score_weights" not in pside_cfg:
-            continue
-        pside_cfg["forager_score_weights"] = normalize_forager_score_weights(
-            pside_cfg["forager_score_weights"],
-            path=f"bot.{pside}.forager_score_weights",
-        )
-
-    return config
 
 
 def config_to_individual(
@@ -937,6 +1011,7 @@ class Evaluator:
                 exchange,
                 self.shared_btc_np[exchange],
                 self.timestamps.get(exchange),
+                metrics_only=True,
             )
             try:
                 fills, equities_array, analysis = execute_backtest(payload, config)
@@ -983,20 +1058,27 @@ class Evaluator:
             self.seen_hashes[actual_hash] = (tuple(objectives), total_penalty)
         return tuple(objectives), total_penalty, metrics_payload
 
-    def build_limit_checks(self):
+    def build_limit_checks(self, aggregate_cfg: Dict[str, Any] | None = None):
         limits = self.config["optimize"].get("limits", [])
         self.limit_checks = expand_limit_checks(
             limits,
             self.scoring_weights,
             penalty_weight=1e6,
             objective_index_map=objective_index_map(self.scoring_specs),
+            aggregate_cfg=aggregate_cfg,
         )
 
     def calc_fitness(self, analyses_combined, *, return_raw_objectives: bool = False):
         per_objective_modifier = [0.0] * len(self.scoring_specs)
         global_modifier = 0.0
         for check in self.limit_checks:
-            val = analyses_combined.get(check["metric_key"])
+            val = resolve_metric_value(analyses_combined, check["metric_key"])
+            if val is None:
+                raise ValueError(
+                    "missing optimizer limit metric "
+                    f"{check['metric_key']!r} for limit on {check['metric']!r}; "
+                    f"available metrics: {_format_available_metric_keys(analyses_combined)}"
+                )
             penalty = compute_limit_violation(check, val)
             if not penalty:
                 continue
@@ -1012,51 +1094,16 @@ class Evaluator:
         engine_scores = []
         raw_objectives: Dict[str, float] = {}
         for idx, spec in enumerate(self.scoring_specs):
-            parts = spec.metric.split("_")
-            candidates = []
-            if len(parts) <= 1:
-                candidates = [spec.metric]
-            else:
-                base, rest = parts[0], parts[1:]
-                base_candidate = "_".join([base, *rest])
-                candidates.append(base_candidate)
-                for perm in permutations(rest):
-                    candidate = "_".join([base, *perm])
-                    candidates.append(candidate)
-            if spec.metric.endswith(("_usd", "_btc")):
-                base_metric = spec.metric.rsplit("_", 1)[0]
-                candidates.append(base_metric)
-
-            extended_candidates = []
-            seen = set()
-            for candidate in candidates:
-                if candidate not in seen:
-                    extended_candidates.append(candidate)
-                    seen.add(candidate)
-                for suffix in ("usd", "btc"):
-                    with_suffix = f"{candidate}_{suffix}"
-                    if with_suffix not in seen:
-                        extended_candidates.append(with_suffix)
-                        seen.add(with_suffix)
-                    parts_candidate = candidate.split("_")
-                    if len(parts_candidate) >= 2:
-                        inserted = "_".join(parts_candidate[:-1] + [suffix, parts_candidate[-1]])
-                        if inserted not in seen:
-                            extended_candidates.append(inserted)
-                            seen.add(inserted)
-
-            val = None
-            selected_metric = None
-            for candidate in extended_candidates:
-                metric_key = f"{candidate}_mean"
-                if val is None and metric_key in analyses_combined:
-                    val = analyses_combined[metric_key]
-                    selected_metric = candidate
-                if val is not None:
-                    break
+            val = resolve_metric_value(analyses_combined, f"{spec.metric}_mean")
+            if val is None and spec.metric.endswith(("_usd", "_btc")):
+                val = resolve_metric_value(analyses_combined, f"{spec.metric.rsplit('_', 1)[0]}_mean")
 
             if val is None:
-                val = 0
+                raise ValueError(
+                    "missing optimizer scoring metric "
+                    f"{spec.metric!r} (expected {spec.metric}_mean); "
+                    f"available metrics: {_format_available_metric_keys(analyses_combined)}"
+                )
             raw_value = float(val)
             raw_objectives[spec.metric] = raw_value
             penalty_total = global_modifier + per_objective_modifier[idx]
@@ -1101,6 +1148,7 @@ class SuiteEvaluator:
         self.base = base_evaluator
         self.contexts = scenario_contexts
         self.aggregate_cfg = aggregate_cfg
+        self.base.build_limit_checks(self.aggregate_cfg)
         # Cache for master dataset attachments (shared across scenarios)
         self._master_attachments: Dict[str, Dict[str, Any]] = {"hlcvs": {}, "btc": {}}
         self._master_arrays: Dict[str, Dict[str, np.ndarray]] = {"hlcvs": {}, "btc": {}}
@@ -1280,6 +1328,7 @@ class SuiteEvaluator:
                     btc_data,
                     ctx.timestamps.get(exchange),
                     coin_indices=coin_indices,
+                    metrics_only=True,
                 )
                 try:
                     fills, equities_array, analysis = execute_backtest(payload, scenario_config)
@@ -1407,7 +1456,7 @@ def add_extra_options(parser, *, help_all: bool):
         default="",
         dest="fine_tune_params",
         help=(
-            "Comma-separated optimize bounds keys to tune; other parameters are fixed to their current config values"
+            "Comma-separated optimize bounds selectors to tune; other parameters are fixed to their current config values"
             if help_all
             else argparse.SUPPRESS
         ),
@@ -1438,6 +1487,33 @@ def apply_fine_tune_bounds(
     cli_overridden_bounds: set[str],
 ) -> None:
     bounds = config.get("optimize", {}).get("bounds", {})
+
+    def _resolve_bound_selectors(selectors, label: str) -> set[str]:
+        resolved: set[str] = set()
+        selectors_sorted = sorted(
+            {str(selector).strip() for selector in selectors if str(selector).strip()}
+        )
+        if not selectors_sorted:
+            return resolved
+        logging.info("%s selectors:", label)
+        for selector in selectors_sorted:
+            matches = sorted(key for key in bounds if selector in key)
+            if not matches:
+                logging.warning("%s selector matched no optimize bounds: %s", label, selector)
+                continue
+            logging.info("  %s ->", selector)
+            for match in matches:
+                logging.info("    %s", match)
+            resolved.update(matches)
+        return resolved
+
+    def _log_bound_set(header: str, keys: set[str]) -> None:
+        if not keys:
+            logging.info("%s: none", header)
+            return
+        logging.info("%s:", header)
+        for key in sorted(keys):
+            logging.info("  %s", key)
 
     def _resolve_bound_key_path(bound_key: str):
         if bound_key in OPTIMIZABLE_BOT_KEY_PATHS:
@@ -1487,58 +1563,54 @@ def apply_fine_tune_bounds(
                 continue
             bounds[key] = [val, val]
 
-    fine_tune_set = set(fine_tune_params)
-    config_fixed_params = set(config.get("optimize", {}).get("fixed_params", []) or [])
+    fine_tune_set = _resolve_bound_selectors(fine_tune_params, "fine-tune")
+    config_fixed_params = _resolve_bound_selectors(
+        config.get("optimize", {}).get("fixed_params", []) or [],
+        "optimize.fixed_params",
+    )
 
     effective_fixed_params = set(config_fixed_params)
-    if fine_tune_set:
+    if fine_tune_params:
         effective_fixed_params.update(key for key in bounds if key not in fine_tune_set)
 
     if not effective_fixed_params:
         return
+
+    if fine_tune_set:
+        _log_bound_set("fine-tune tunable bounds", fine_tune_set)
+    _log_bound_set("fixed optimize bounds", effective_fixed_params)
 
     for key in sorted(effective_fixed_params):
         if key not in bounds:
             continue
         _fix_bound_to_current_value(key)
 
-    missing = [key for key in fine_tune_set if key not in bounds]
-    if missing:
-        logging.warning(
-            "fine-tune bounds: requested keys not found in optimize bounds: %s",
-            ",".join(sorted(missing)),
-        )
-    fixed_missing = [key for key in config_fixed_params if key not in bounds]
-    if fixed_missing:
-        logging.warning(
-            "optimize.fixed_params keys not found in optimize bounds: %s",
-            ",".join(sorted(fixed_missing)),
-        )
-
 
 def extract_configs(path):
-    cfgs = []
-    if os.path.exists(path):
-        if path.endswith("_all_results.bin"):
-            logging.info(f"Skipping {path}")
-            return []
-        if path.endswith(".json"):
-            try:
-                raw = load_hjson_config(path, log_errors=False)
-                cfgs.append(_extract_starting_config(raw, source=path))
-                return cfgs
-            except Exception as e:
-                logging.warning(f"failed to extract bot config from starting config {path}: {e}")
-                return []
-        if path.endswith("_pareto.txt"):
-            with open(path) as f:
-                for line in f.readlines():
-                    try:
-                        cfg = json.loads(line)
-                        cfgs.append(_extract_starting_config(cfg, source=path))
-                    except Exception as e:
-                        logging.warning(f"failed to extract bot config from starting config {path}: {e}")
-    return cfgs
+    return list(iter_extract_configs(path))
+
+
+def iter_extract_configs(path):
+    if not os.path.exists(path):
+        return
+    if path.endswith("_all_results.bin"):
+        logging.info(f"Skipping {path}")
+        return
+    if path.endswith(".json"):
+        try:
+            raw = load_hjson_config(path, log_errors=False)
+            yield _extract_starting_config(raw, source=path)
+        except Exception as e:
+            logging.warning(f"failed to extract bot config from starting config {path}: {e}")
+        return
+    if path.endswith("_pareto.txt"):
+        with open(path) as f:
+            for line in f:
+                try:
+                    cfg = json.loads(line)
+                    yield _extract_starting_config(cfg, source=path)
+                except Exception as e:
+                    logging.warning(f"failed to extract bot config from starting config {path}: {e}")
 
 
 def _extract_starting_config(raw_config, *, source: str = "<memory>"):
@@ -1590,16 +1662,18 @@ def _build_starting_seed_config(cfg):
 
 
 def get_starting_configs(starting_configs: str):
+    return list(iter_starting_configs(starting_configs))
+
+
+def iter_starting_configs(starting_configs: str):
     if starting_configs is None:
-        return []
+        return
     if os.path.isdir(starting_configs):
-        return flatten(
-            [
-                get_starting_configs(os.path.join(starting_configs, f))
-                for f in os.listdir(starting_configs)
-            ]
-        )
-    return extract_configs(starting_configs)
+        with os.scandir(starting_configs) as entries:
+            for entry in entries:
+                yield from iter_starting_configs(entry.path)
+        return
+    yield from iter_extract_configs(starting_configs)
 
 
 def configs_to_individuals(
@@ -1608,8 +1682,25 @@ def configs_to_individuals(
     sig_digits=0,
     optimization_shape: OptimizationShape | None = None,
 ):
+    inds, _ = configs_to_individuals_streaming(
+        cfgs,
+        bounds,
+        sig_digits=sig_digits,
+        optimization_shape=optimization_shape,
+    )
+    return inds
+
+
+def configs_to_individuals_streaming(
+    cfgs,
+    bounds,
+    sig_digits=0,
+    optimization_shape: OptimizationShape | None = None,
+):
     inds = set()
+    raw_count = 0
     for cfg in cfgs:
+        raw_count += 1
         try:
             fcfg = _build_starting_seed_config(cfg)
             individual = config_to_individual(
@@ -1621,7 +1712,7 @@ def configs_to_individuals(
             inds.add(tuple(individual))
         except Exception as e:
             logging.warning(f"failed to use starting config as optimizer seed: {e}")
-    return list(inds)
+    return list(inds), raw_count
 
 
 async def main():
@@ -1633,7 +1724,7 @@ async def main():
         usage="%(prog)s [config_path] [options]",
         epilog=(
             "Examples:\n"
-            "  passivbot optimize configs/examples/default_trailing_grid_long_npos10.json -s XMR -sd 2025 -c 4 --suite n\n"
+            "  passivbot optimize configs/examples/default_trailing_grid_long_npos7.json -s XMR -sd 2025 -c 4 --suite n\n"
             "  passivbot optimize -e bybit -s BTC,ETH -i 10000 -ps 200\n"
             "\n"
             "Use --help-all to show every config override flag, including optimize bounds."
@@ -1770,11 +1861,6 @@ async def main():
         if key.startswith("optimize.bounds.") and value is not None
     }
     apply_fine_tune_bounds(config, fine_tune_params, cli_bounds_overrides)
-    if fine_tune_params:
-        logging.info(
-            "Fine-tuning mode active for %s",
-            ", ".join(sorted(fine_tune_params)),
-        )
     suite_override = None
     if args.suite_config:
         logging.info("loading suite config %s", args.suite_config)
@@ -1897,54 +1983,37 @@ async def main():
 
             if use_combined:
                 exchange = "combined"
-                coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices, _timestamps = (
-                    await prepare_hlcvs_mss(config, exchange)
+                coins, mss = _register_exchange_data(
+                    exchange,
+                    await prepare_hlcvs_mss(config, exchange),
+                    config,
+                    msss=msss,
+                    hlcvs_specs=hlcvs_specs,
+                    btc_usd_specs=btc_usd_specs,
+                    timestamps_dict=timestamps_dict,
+                    array_manager=array_manager,
                 )
-                hlcvs, _timestamps, btc_usd_prices = _maybe_aggregate_backtest_data(
-                    hlcvs, _timestamps, btc_usd_prices, mss, config
-                )
-                timestamps_dict[exchange] = _timestamps
                 exchange_preference = defaultdict(list)
                 for coin in coins:
                     exchange_preference[mss[coin]["exchange"]].append(coin)
                 for ex in exchange_preference:
                     logging.info(f"chose {ex} for {','.join(exchange_preference[ex])}")
-                config["backtest"]["coins"][exchange] = coins
-                msss[exchange] = mss
-                validate_array(hlcvs, "hlcvs")
-                hlcvs_array = np.ascontiguousarray(hlcvs, dtype=np.float64)
-                hlcvs_spec, _ = array_manager.create_from(hlcvs_array)
-                hlcvs_specs[exchange] = hlcvs_spec
-
-                btc_usd_array = np.ascontiguousarray(btc_usd_prices, dtype=np.float64)
-                validate_array(btc_usd_array, f"btc_usd_data for {exchange}", allow_nan=False)
-                btc_usd_spec, _ = array_manager.create_from(btc_usd_array)
-                btc_usd_specs[exchange] = btc_usd_spec
-                del hlcvs, hlcvs_array, btc_usd_prices, btc_usd_array
             else:
-                tasks = {}
-                for exchange in backtest_exchanges:
-                    tasks[exchange] = asyncio.create_task(prepare_hlcvs_mss(config, exchange))
-                for exchange in backtest_exchanges:
-                    coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices, _timestamps = (
-                        await tasks[exchange]
+                tasks = {
+                    exchange: asyncio.create_task(prepare_hlcvs_mss(config, exchange))
+                    for exchange in backtest_exchanges
+                }
+                for exchange, task in tasks.items():
+                    _register_exchange_data(
+                        exchange,
+                        await task,
+                        config,
+                        msss=msss,
+                        hlcvs_specs=hlcvs_specs,
+                        btc_usd_specs=btc_usd_specs,
+                        timestamps_dict=timestamps_dict,
+                        array_manager=array_manager,
                     )
-                    hlcvs, _timestamps, btc_usd_prices = _maybe_aggregate_backtest_data(
-                        hlcvs, _timestamps, btc_usd_prices, mss, config
-                    )
-                    timestamps_dict[exchange] = _timestamps
-                    config["backtest"]["coins"][exchange] = coins
-                    msss[exchange] = mss
-                    validate_array(hlcvs, "hlcvs")
-                    hlcvs_array = np.ascontiguousarray(hlcvs, dtype=np.float64)
-                    hlcvs_spec, _ = array_manager.create_from(hlcvs_array)
-                    hlcvs_specs[exchange] = hlcvs_spec
-
-                    btc_usd_array = np.ascontiguousarray(btc_usd_prices, dtype=np.float64)
-                    validate_array(btc_usd_array, f"btc_usd_data for {exchange}", allow_nan=False)
-                    btc_usd_spec, _ = array_manager.create_from(btc_usd_array)
-                    btc_usd_specs[exchange] = btc_usd_spec
-                    del hlcvs, hlcvs_array, btc_usd_prices, btc_usd_array
         exchanges = backtest_exchanges
         exchanges_fname = "combined" if len(backtest_exchanges) > 1 else "_".join(exchanges)
         date_fname = ts_to_date(utc_ms())[:19].replace(":", "_")
@@ -2027,6 +2096,8 @@ async def main():
             ignore_sigint_in_worker=ignore_sigint_in_worker,
             get_starting_configs=get_starting_configs,
             configs_to_individuals=configs_to_individuals,
+            iter_starting_configs=iter_starting_configs,
+            configs_to_individuals_streaming=configs_to_individuals_streaming,
             optimization_shape=evaluator.optimization_shape,
             record_individual_result=_record_individual_result,
             run_evolution=ea_mu_plus_lambda_stream,

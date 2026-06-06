@@ -3,7 +3,7 @@
 Passivbot configurations can be optimized using a multi-objective evolutionary algorithm to balance performance metrics while meeting constraints.
 
 The canonical defaults live in `src/config/schema.py`. The example config
-`configs/examples/default_trailing_grid_long_npos10.json` mirrors those defaults exactly. For the
+`configs/examples/default_trailing_grid_long_npos7.json` mirrors those defaults exactly. For the
 recommended config workflow, see [Config Workflow](config_workflow.md).
 
 Optimization requires the full install profile:
@@ -28,10 +28,36 @@ single-scenario by default unless you explicitly enable suite mode.
 
 Example:
 ```bash
-passivbot optimize configs/examples/default_trailing_grid_long_npos10.json --start configs/starting_pool/
+passivbot optimize configs/examples/default_trailing_grid_long_npos7.json --start configs/starting_pool/
 ```
 
 Most config parameters can be modified via CLI. `passivbot optimize -h` for more info.
+
+### Scoring Objectives
+
+`optimize.scoring` defines the metrics the optimizer tries to improve. The canonical form is a
+list of objective objects:
+
+```json
+"scoring": [
+  {"metric": "adg_strategy_eq", "goal": "max"},
+  {"metric": "drawdown_worst_strategy_eq", "goal": "min"}
+]
+```
+
+- `metric` is a canonical backtest metric name.
+- `goal: "max"` means higher raw metric values are better.
+- `goal: "min"` means lower raw metric values are better.
+
+The older shorthand form is still accepted for built-in metrics with known default goals:
+
+```json
+"scoring": ["adg_strategy_eq", "drawdown_worst_strategy_eq"]
+```
+
+Passivbot normalizes that shorthand to the canonical object form during config formatting. For
+custom or newly added metrics, use the explicit object form so the optimizer knows whether to
+minimize or maximize the metric.
 
 ### Backend Selection
 
@@ -116,7 +142,8 @@ The main NSGA-III-specific knob is:
   - In that case Passivbot resolves the NSGA-III reference directions first and then uses the
     number of reference directions as the population size.
   - For the default 8-objective setup, that means `population_size = 330`.
-  - For `pymoo` + `nsga2`, set an explicit integer.
+  - For `pymoo` + `nsga2`, `null` means “auto” and currently resolves to `250`.
+  - Set an explicit integer when you want to override either auto behavior.
   - For `deap`, Passivbot currently falls back to its legacy fixed default when `null` is left in
     place.
 
@@ -166,7 +193,9 @@ Recommended defaults for typical Passivbot runs:
   variation much more local or much more aggressive.
 - Keep `crossover_prob_var: 0.5` unless you have evidence that crossover is either too timid or
   too disruptive for your runs.
-- Leave `population_size: null` and `ref_dirs.n_partitions: "auto"` for the default Passivbot NSGA-III behavior.
+- Leave `population_size: null` and `ref_dirs.n_partitions: "auto"` for default pymoo behavior:
+  NSGA-II resolves null population size to `250`, while NSGA-III derives it from reference
+  directions.
 - Keep `pareto_max_size: 1000` unless archived front updates become a measured bottleneck for your
   machine or workflow.
 - If you need more or less exploration pressure, change `n_partitions` or override
@@ -230,22 +259,26 @@ Trade-offs:
 
 When you only want to adjust a handful of parameters and keep everything else fixed, use
 `--fine_tune_params` (short: `-ft`). Provide a comma-separated list of `optimize.bounds`
-keys to keep tunable; all other bounds are locked to their current config values before
-the run starts.
+selectors to keep tunable; all other bounds are locked to their current config values
+before the run starts. A selector matches any bounds key containing that string, so
+`close_grid` matches both `long_close_grid_*` and `short_close_grid_*` bounds.
 
 ```bash
-passivbot optimize configs/examples/default_trailing_grid_long_npos10.json \
-  --fine_tune_params long_entry_grid_spacing_pct,long_entry_initial_qty_pct
+passivbot optimize configs/examples/default_trailing_grid_long_npos7.json \
+  --fine_tune_params close_grid,entry_grid_spacing_pct
 ```
 
 Behind the scenes the optimizer sets every unlisted bound to `[value, value]`, so the GA
 can mutate only the parameters you specified. Bounds for the listed parameters remain as
-configured.
+configured. The optimizer logs each selector expansion on separate sorted lines before
+the run starts.
 
-`optimize.fixed_params` provides the config-file equivalent: list `optimize.bounds` keys that
-should always be fixed to their current config values. Internally, `--fine_tune_params` and
-`optimize.fixed_params` are merged into one effective fixed-parameter set before bounds are
-collapsed.
+`optimize.fixed_params` provides the config-file equivalent: list `optimize.bounds`
+selectors that should always be fixed to their current config values. Broad selectors are
+literal substring matches; for example, `trailing` fixes all bounds whose names contain
+`trailing`, while `close` also matches `unstuck_close_pct`. Use narrower selectors when
+needed. Internally, `--fine_tune_params` and `optimize.fixed_params` are merged into one
+effective fixed-parameter set before bounds are collapsed.
 
 `optimize.fixed_runtime_overrides` is different: it overrides runtime config values only during
 optimize evaluations, without changing the stored/live config value. This is useful for
@@ -261,9 +294,9 @@ operator-risk settings such as:
 ```
 
 That default override disables terminal no-restart during optimizer evaluations so candidates can
-be constrained through `drawdown_worst_hsl`, `drawdown_worst_ema_hsl`,
-`drawdown_worst_mean_1pct_hsl`, `drawdown_worst_mean_1pct_ema_hsl`, and
-`peak_recovery_hours_hsl` instead of being prematurely truncated.
+be constrained through `drawdown_worst_strategy_eq`, `drawdown_worst_ema_strategy_eq`,
+`drawdown_worst_mean_1pct_strategy_eq`, `drawdown_worst_mean_1pct_ema_strategy_eq`, and
+`strategy_eq_recovery_days_max` instead of being prematurely truncated.
 
 When you provide many starting configs, optimizer now also bounds how many seed evaluations may be
 in flight at once:
@@ -343,6 +376,8 @@ mode is enabled) instead of the older `analyses_combined` / per-exchange analysi
 - Avoids duplicates through hash tracking and perturbation
 - Logs starting-config dedup statistics at startup, including how many raw configs collapsed after quantization and how many extra TWEL-scaled variants survived
 
+Per-coin warmup inside an optimizer run is sized from `optimize.bounds`, not from the `bot.*` template values. The optimizer treats each optimized field as if it were at its upper bound when computing how much history each coin needs, so every individual evaluated in the same run trades on an identical window. Standalone `passivbot backtest <config.json>` is unaffected and still sizes warmup from whatever bot values the config you hand it contains.
+
 ## Output Structure
 
 Each optimization run creates a directory:
@@ -380,8 +415,9 @@ python3 src/pareto_store.py optimize_results/.../pareto/
 loads the JSON artifacts, optionally filters them with `--limit` / `--limits`, then chooses one
 candidate using a named decision rule. It accepts either a `pareto/` directory, an optimize run
 directory, or no path at all, in which case it falls back to the newest local
-`optimize_results/.../pareto`. It also shows the retained front's ideal point for the active
-objectives. Recommended workflow:
+`optimize_results/.../pareto` by lexicographic run-directory name, considering only runs whose
+`pareto/` subdirectory contains at least one `*.json` candidate. It also shows the retained
+front's ideal point for the active objectives. Recommended workflow:
 
 1. apply hard filters with `--limit`
 2. use `-m reference` if you already know your target ADG / drawdown / recovery regime
@@ -404,14 +440,14 @@ formal MCDM implementations. For most real runs, `knee`, `reference`, and `utili
 useful methods.
 
 `-o` / `--objectives` can also reference stored metrics outside the original `optimize.scoring`
-list, for example `sharpe_ratio_strategy_pnl_rebased`, as long as that metric is present in the
+list, for example `sharpe_ratio_strategy_eq`, as long as that metric is present in the
 saved Pareto JSON and Passivbot has a known default min/max direction for it.
 
 Example:
 
 ```bash
 passivbot tool pareto \
-  -o sharpe_ratio_strategy_pnl_rebased,adg_strategy_pnl_rebased,peak_recovery_hours_hsl \
+  -o sharpe_ratio_strategy_eq,adg_strategy_eq,strategy_eq_recovery_days_max \
   -m ideal
 ```
 
@@ -479,7 +515,7 @@ appends one more canonical entry:
 ```bash
 passivbot optimize \
   --limits '[{"metric":"drawdown_worst","penalize_if":">","value":0.35}]' \
-  --limit 'peak_recovery_hours_hsl <= 500'
+  --limit 'strategy_eq_recovery_days_max <= 21'
 ```
 
 Semantics:
@@ -504,11 +540,12 @@ over all exchanges before scoring.
 
 - `optimize.scoring` lists the objective metrics. Each entry becomes a fitness component in
   sorted order.
+- Each scoring entry is normalized to `{metric, goal}`. `goal: "max"` means higher raw metric
+  values are better; `goal: "min"` means lower raw metric values are better.
 - For every metric, `Evaluator.combine_analyses` computes mean/min/max/std across all
   exchanges in the run. The scoring logic uses the mean (`{metric}_mean`).
-- `Evaluator.scoring_weights` (`src/optimize.py`) assigns the optimization direction: a
-  negative weight means “maximize” (value is multiplied by -1 before minimization), while a
-  positive weight means “minimize.”
+- Internally, Passivbot converts all objectives into optimizer engine space where lower is better,
+  so both the `deap` and `pymoo` backends receive consistent minimization-style values.
 - Penalties from `optimize.limits` are added to every objective when a bound is violated,
   turning constraint breaches into very poor scores.
 - Metrics are emitted with both USD and BTC suffixes (for example, `adg_usd` and `adg_btc`).
@@ -526,19 +563,19 @@ over all exchanges before scoring.
 | `adg`, `adg_w` | Average Daily Gain (smoothed geometric) and its recency-biased counterpart |
 | `mdg`, `mdg_w` | Median Daily Gain and its recency-biased counterpart |
 | `gain` | Final balance gain (end/start ratio) |
-| `adg_strategy_pnl_rebased`, `adg_strategy_pnl_rebased_w` | Collateral-agnostic geometric growth on the strategy-PnL rebased equity curve |
-| `mdg_strategy_pnl_rebased`, `mdg_strategy_pnl_rebased_w` | Median-day version of the same rebased growth family |
+| `adg_strategy_eq`, `adg_strategy_eq_w` | Collateral-agnostic geometric growth on the synthetic strategy-equity curve |
+| `mdg_strategy_eq`, `mdg_strategy_eq_w` | Median-day version of the same strategy-equity growth family |
 | `*_per_exposure_{long,short}` | Above metrics divided by the configured exposure limit per side |
 
 ### Risk Metrics
 | Metric | Description |
 |--------|-------------|
 | `drawdown_worst` | Maximum peak-to-trough drawdown |
-| `drawdown_worst_mean_1pct` | Mean of worst 1% drawdowns (daily) |
-| `drawdown_worst_hsl` | Worst account-level HSL drawdown |
-| `drawdown_worst_ema_hsl` | Worst EMA-smoothed HSL drawdown, shared as `max(long, short)` |
-| `drawdown_worst_mean_1pct_hsl` | Mean of worst 1% HSL drawdown samples |
-| `drawdown_worst_mean_1pct_ema_hsl` | Mean of worst 1% EMA-smoothed HSL drawdown samples, shared as `max(long, short)` |
+| `drawdown_worst_mean_1pct` | Mean of worst 1% daily worst drawdowns, computed from full-resolution drawdowns before daily reduction |
+| `drawdown_worst_strategy_eq` | Worst drawdown on collateral-agnostic strategy equity |
+| `drawdown_worst_ema_strategy_eq` | Worst EMA-smoothed strategy-equity drawdown, shared as `max(long, short)` |
+| `drawdown_worst_mean_1pct_strategy_eq` | Mean of worst 1% daily worst strategy-equity drawdowns, computed from full-resolution strategy-equity drawdowns before daily reduction |
+| `drawdown_worst_mean_1pct_ema_strategy_eq` | Mean of worst 1% EMA-smoothed strategy-equity drawdown samples, shared as `max(long, short)` |
 | `expected_shortfall_1pct` | Mean of worst 1% daily losses (CVaR) |
 | `equity_balance_diff_neg_max` / `pos_max` | Largest divergence between equity and account balance (negative side tracks only drawdowns below balance; positive side tracks only run-ups above balance) |
 | `equity_balance_diff_neg_mean` / `pos_mean` | Average divergence between equity and balance (split by sign as above) |
@@ -551,20 +588,21 @@ over all exchanges before scoring.
 | `calmar_ratio`, `calmar_ratio_w` | Return divided by maximum drawdown |
 | `sterling_ratio`, `sterling_ratio_w` | Return divided by the average of the worst 1% drawdowns |
 | `omega_ratio`, `omega_ratio_w` | Sum of positive returns / sum of absolute negative returns |
-| `*_strategy_pnl_rebased`, `*_strategy_pnl_rebased_w` ratios | Collateral-agnostic ratio family using the strategy-PnL rebased equity curve |
+| `*_strategy_eq`, `*_strategy_eq_w` ratios | Collateral-agnostic ratio family using the strategy-equity curve |
 
 ### Position & Execution Metrics
 | Metric | Description |
 |--------|-------------|
 | `positions_held_per_day` | Average number of unique positions opened per day |
-| `position_held_hours_{mean,median,max}` | Holding-time statistics in hours |
-| `position_unchanged_hours_max` | Longest span without modifying an existing position |
+| `position_held_hours_{mean,median,max}`, `position_held_days_{mean,median,max}` | Holding-time statistics in hours and equivalent days |
+| `position_unchanged_hours_max`, `position_unchanged_days_max` | Longest span without modifying an existing position, in hours and equivalent days |
 | `volume_pct_per_day_avg`, `volume_pct_per_day_avg_w` | Average traded volume as % of account per day, with recency bias |
-| `peak_recovery_hours_equity_usd`, `_btc` | Longest time (in hours) the equity curve stayed below its prior peak before recovering, per denomination. Available for scoring and limit checks (e.g. `{"metric": "peak_recovery_hours_equity_usd", "penalize_if": ">", "value": 168}`). |
-| `peak_recovery_hours_pnl` | Longest recovery time (hours) of cumulative realised PnL (USD). Useful for monitoring realised drawdown recovery latency. |
-| `peak_recovery_hours_hsl` | Longest time below the all-time rebased HSL peak before recovery. Intended for optimizer risk limits. |
-| `high_exposure_hours_{mean,max}_long` | Mean / maximum duration (hours) of continuous periods where total long wallet exposure exceeded the daily-resampled average long TWE |
-| `high_exposure_hours_{mean,max}_short` | Mean / maximum duration (hours) of continuous periods where total short wallet exposure exceeded the daily-resampled average short TWE |
+| `peak_recovery_hours_equity_usd`, `_btc`; `peak_recovery_days_equity_usd`, `_btc` | Longest time the equity curve stayed below its prior peak before recovering, per denomination, in hours and equivalent days. Available for scoring and limit checks (e.g. `{"metric": "peak_recovery_days_equity_usd", "penalize_if": ">", "value": 7}`). |
+| `peak_recovery_hours_pnl`, `peak_recovery_days_pnl` | Longest recovery time of cumulative realised PnL (USD), in hours and equivalent days. Useful for monitoring realised drawdown recovery latency. |
+| `strategy_eq_recovery_days_mean`, `strategy_eq_recovery_days_median`, `strategy_eq_recovery_days_p95`, `strategy_eq_recovery_days_p99`, `strategy_eq_recovery_days_mean_worst_5pct`, `strategy_eq_recovery_days_mean_worst_1pct`, `strategy_eq_recovery_days_max` | Per-sample strategy-equity time-to-exceed distribution in days. Each sample measures how long until a later strategy-equity sample strictly exceeds it; unrecovered samples use the open tail to the backtest end. |
+| `peak_recovery_hours_strategy_eq`, `peak_recovery_days_strategy_eq` | Legacy max-recovery metrics. `peak_recovery_days_strategy_eq` is an alias for `strategy_eq_recovery_days_max`; the hours variant remains available for older configs. |
+| `high_exposure_hours_{mean,max}_long`, `high_exposure_days_{mean,max}_long` | Mean / maximum duration of continuous periods where total long wallet exposure exceeded the daily-resampled average long TWE, in hours and equivalent days |
+| `high_exposure_hours_{mean,max}_short`, `high_exposure_days_{mean,max}_short` | Mean / maximum duration of continuous periods where total short wallet exposure exceeded the daily-resampled average short TWE, in hours and equivalent days |
 
 ### Equity Curve Quality
 | Metric | Description |

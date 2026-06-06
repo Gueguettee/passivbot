@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from config.scoring import ObjectiveSpec, dominates_objectives, extract_objective_specs, from_engine_value
+from config.metrics import resolve_metric_value
 
 
 @dataclass(frozen=True)
@@ -13,6 +15,20 @@ class ParetoPoint:
     hash_id: str
     objectives: Tuple[float, ...]
     violation: float = 0.0
+
+
+def detect_latest_pareto_dir(root: str | Path = "optimize_results") -> Optional[Path]:
+    base = Path(root).expanduser()
+    if not base.is_dir():
+        return None
+    runs = [
+        path
+        for path in base.iterdir()
+        if path.is_dir() and (path / "pareto").is_dir() and any((path / "pareto").glob("*.json"))
+    ]
+    if not runs:
+        return None
+    return (sorted(runs, key=lambda path: path.name)[-1] / "pareto").resolve()
 
 
 def extract_objectives(
@@ -31,9 +47,8 @@ def extract_objectives(
         values: list[float] = []
         keys: list[str] = []
         for idx, spec in enumerate(specs):
-            if spec.metric in objectives_map:
-                value = objectives_map.get(spec.metric)
-            else:
+            value = resolve_metric_value(objectives_map, spec.metric)
+            if value is None:
                 value = objectives_map.get(f"w_{idx}")
                 if value is not None:
                     value = from_engine_value(spec, float(value))

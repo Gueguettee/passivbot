@@ -51,6 +51,10 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "tools.probe_hyperliquid_balance",
         "read-only Hyperliquid balance smoke test",
     ),
+    "hyperliquid-abstraction-probe": CommandSpec(
+        "tools.probe_hyperliquid_abstraction",
+        "read-only Hyperliquid account abstraction probe",
+    ),
     "hyperliquid-order-margin-probe": CommandSpec(
         "tools.probe_hyperliquid_order_margin",
         "mutating Hyperliquid order-margin diagnostic",
@@ -84,9 +88,24 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "plot iterative history files (requires full install)",
         requires_full=True,
     ),
+    "inspect-ohlcvs": CommandSpec(
+        "tools.inspect_ohlcvs",
+        "inspect v2 OHLCV cache metadata and gaps (requires full install)",
+        requires_full=True,
+    ),
+    "ohlcvs-doctor": CommandSpec(
+        "tools.ohlcvs_doctor",
+        "audit and repair v2 OHLCV catalog metadata (requires full install)",
+        requires_full=True,
+    ),
     "migrate-historical-data": CommandSpec(
         "tools.migrate_historical_data",
         "migrate historical data layout (requires full install)",
+        requires_full=True,
+    ),
+    "merge-paretos": CommandSpec(
+        "tools.merge_paretos",
+        "merge Pareto fronts into starting configs (requires full install)",
         requires_full=True,
     ),
     "monitor-relay": CommandSpec(
@@ -124,6 +143,21 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "launch Pareto dashboard (requires full install)",
         requires_full=True,
     ),
+    "pareto-analyze": CommandSpec(
+        "tools.pareto_analyzer",
+        "analyze Pareto front config and metric distributions (requires full install)",
+        requires_full=True,
+    ),
+    "pareto-analysis": CommandSpec(
+        "tools.pareto_analyzer",
+        "analyze Pareto front config and metric distributions (requires full install)",
+        requires_full=True,
+    ),
+    "pareto-compress": CommandSpec(
+        "tools.pareto_compress",
+        "select a compact representative subset from a Pareto front (requires full install)",
+        requires_full=True,
+    ),
     "pareto-explorer": CommandSpec(
         "tools.pareto_explorer",
         "select a single candidate from a Pareto front (requires full install)",
@@ -135,6 +169,14 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         requires_full=True,
     ),
     "streamline-json": CommandSpec("tools.streamline_json", "reformat config or result JSON"),
+    "ticker-probe": CommandSpec(
+        "tools.probe_ticker_capabilities",
+        "read-only exchange ticker capability probe",
+    ),
+    "ticker-endpoint-probe": CommandSpec(
+        "tools.probe_ccxt_ticker_endpoints",
+        "multi-user CCXT ticker endpoint latency probe",
+    ),
     "verify-hlcvs-data": CommandSpec(
         "tools.verify_hlcvs_data",
         "verify cached OHLCV datasets (requires full install)",

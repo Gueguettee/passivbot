@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 from pathlib import Path
 import asyncio
 
@@ -57,12 +58,12 @@ def test_download_dispatch_forwards_new_module_and_prog(monkeypatch):
     monkeypatch.setattr(cli_main, "_invoke_module_main", fake_invoke_module_main)
     monkeypatch.setattr(cli_main, "_missing_full_install_markers", lambda: [])
 
-    assert cli_main.main(["download", "configs/examples/default_trailing_grid_long_npos10.json"]) == 0
+    assert cli_main.main(["download", "configs/examples/default_trailing_grid_long_npos7.json"]) == 0
 
     assert captured["module_name"] == "ohlcv_download"
     assert captured["argv"] == [
         "passivbot download",
-        "configs/examples/default_trailing_grid_long_npos10.json",
+        "configs/examples/default_trailing_grid_long_npos7.json",
     ]
     assert captured["prog_env"] == "passivbot download"
     assert sys.argv == original_argv
@@ -128,9 +129,12 @@ def test_tool_help_lists_supported_tools(capsys):
     assert cli_main.main(["tool", "-h"]) == 0
 
     out = capsys.readouterr().out
+    assert "hyperliquid-abstraction-probe" in out
     assert "hyperliquid-balance-probe" in out
     assert "hyperliquid-order-margin-probe" in out
     assert "hyperliquid-position-probe" in out
+    assert "inspect-ohlcvs" in out
+    assert "merge-paretos" in out
     assert "monitor-dev" in out
     assert "monitor-relay" in out
     assert "monitor-web" in out
@@ -287,6 +291,81 @@ def test_pareto_tool_dispatch_forwards_module_and_prog(monkeypatch):
     assert captured["prog_env"] == "passivbot tool pareto"
 
 
+def test_pareto_analyze_tool_dispatch_forwards_module_and_prog(monkeypatch):
+    captured = {}
+    original_argv = sys.argv[:]
+
+    def fake_invoke_module_main(module_name):
+        captured["module_name"] = module_name
+        captured["argv"] = sys.argv[:]
+        captured["prog_env"] = os.environ.get("PASSIVBOT_CLI_PROG")
+        return True, 0
+
+    monkeypatch.setattr(cli_main, "_invoke_module_main", fake_invoke_module_main)
+    monkeypatch.setattr(cli_main, "_missing_full_install_markers", lambda: [])
+
+    assert cli_main.main(["tool", "pareto-analyze", "optimize_results/example/pareto"]) == 0
+
+    assert captured["module_name"] == "tools.pareto_analyzer"
+    assert captured["argv"] == [
+        "passivbot tool pareto-analyze",
+        "optimize_results/example/pareto",
+    ]
+    assert captured["prog_env"] == "passivbot tool pareto-analyze"
+    assert sys.argv == original_argv
+    assert os.environ.get("PASSIVBOT_CLI_PROG") is None
+
+
+def test_pareto_compress_tool_dispatch_forwards_module_and_prog(monkeypatch):
+    captured = {}
+    original_argv = sys.argv[:]
+
+    def fake_invoke_module_main(module_name):
+        captured["module_name"] = module_name
+        captured["argv"] = sys.argv[:]
+        captured["prog_env"] = os.environ.get("PASSIVBOT_CLI_PROG")
+        return True, 0
+
+    monkeypatch.setattr(cli_main, "_invoke_module_main", fake_invoke_module_main)
+    monkeypatch.setattr(cli_main, "_missing_full_install_markers", lambda: [])
+
+    assert cli_main.main(["tool", "pareto-compress", "optimize_results/example/pareto", "8"]) == 0
+
+    assert captured["module_name"] == "tools.pareto_compress"
+    assert captured["argv"] == [
+        "passivbot tool pareto-compress",
+        "optimize_results/example/pareto",
+        "8",
+    ]
+    assert captured["prog_env"] == "passivbot tool pareto-compress"
+    assert sys.argv == original_argv
+    assert os.environ.get("PASSIVBOT_CLI_PROG") is None
+
+
+def test_merge_paretos_tool_dispatch_forwards_module_and_prog(monkeypatch):
+    captured = {}
+
+    def fake_invoke_module_main(module_name):
+        captured["module_name"] = module_name
+        captured["argv"] = sys.argv[:]
+        captured["prog_env"] = os.environ.get("PASSIVBOT_CLI_PROG")
+        return True, 0
+
+    monkeypatch.setattr(cli_main, "_invoke_module_main", fake_invoke_module_main)
+    monkeypatch.setattr(cli_main, "_missing_full_install_markers", lambda: [])
+
+    assert cli_main.main(["tool", "merge-paretos", "long_run", "short_run", "merged"]) == 0
+
+    assert captured["module_name"] == "tools.merge_paretos"
+    assert captured["argv"] == [
+        "passivbot tool merge-paretos",
+        "long_run",
+        "short_run",
+        "merged",
+    ]
+    assert captured["prog_env"] == "passivbot tool merge-paretos"
+
+
 def test_monitor_relay_tool_dispatch_forwards_module_and_prog(monkeypatch):
     captured = {}
 
@@ -304,6 +383,25 @@ def test_monitor_relay_tool_dispatch_forwards_module_and_prog(monkeypatch):
     assert captured["module_name"] == "tools.monitor_relay"
     assert captured["argv"] == ["passivbot tool monitor-relay", "--port", "9000"]
     assert captured["prog_env"] == "passivbot tool monitor-relay"
+
+
+def test_inspect_ohlcvs_tool_dispatch_forwards_module_and_prog(monkeypatch):
+    captured = {}
+
+    def fake_invoke_module_main(module_name):
+        captured["module_name"] = module_name
+        captured["argv"] = sys.argv[:]
+        captured["prog_env"] = os.environ.get("PASSIVBOT_CLI_PROG")
+        return True, 0
+
+    monkeypatch.setattr(cli_main, "_invoke_module_main", fake_invoke_module_main)
+    monkeypatch.setattr(cli_main, "_missing_full_install_markers", lambda: [])
+
+    assert cli_main.main(["tool", "inspect-ohlcvs", "--exchange", "binance"]) == 0
+
+    assert captured["module_name"] == "tools.inspect_ohlcvs"
+    assert captured["argv"] == ["passivbot tool inspect-ohlcvs", "--exchange", "binance"]
+    assert captured["prog_env"] == "passivbot tool inspect-ohlcvs"
 
 
 def test_monitor_dev_tool_dispatch_forwards_module_and_prog(monkeypatch):
@@ -402,6 +500,89 @@ def test_hyperliquid_position_probe_dispatch_forwards_module_and_prog(monkeypatc
     assert captured["prog_env"] == "passivbot tool hyperliquid-position-probe"
 
 
+def test_hyperliquid_abstraction_probe_dispatch_forwards_module_and_prog(monkeypatch):
+    captured = {}
+
+    def fake_invoke_module_main(module_name):
+        captured["module_name"] = module_name
+        captured["argv"] = sys.argv[:]
+        captured["prog_env"] = os.environ.get("PASSIVBOT_CLI_PROG")
+        return True, 0
+
+    monkeypatch.setattr(cli_main, "_invoke_module_main", fake_invoke_module_main)
+    monkeypatch.setattr(cli_main, "_missing_full_install_markers", lambda: [])
+
+    assert cli_main.main(["tool", "hyperliquid-abstraction-probe", "--user", "hyperliquid_01"]) == 0
+
+    assert captured["module_name"] == "tools.probe_hyperliquid_abstraction"
+    assert captured["argv"] == [
+        "passivbot tool hyperliquid-abstraction-probe",
+        "--user",
+        "hyperliquid_01",
+    ]
+    assert captured["prog_env"] == "passivbot tool hyperliquid-abstraction-probe"
+
+
+def test_ticker_probe_dispatch_forwards_module_and_prog(monkeypatch):
+    captured = {}
+
+    def fake_invoke_module_main(module_name):
+        captured["module_name"] = module_name
+        captured["argv"] = sys.argv[:]
+        captured["prog_env"] = os.environ.get("PASSIVBOT_CLI_PROG")
+        return True, 0
+
+    monkeypatch.setattr(cli_main, "_invoke_module_main", fake_invoke_module_main)
+    monkeypatch.setattr(cli_main, "_missing_full_install_markers", lambda: [])
+
+    assert (
+        cli_main.main(
+            [
+                "tool",
+                "ticker-probe",
+                "--user",
+                "ebybitsub03",
+                "--symbols",
+                "BTC/USDT:USDT",
+            ]
+        )
+        == 0
+    )
+
+    assert captured["module_name"] == "tools.probe_ticker_capabilities"
+    assert captured["argv"] == [
+        "passivbot tool ticker-probe",
+        "--user",
+        "ebybitsub03",
+        "--symbols",
+        "BTC/USDT:USDT",
+    ]
+    assert captured["prog_env"] == "passivbot tool ticker-probe"
+
+
+def test_ticker_endpoint_probe_dispatch_forwards_module_and_prog(monkeypatch):
+    captured = {}
+
+    def fake_invoke_module_main(module_name):
+        captured["module_name"] = module_name
+        captured["argv"] = sys.argv[:]
+        captured["prog_env"] = os.environ.get("PASSIVBOT_CLI_PROG")
+        return True, 0
+
+    monkeypatch.setattr(cli_main, "_invoke_module_main", fake_invoke_module_main)
+    monkeypatch.setattr(cli_main, "_missing_full_install_markers", lambda: [])
+
+    assert cli_main.main(["tool", "ticker-endpoint-probe", "--users", "ebybitsub03"]) == 0
+
+    assert captured["module_name"] == "tools.probe_ccxt_ticker_endpoints"
+    assert captured["argv"] == [
+        "passivbot tool ticker-endpoint-probe",
+        "--users",
+        "ebybitsub03",
+    ]
+    assert captured["prog_env"] == "passivbot tool ticker-endpoint-probe"
+
+
 def test_unknown_command_exits_with_error():
     with pytest.raises(SystemExit) as exc:
         cli_main.main(["unknown"])
@@ -463,6 +644,41 @@ def test_run_module_falls_back_to_runpy_when_module_has_no_main(monkeypatch):
     assert captured["module_name"] == "tools.generate_mcap_list"
     assert captured["runpy_module_name"] == "tools.generate_mcap_list"
     assert captured["run_name"] == "__main__"
+
+
+def test_generate_mcap_list_tool_uses_main_without_runpy(monkeypatch, tmp_path):
+    from tools import generate_mcap_list
+
+    output_path = tmp_path / "approved.json"
+
+    monkeypatch.setattr(
+        generate_mcap_list,
+        "get_top_market_caps",
+        lambda n_coins, minimum_market_cap_millions, exchange=None: {
+            "BTC": {"symbol": "btc", "market_cap": 1_000_000_000}
+        },
+    )
+    monkeypatch.setattr(
+        cli_main.runpy,
+        "run_module",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("generate-mcap-list should use main(), not runpy")
+        ),
+    )
+
+    assert (
+        cli_main._run_module(
+            "tools.generate_mcap_list",
+            "passivbot tool generate-mcap-list",
+            ["-n", "1", "-o", str(output_path)],
+        )
+        == 0
+    )
+
+    assert json.loads(output_path.read_text(encoding="utf-8")) == ["BTC"]
+    assert json.loads(output_path.with_name("approved_full.json").read_text(encoding="utf-8"))[
+        "BTC"
+    ]["symbol"] == "btc"
 
 
 def test_invoke_module_main_runs_async_entrypoint(monkeypatch):

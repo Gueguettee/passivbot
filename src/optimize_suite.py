@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from copy import deepcopy
 from dataclasses import dataclass
@@ -16,7 +15,11 @@ from config import load_prepared_config
 from config.access import require_config_value, require_live_value
 from config.overrides import parse_overrides
 from config_utils import format_config
-from warmup_utils import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes
+from optimization.warmup import (
+    compute_optimizer_backtest_warmup_minutes,
+    compute_optimizer_per_coin_warmup_minutes,
+    stamp_warmup_metadata,
+)
 from shared_arrays import attach_shared_array
 from suite_runner import (
     SuiteScenario,
@@ -24,8 +27,6 @@ from suite_runner import (
     aggregate_metrics,
     apply_scenario,
     build_scenarios,
-    _compute_effective_coin_exchange,
-    _build_scenario_signature,
     collect_suite_coin_sources,
     filter_coins_by_exchange_assignment,
     prepare_master_datasets,
@@ -142,6 +143,7 @@ async def prepare_suite_contexts(
         shared_array_manager=shared_array_manager,
         needed_individual_exchanges=needed_individual,
         candle_interval_minutes=candle_interval,
+        scenarios=scenarios,
     )
     available_coins = set()
     for dataset in datasets.values():
@@ -155,7 +157,6 @@ async def prepare_suite_contexts(
         set(ds.exchange for ds in datasets.values() if ds.exchange != "combined")
     ) or (datasets["combined"].available_exchanges if has_combined else [])
 
-    seen_signatures: Dict[str, str] = {}
     contexts: List[ScenarioEvalContext] = []
 
     def _build_lazy_mss_slice(
@@ -173,8 +174,7 @@ async def prepare_suite_contexts(
             coin: deepcopy(dataset.mss.get(coin, {})) for coin in selected_coins
         }
         # Adjust per-coin indices relative to the time slice to avoid full hlcvs copies.
-        warmup_map = compute_per_coin_warmup_minutes(scenario_config)
-        default_warm = int(warmup_map.get("__default__", 0))
+        warmup_map = compute_optimizer_per_coin_warmup_minutes(scenario_config)
         for coin, meta in mss_slice.items():
             first_idx = int(meta.get("first_valid_index", 0))
             last_idx = int(meta.get("last_valid_index", total_steps_1m - 1))
@@ -202,13 +202,7 @@ async def prepare_suite_contexts(
                     pass
             meta["first_valid_index"] = first_idx
             meta["last_valid_index"] = last_idx
-            warm_minutes = int(meta.get("warmup_minutes", warmup_map.get(coin, default_warm)))
-            meta["warmup_minutes"] = warm_minutes
-            if first_idx > last_idx:
-                trade_start_idx = first_idx
-            else:
-                trade_start_idx = min(last_idx, first_idx + warm_minutes)
-            meta["trade_start_index"] = trade_start_idx
+        stamp_warmup_metadata(mss_slice, selected_coins, warmup_map)
 
         # Meta window details (matches _prepare_dataset_subset semantics without hlcvs copies).
         start_value = require_config_value(scenario_config, "backtest.start_date")
@@ -227,8 +221,8 @@ async def prepare_suite_contexts(
             meta["effective_end_date"] = ts_to_date(int(ts_window[-1]))
             warmup_provided = max(0, int(max(0, start_ts - int(ts_window[0])) // 60_000))
         else:
-            warmup_provided = int(compute_backtest_warmup_minutes(scenario_config))
-        meta["warmup_minutes_requested"] = int(compute_backtest_warmup_minutes(scenario_config))
+            warmup_provided = int(compute_optimizer_backtest_warmup_minutes(scenario_config))
+        meta["warmup_minutes_requested"] = int(compute_optimizer_backtest_warmup_minutes(scenario_config))
         meta["warmup_minutes_provided"] = warmup_provided
         mss_slice["__meta__"] = meta
         return mss_slice
@@ -254,18 +248,6 @@ async def prepare_suite_contexts(
         scenario_config.setdefault("backtest", {})
         scenario_config["backtest"]["coins"] = {}
 
-        coin_exchange = _compute_effective_coin_exchange(
-            scenario, scenario_coins, datasets, dataset_available_exchanges
-        )
-        signature = _build_scenario_signature(scenario_config, coin_exchange)
-        if signature in seen_signatures:
-            logging.info(
-                "Skipping scenario %s (duplicate of %s)",
-                scenario.label,
-                seen_signatures[signature],
-            )
-            continue
-        seen_signatures[signature] = scenario.label
         # Debug visibility to ensure scenario-specific windows/overrides are honored
         logging.debug(
             "Suite scenario %s | start=%s end=%s coins=%s overrides=%s",

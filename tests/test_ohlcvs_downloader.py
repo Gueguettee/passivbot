@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 import hlcv_preparation as hp
+import ohlcv_download
 import ohlcv_utils as ou
 import utils
 
@@ -26,6 +27,9 @@ def test_to_ccxt_exchange_id(monkeypatch):
     assert utils.to_ccxt_exchange_id("bybit") == "bybit"
     # Already ccxt ID stays as-is
     assert utils.to_ccxt_exchange_id("binanceusdm") == "binanceusdm"
+    # User-facing and cache/data names stay on the short exchange spelling.
+    assert utils.to_standard_exchange_name("binanceusdm") == "binance"
+    assert utils.to_standard_exchange_name("kucoinfutures") == "kucoin"
 
 
 def test_deduplicate_rows():
@@ -130,6 +134,44 @@ def test_attempt_gap_fix_ohlcvs_raises_on_huge_gap():
     )
     with pytest.raises(Exception):
         ou.attempt_gap_fix_ohlcvs(df, symbol="HUGE", verbose=False)
+
+
+@pytest.mark.asyncio
+async def test_download_uses_backtest_materialization_path(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_format_approved_ignored_coins(config, exchanges):
+        calls.append(("format", tuple(exchanges)))
+
+    async def fake_prepare_hlcvs_mss(config, exchange, *, force_refetch_gaps=False):
+        calls.append(("prepare", exchange, force_refetch_gaps))
+        return (
+            ["BTC"],
+            np.zeros((1, 1, 4), dtype=np.float64),
+            {"BTC": {}, "__meta__": {"candidate_report": []}},
+            str(tmp_path / "results" / exchange) + "/",
+            tmp_path / "caches" / "hlcvs_data" / f"{exchange}__abc",
+            np.ones(1, dtype=np.float64),
+            np.array([0], dtype=np.int64),
+        )
+
+    monkeypatch.setattr(ohlcv_download, "format_approved_ignored_coins", fake_format_approved_ignored_coins)
+    monkeypatch.setattr(ohlcv_download, "prepare_hlcvs_mss", fake_prepare_hlcvs_mss)
+
+    config = {
+        "backtest": {
+            "exchanges": ["binance", "bybit"],
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "gap_tolerance_ohlcvs_minutes": 120.0,
+        },
+        "live": {"approved_coins": {"long": ["BTC"], "short": []}},
+    }
+
+    await ohlcv_download.warm_ohlcv_caches(config, force_refetch_gaps=True)
+
+    assert calls == [("format", ("binance", "bybit")), ("prepare", "combined", True)]
+    assert config["backtest"]["coins"]["combined"] == ["BTC"]
 
 
 def test_dump_and_load_ohlcvs_roundtrip(tmp_path):

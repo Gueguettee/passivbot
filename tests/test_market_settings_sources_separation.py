@@ -8,6 +8,9 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from ohlcv_catalog import OhlcvCatalog
+from ohlcv_store import OhlcvStore
+
 
 def test_ohlcv_source_extraction():
     """Verify that ohlcv_source is correctly extracted from mss dict."""
@@ -136,7 +139,9 @@ def test_coins_by_exchange_grouping():
 
 
 @pytest.mark.asyncio
-async def test_prepare_hlcvs_combined_impl_uses_ohlcv_source_for_volume_normalization(monkeypatch):
+async def test_prepare_hlcvs_combined_impl_uses_ohlcv_source_for_volume_normalization(
+    monkeypatch, tmp_path
+):
     """Verify production combined flow uses ohlcv_source for volume normalization inputs."""
     import hlcv_preparation as hp
 
@@ -198,7 +203,18 @@ async def test_prepare_hlcvs_combined_impl_uses_ohlcv_source_for_volume_normaliz
 
     config = {
         "backtest": {"gap_tolerance_ohlcvs_minutes": 120},
-        "bot": {"long": {}, "short": {}},
+        "bot": {
+            "long": {
+                "n_positions": 1,
+                "total_wallet_exposure_limit": 1.0,
+                "wallet_exposure_limit": 1.0,
+            },
+            "short": {
+                "n_positions": 0,
+                "total_wallet_exposure_limit": 0.0,
+                "wallet_exposure_limit": 0.0,
+            },
+        },
         "live": {
             "approved_coins": {"long": ["BTC/USDT:USDT"], "short": []},
             "minimum_coin_age_days": 0,
@@ -207,7 +223,10 @@ async def test_prepare_hlcvs_combined_impl_uses_ohlcv_source_for_volume_normaliz
         },
     }
 
-    mss, _timestamps, unified_array = await hp._prepare_hlcvs_combined_impl(
+    catalog = OhlcvCatalog(tmp_path / "caches" / "ohlcvs" / "catalog.sqlite")
+    store = OhlcvStore(tmp_path / "caches" / "ohlcvs", catalog)
+
+    mss, _timestamps, aligned_values_by_coin = await hp._prepare_hlcvs_combined_impl(
         config=config,
         om_dict=om_dict,
         base_start_ts=start_ts,
@@ -215,8 +234,12 @@ async def test_prepare_hlcvs_combined_impl_uses_ohlcv_source_for_volume_normaliz
         end_ts=start_ts + 180_000,
         forced_sources={},
         market_settings_sources={"BTC": "bybit"},
+        force_refetch_gaps=False,
+        catalog=catalog,
+        store=store,
+        legacy_root=None,
     )
 
     assert mss["BTC"]["exchange"] == "bybit"
     assert mss["BTC"]["ohlcv_source"] == "binance"
-    assert unified_array[:, 0, 3].sum() == pytest.approx(candle_df["volume"].sum())
+    assert aligned_values_by_coin["BTC"][:, 3].sum() == pytest.approx(candle_df["volume"].sum())

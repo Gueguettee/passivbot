@@ -8,6 +8,7 @@ import asyncio
 import hjson
 import inspect
 import time
+import warnings
 from collections import defaultdict
 from typing import Dict, Any, List, Union, Optional
 import re
@@ -18,6 +19,10 @@ import portalocker  # type: ignore
 from custom_endpoint_overrides import (
     apply_rest_overrides_to_ccxt,
     resolve_custom_endpoint_override,
+)
+
+warnings.filterwarnings(
+    "ignore", message="timeout has no effect in blocking mode", module="portalocker"
 )
 
 logging.basicConfig(
@@ -87,7 +92,7 @@ def _cleanup_stale_symbol_map_locks() -> None:
                 age = now - stat.st_mtime
                 if age > threshold:
                     lock_path.unlink()
-                    logging.info("removed stale symbol map lock %s (age %.1fs)", lock_path, age)
+                    logging.debug("removed stale symbol map lock %s (age %.1fs)", lock_path, age)
             except FileNotFoundError:
                 continue
             except Exception as exc:
@@ -462,10 +467,15 @@ def filter_markets(markets: dict, exchange: str, quote=None, verbose=False) -> (
     if verbose:
         for line in sorted(set(reasons.values())):
             syms = [k for k in reasons if reasons[k] == line]
+            log = (
+                logging.debug
+                if line in {"not active", "wrong quote", "not swap", "not linear"}
+                else logging.info
+            )
             if len(syms) > 12:
-                logging.info(f"{line}: {len(syms)} symbols")
+                log(f"{line}: {len(syms)} symbols")
             elif len(syms) > 0:
-                logging.info(f"{line}: {','.join(sorted(set([s for s in syms])))}")
+                log(f"{line}: {','.join(sorted(set([s for s in syms])))}")
 
     return eligible, ineligible, reasons
 

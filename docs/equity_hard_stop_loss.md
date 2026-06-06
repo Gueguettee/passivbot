@@ -9,39 +9,40 @@ HSL is configured separately for each `pside`:
 
 Signal construction is selected globally with `live.hsl_signal_mode`:
 
-1. `pside`
+1. `unified` (default)
+   - long and short keep separate HSL controllers
+   - both controllers are fed from the same combined account-level strategy signal
+2. `pside`
    - long HSL uses long realized/unrealized strategy PnL
    - short HSL uses short realized/unrealized strategy PnL
-2. `unified`
-   - long and short keep separate HSL controllers
-   - both controllers are fed from the same unified account-level strategy signal
 
 ### Choosing a Signal Mode
 
-`pside` is the better default in most cases:
+`unified` is the default and the safer general-purpose choice:
 
-1. long HSL reacts to long deterioration
-2. short HSL reacts to short deterioration
-3. one profitable `pside` cannot hide a weak one
-4. side-specific `*_hsl_long` and `*_hsl_short` metrics are easier to interpret
-
-Use `pside` when:
-
-1. long and short are tuned differently
-2. one `pside` should be allowed to halt while the other continues
-3. you want clearer side-local diagnostics and optimization feedback
-
-`unified` is better when you want whole-account awareness:
-
-1. long and short still keep separate thresholds, cooldowns, and halts
-2. both controllers see the same combined account-level strategy signal
-3. one profitable `pside` can offset stress on the other in the HSL trigger signal
+1. HSL reacts to whole-account strategy drawdown
+2. long and short still keep separate thresholds, cooldowns, and halts
+3. account-level stress on either side can influence both HSL controllers
+4. it avoids side-local churn where one side repeatedly halts while the other keeps adding account risk
 
 Use `unified` when:
 
 1. the strategy is intended to behave as one combined book
-2. long and short naturally hedge or subsidize each other
-3. you want account-level stress on one side to influence the HSL trigger signal on the other side
+2. long and short share one capital pool
+3. you want portfolio/account-level drawdown control
+
+`pside` is a specialized side-local signal mode:
+
+1. long HSL reacts only to long deterioration
+2. short HSL reacts only to short deterioration
+3. one profitable `pside` cannot hide a weak one
+4. side-specific `*_strategy_eq_long` and `*_strategy_eq_short` metrics are easier to interpret
+
+Use `pside` when:
+
+1. long and short are intentionally independent strategies
+2. one `pside` should be allowed to halt while the other continues
+3. you optimize and deploy with `live.hsl_signal_mode = "pside"` consistently
 
 This is separate from auto-unstuck and the realized-loss gate:
 
@@ -97,7 +98,7 @@ At RED for one `pside`:
 
 1. that `pside` is forced into panic mode
 2. positions on that `pside` are closed using `hsl_panic_close_order_type`
-3. the bot waits until that `pside` is flat
+3. the bot waits until all positions on that `pside` are fully closed
 4. that `pside` halts
 5. optional cooldown-based restart may occur for that `pside`
 
@@ -109,13 +110,14 @@ In both live and backtests, `hsl_no_restart_drawdown_threshold` is evaluated aga
 
 The intended HSL contract after a valid RED panic is:
 
-1. once a `pside` panic-close has finalized and that `pside` is flat, that RED stop is considered complete
+1. once a `pside` panic-close has finalized and all positions on that `pside` are fully closed, that RED stop is considered complete
 2. that `pside`'s HSL equity tracker is then reset from after that panic
 3. any later cooldown, restart, and future RED decisions for that `pside` are measured from the post-panic state, not from pre-panic peaks
 
 This contract applies both to live runtime and to restart-time history replay.
 
-In practical terms, restart replay must treat a historical panic-flatten event as a completed RED stop even if:
+In practical terms, restart replay must treat a historical RED panic close that fully closed all
+positions on that `pside` as a completed RED stop even if:
 
 1. the panic-close was split across multiple fills
 2. re-entry happened later in the same minute
@@ -132,11 +134,11 @@ that is currently halted in RED cooldown.
 
 1. `panic`
    - panic-close that position immediately
-   - once flat, restart the cooldown timer from that new panic-close
+   - once all positions on that `pside` are fully closed, restart the cooldown timer from that new panic-close
    - this is the safest default
 2. `normal`
    - treat the position as an explicit operator override
-   - while that `pside` is still flat, the bot remains halted and will not open fresh initials on its own
+   - while that `pside` still has no open positions, the bot remains halted and will not open fresh initials on its own
    - clear the halt for that `pside`
    - reset HSL drawdown tracking and rolling-peak state from the current live state
 3. `manual`
@@ -182,7 +184,7 @@ Each `pside` has the same HSL parameter set:
 Live-only HSL parameter:
 
 10. `live.hsl_position_during_cooldown_policy`
-    - controls how the live bot responds if a non-flat position appears on a halted `pside` during RED cooldown
+    - controls how the live bot responds if an open position appears on a halted `pside` during RED cooldown
     - supported values are listed in the section above
 
 ## Backtest Behavior
@@ -196,34 +198,36 @@ Important backtest details:
 2. `hsl_panic_close_order_type = "market"`
    - panic exits use simulated taker execution on the next bar
    - slippage is controlled by `backtest.market_order_slippage_pct`
+   - live panic market exits use the exchange adapter's order semantics and live exchange/CCXT slippage controls, not `backtest.market_order_slippage_pct`
 3. Backtests export both:
-   - global account-level HSL metrics under `*_hsl`
-   - side-specific HSL metrics under `*_hsl_long` / `*_hsl_short`
+   - operational HSL telemetry under `hard_stop_*`
+   - collateral-agnostic strategy-equity risk metrics under `*_strategy_eq`
 
-Main optimizer-facing global HSL metrics:
+Main optimizer-facing strategy-equity risk metrics:
 
-1. `drawdown_worst_hsl`
-2. `drawdown_worst_ema_hsl`
-3. `drawdown_worst_mean_1pct_hsl`
-4. `drawdown_worst_mean_1pct_ema_hsl`
-5. `peak_recovery_hours_hsl`
+1. `drawdown_worst_strategy_eq`
+2. `drawdown_worst_ema_strategy_eq`
+3. `drawdown_worst_mean_1pct_strategy_eq`
+4. `drawdown_worst_mean_1pct_ema_strategy_eq`
+5. `strategy_eq_recovery_days_max`
+6. `strategy_eq_recovery_days_mean_worst_1pct`
 
 For the shared EMA-smoothed metrics, long and short each use their own configured
 `hsl_ema_span_minutes`. The shared values are reported conservatively as `max(long, short)`
 rather than trying to invent one combined EMA span.
 
-Useful side-specific HSL metrics:
+Useful side-specific strategy-equity metrics:
 
-1. `drawdown_worst_hsl_long`
-2. `drawdown_worst_hsl_short`
-3. `drawdown_worst_ema_hsl_long`
-4. `drawdown_worst_ema_hsl_short`
-5. `drawdown_worst_mean_1pct_hsl_long`
-6. `drawdown_worst_mean_1pct_hsl_short`
-7. `drawdown_worst_mean_1pct_ema_hsl_long`
-8. `drawdown_worst_mean_1pct_ema_hsl_short`
-9. `peak_recovery_hours_hsl_long`
-10. `peak_recovery_hours_hsl_short`
+1. `drawdown_worst_strategy_eq_long`
+2. `drawdown_worst_strategy_eq_short`
+3. `drawdown_worst_ema_strategy_eq_long`
+4. `drawdown_worst_ema_strategy_eq_short`
+5. `drawdown_worst_mean_1pct_strategy_eq_long`
+6. `drawdown_worst_mean_1pct_strategy_eq_short`
+7. `drawdown_worst_mean_1pct_ema_strategy_eq_long`
+8. `drawdown_worst_mean_1pct_ema_strategy_eq_short`
+9. `peak_recovery_days_strategy_eq_long`
+10. `peak_recovery_days_strategy_eq_short`
 11. `hard_stop_triggers_long`
 12. `hard_stop_triggers_short`
 13. `hard_stop_restarts_long`
@@ -269,7 +273,7 @@ moment.
    - Fraction of sampled runtime where the worst active HSL tier was RED.
    - This is usually the clearest “how often was the system in emergency mode” metric.
    - In practice, you normally want this close to zero. Even small values can be meaningful because
-     RED includes forced flattening and halted time.
+     RED includes forced position closing and halted time.
 
 ### Trigger and halt metrics
 
@@ -278,12 +282,12 @@ moment.
    - Use this to see whether triggers happen barely above threshold or only after deeper damage.
 2. `hard_stop_duration_minutes_mean`
    - Average elapsed minutes from RED halt start until that halt fully ends.
-   - Includes flattening and, when enabled, cooldown waiting before restart.
+   - Includes position closing and, when enabled, cooldown waiting before restart.
 3. `hard_stop_duration_minutes_max`
    - Longest single halt duration observed during the run.
    - Useful for spotting rare but operationally painful stalls.
 4. `hard_stop_flatten_time_minutes_mean`
-   - Average time from RED trigger to fully flat position state.
+   - Average time from RED trigger until all positions on the triggered `pside` are fully closed.
    - This isolates execution/exit latency from the later cooldown portion of the halt.
 
 ### Restart quality metrics
@@ -321,12 +325,12 @@ Optimizer runs instead disable terminal no-restart by default through:
 1. `optimize.fixed_runtime_overrides["bot.long.hsl_no_restart_drawdown_threshold"] = 1.0`
 2. `optimize.fixed_runtime_overrides["bot.short.hsl_no_restart_drawdown_threshold"] = 1.0`
 
-The optimizer should constrain risk through `*_hsl` metrics rather than by terminating candidates early with terminal no-restart.
+The optimizer should constrain risk through canonical `*_strategy_eq` metrics rather than by terminating candidates early with terminal no-restart.
 
 ## Notes
 
 1. Runtime HSL behavior is side-specific by `pside`.
-2. Global `*_hsl` metrics are retained because they remain useful for optimizer scoring and whole-account risk inspection.
+2. Global `*_strategy_eq` metrics are the canonical optimizer and whole-account risk-inspection metrics; deprecated `*_hsl` metric names remain accepted as aliases for older configs/results.
 3. HSL is intended as a supervisory backstop, not as a replacement for sane wallet-exposure settings.
 
 ## Stateless Restart Behavior

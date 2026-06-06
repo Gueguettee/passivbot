@@ -1,6 +1,7 @@
 """Tests for MissingEma fix: EMA paths and error handling."""
 
 import asyncio
+import logging
 import math
 import time
 import json
@@ -297,6 +298,10 @@ class _BundleReproBot:
         entry_h1_span_hours=0.0,
         prev_close_ema=None,
         prev_age_ms=5_000,
+        project_open_tail=False,
+        projected_close_ema=None,
+        projected_qv_ema=None,
+        projected_log_range_ema=None,
     ):
         self.symbol = symbol
         self.PB_modes = {"long": {symbol: "normal"}, "short": {symbol: "manual"}}
@@ -308,7 +313,15 @@ class _BundleReproBot:
         self.h1_mode = h1_mode
         self.h1_log_range_value = float(h1_log_range_value)
         self.entry_h1_span_hours = float(entry_h1_span_hours)
+        self.project_open_tail = bool(project_open_tail)
+        self.projected_close_ema = dict(projected_close_ema or {})
+        self.projected_qv_ema = None if projected_qv_ema is None else dict(projected_qv_ema)
+        self.projected_log_range_ema = (
+            None if projected_log_range_ema is None else dict(projected_log_range_ema)
+        )
         self._orchestrator_close_ema_fallback_counts = {}
+        self.config = {"live": {"max_forager_candle_staleness_minutes": 10}}
+        self.exchange = "kucoin"
         now_ms = int(time.time() * 1000)
         if prev_close_ema is None:
             self._orchestrator_prev_close_ema = {}
@@ -324,17 +337,23 @@ class _BundleReproBot:
             def __init__(self, outer):
                 self.outer = outer
 
-            async def get_latest_ema_close(self, symbol, span, max_age_ms=30_000):
+            async def get_latest_ema_close(
+                self, symbol, span, max_age_ms=30_000, allow_remote_fetch=True
+            ):
                 if self.outer.close_mode == "timeout":
                     raise TimeoutError("kucoinfutures GET ... RequestTimeout")
                 if self.outer.close_mode == "nan":
                     return float("nan")
                 return float(self.outer.close_value)
 
-            async def get_latest_ema_quote_volume(self, symbol, span, max_age_ms=60_000):
+            async def get_latest_ema_quote_volume(
+                self, symbol, span, max_age_ms=60_000, allow_remote_fetch=True
+            ):
                 return 250000.0
 
-            async def get_latest_ema_log_range(self, symbol, span, tf=None, max_age_ms=60_000):
+            async def get_latest_ema_log_range(
+                self, symbol, span, tf=None, max_age_ms=60_000, allow_remote_fetch=True
+            ):
                 if tf == "1h":
                     if self.outer.h1_mode == "timeout":
                         raise TimeoutError("kucoinfutures GET ... RequestTimeout")
@@ -342,6 +361,74 @@ class _BundleReproBot:
                         return float("nan")
                     return float(self.outer.h1_log_range_value)
                 return 0.0015
+
+            def get_completed_candle_health(self, symbol, windows=None, now_ms=None):
+                if not self.outer.project_open_tail:
+                    return {
+                        "ok": True,
+                        "timeframes": {
+                            "1m": {
+                                "timeframe": "1m",
+                                "coverage_ok": True,
+                                "latest_expected_ts": 120_000,
+                                "last_cached_ts": 120_000,
+                            }
+                        },
+                    }
+                return {
+                    "ok": False,
+                    "timeframes": {
+                        "1m": {
+                            "timeframe": "1m",
+                            "coverage_ok": False,
+                            "latest_expected_ts": 180_000,
+                            "last_cached_ts": 120_000,
+                            "missing_candles": 1,
+                            "missing_spans": [(180_000, 180_000)],
+                            "open_tail_gap": True,
+                            "tail_gap_candles": 1,
+                            "tail_gap_age_ms": 60_000,
+                        }
+                    },
+                }
+
+            async def get_projected_open_tail_ema_metrics(
+                self,
+                symbol,
+                spans_by_metric,
+                *,
+                latest_expected_ts,
+                last_cached_ts,
+                max_tail_gap_ms,
+            ):
+                self.outer.projected_open_tail_called = True
+                qv = (
+                    {float(span): 250000.0 for span in spans_by_metric.get("qv", [])}
+                    if self.outer.projected_qv_ema is None
+                    else {
+                        float(span): float(self.outer.projected_qv_ema[float(span)])
+                        for span in spans_by_metric.get("qv", [])
+                        if float(span) in self.outer.projected_qv_ema
+                    }
+                )
+                log_range = (
+                    {float(span): 0.0015 for span in spans_by_metric.get("log_range", [])}
+                    if self.outer.projected_log_range_ema is None
+                    else {
+                        float(span): float(self.outer.projected_log_range_ema[float(span)])
+                        for span in spans_by_metric.get("log_range", [])
+                        if float(span) in self.outer.projected_log_range_ema
+                    }
+                )
+                return {
+                    "close": {
+                        float(span): float(self.outer.projected_close_ema[float(span)])
+                        for span in spans_by_metric.get("close", [])
+                        if float(span) in self.outer.projected_close_ema
+                    },
+                    "qv": qv,
+                    "log_range": log_range,
+                }
 
         self.cm = _CM(self)
 
@@ -363,9 +450,9 @@ class _BundleReproBot:
         return 0.0
 
     def bot_value(self, pside, key):
-        if key == "filter_volume_ema_span":
+        if key in ("filter_volume_ema_span", "forager_volume_ema_span"):
             return 10.0
-        if key == "filter_volatility_ema_span":
+        if key in ("filter_volatility_ema_span", "forager_volatility_ema_span"):
             return 10.0
         return 0.0
 
@@ -433,6 +520,145 @@ async def test_kucoin_avax_close_ema_fallback_uses_previous_ema_not_price():
     assert bot._orchestrator_close_ema_fallback_counts[(symbol, span0)] == 1
     assert bot._orchestrator_close_ema_fallback_counts[(symbol, span1)] == 1
     assert bot._orchestrator_close_ema_fallback_counts[(symbol, span2)] == 1
+
+
+@pytest.mark.asyncio
+async def test_open_tail_projection_precedes_previous_close_ema_fallback():
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "AVAX/USDT:USDT"
+    span0 = 10.0
+    span1 = 20.0
+    span2 = (span0 * span1) ** 0.5
+    prev = {span0: 100.04, span1: 100.03, span2: 100.02}
+    projected = {span0: 201.0, span1: 202.0, span2: 203.0}
+    bot = _BundleReproBot(
+        symbol,
+        close_mode="timeout",
+        prev_close_ema=prev,
+        project_open_tail=True,
+        projected_close_ema=projected,
+    )
+    bot.projected_open_tail_called = False
+
+    (
+        m1_close_emas,
+        m1_volume_emas,
+        m1_log_range_emas,
+        _h1_log_range_emas,
+        volumes_long,
+        log_ranges_long,
+    ) = await pb_mod.Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
+
+    assert bot.projected_open_tail_called is True
+    got = m1_close_emas[symbol]
+    assert got[span0] == pytest.approx(projected[span0])
+    assert got[span1] == pytest.approx(projected[span1])
+    assert got[span2] == pytest.approx(projected[span2])
+    assert m1_volume_emas[symbol][10.0] == pytest.approx(250000.0)
+    assert m1_log_range_emas[symbol][10.0] == pytest.approx(0.0015)
+    assert volumes_long[symbol] == pytest.approx(250000.0)
+    assert log_ranges_long[symbol] == pytest.approx(0.0015)
+    assert bot._orchestrator_close_ema_fallback_counts == {}
+
+
+@pytest.mark.asyncio
+async def test_open_tail_projection_missing_optional_metrics_are_diagnostic(caplog):
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "AVAX/USDT:USDT"
+    span0 = 10.0
+    span1 = 20.0
+    span2 = (span0 * span1) ** 0.5
+    bot = _BundleReproBot(
+        symbol,
+        close_mode="timeout",
+        project_open_tail=True,
+        projected_close_ema={span0: 201.0, span1: 202.0, span2: 203.0},
+        projected_qv_ema={},
+        projected_log_range_ema={},
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        (
+            _m1_close_emas,
+            m1_volume_emas,
+            m1_log_range_emas,
+            _h1_log_range_emas,
+            volumes_long,
+            log_ranges_long,
+        ) = await pb_mod.Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
+
+    assert m1_volume_emas[symbol] == {}
+    assert m1_log_range_emas[symbol] == {}
+    assert volumes_long[symbol] == 0.0
+    assert log_ranges_long[symbol] == 0.0
+    optional_logs = [record.message for record in caplog.records if "optional EMA drops" in record.message]
+    assert optional_logs
+    assert "m1_volume" in optional_logs[-1]
+    assert "m1_log_range" in optional_logs[-1]
+    assert "projected open-tail" in optional_logs[-1]
+
+
+@pytest.mark.asyncio
+async def test_open_tail_projection_missing_close_span_fails_loudly():
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "AVAX/USDT:USDT"
+    span0 = 10.0
+    bot = _BundleReproBot(
+        symbol,
+        close_mode="timeout",
+        project_open_tail=True,
+        projected_close_ema={span0: 201.0},
+    )
+
+    with pytest.raises(RuntimeError, match="projected open-tail close EMA incomplete"):
+        await pb_mod.Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
+
+
+@pytest.mark.asyncio
+async def test_close_ema_fallback_raises_when_previous_ema_is_stale(caplog):
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "AVAX/USDT:USDT"
+    span0 = 10.0
+    span1 = 20.0
+    span2 = (span0 * span1) ** 0.5
+    prev = {span0: 100.04, span1: 100.03, span2: 100.02}
+    bot = _BundleReproBot(
+        symbol,
+        close_mode="timeout",
+        prev_close_ema=prev,
+        prev_age_ms=11 * 60_000,
+    )
+    bot.config = {"live": {"max_forager_candle_staleness_minutes": 10}}
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError, match="previous close EMA stale"):
+            await pb_mod.Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
+
+    stale_warnings = [
+        record.message
+        for record in caplog.records
+        if "close EMA fallback stale" in record.message
+    ]
+    assert len(stale_warnings) == 1
+    assert "spans=10,14.142136,20" in stale_warnings[0]
+    assert "last_refresh_ms=" in stale_warnings[0]
+    assert "staleness_ms=" in stale_warnings[0]
 
 
 @pytest.mark.asyncio
@@ -526,7 +752,7 @@ class _PacingProbeCM:
         self.current_concurrency = 0
         self.max_concurrency = 0
 
-    async def get_latest_ema_close(self, symbol, *, span, max_age_ms):
+    async def get_latest_ema_close(self, symbol, *, span, max_age_ms, allow_remote_fetch=True):
         self.current_concurrency += 1
         self.max_concurrency = max(self.max_concurrency, self.current_concurrency)
         try:
@@ -535,10 +761,14 @@ class _PacingProbeCM:
         finally:
             self.current_concurrency -= 1
 
-    async def get_latest_ema_quote_volume(self, symbol, *, span, max_age_ms):
+    async def get_latest_ema_quote_volume(
+        self, symbol, *, span, max_age_ms, allow_remote_fetch=True
+    ):
         return 0.0
 
-    async def get_latest_ema_log_range(self, symbol, *, span, max_age_ms, tf="1m"):
+    async def get_latest_ema_log_range(
+        self, symbol, *, span, max_age_ms, tf="1m", allow_remote_fetch=True
+    ):
         return 0.0
 
 
@@ -608,3 +838,22 @@ async def test_ema_bundle_serializes_fetches_when_exchange_has_default_pacing(mo
     )
 
     assert bot.cm.max_concurrency == 1
+
+
+@pytest.mark.asyncio
+async def test_ema_bundle_parallel_shutdown_cancel_propagates(monkeypatch):
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    monkeypatch.setattr(pb_mod.random, "shuffle", lambda items: None)
+    bot = _PacingProbeBot(exchange="binance", sleep_fn=asyncio.sleep)
+    bot.stop_signal_received = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+            bot,
+            ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+            {"long": {}, "short": {}},
+        )

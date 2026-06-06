@@ -35,6 +35,7 @@ from config_utils import (
     parse_overrides,
     format_config,
 )
+from warmup_utils import compute_backtest_warmup_minutes
 
 
 def test_load_input_config_without_path_uses_schema_defaults():
@@ -43,13 +44,30 @@ def test_load_input_config_without_path_uses_schema_defaults():
     assert base_config_path == ""
     assert source == get_template_config()
     assert raw_snapshot == get_template_config()
+    assert source["live"]["hsl_signal_mode"] == "unified"
 
 
 def test_default_example_config_matches_schema_defaults():
-    with open("configs/examples/default_trailing_grid_long_npos10.json", encoding="utf-8") as fh:
+    with open("configs/examples/default_trailing_grid_long_npos7.json", encoding="utf-8") as fh:
         example = json.load(fh)
 
     assert example == get_template_config()
+
+
+def test_prepare_config_strips_deprecated_price_distance_threshold():
+    source = get_template_config()
+    source["live"]["price_distance_threshold"] = 0.002
+
+    prepared = prepare_config(
+        source,
+        base_config_path="",
+        live_only=True,
+        verbose=False,
+        target="live",
+        runtime="live",
+    )
+
+    assert "price_distance_threshold" not in prepared["live"]
 
 
 def test_prepare_config_preserves_raw_snapshot_and_effective_input():
@@ -315,7 +333,7 @@ def test_max_realized_loss_pct_default_is_consistent_across_template_and_formatt
     formatted = format_config(sparse, verbose=False)
     assert formatted["live"]["max_realized_loss_pct"] == pytest.approx(1.0)
 
-    loaded = load_config("configs/examples/default_trailing_grid_long_npos10.json", verbose=False)
+    loaded = load_config("configs/examples/default_trailing_grid_long_npos7.json", verbose=False)
     assert loaded["live"]["max_realized_loss_pct"] == pytest.approx(1.0)
 
 
@@ -420,7 +438,7 @@ def test_load_config_disabled_sparse_optimize_limits_are_normalized(caplog, tmp_
 
     loaded = load_config(str(path), verbose=False)
 
-    assert loaded["optimize"]["limits"][1]["metric"] == "peak_recovery_hours_hsl"
+    assert loaded["optimize"]["limits"][1]["metric"] == "peak_recovery_hours_strategy_eq"
     assert loaded["optimize"]["limits"][1]["enabled"] is False
     assert loaded["optimize"]["limits"][2]["enabled"] is False
     assert not any("optimize.limits malformed or unsupported" in rec.message for rec in caplog.records)
@@ -460,12 +478,12 @@ def test_parse_limit_cli_entry_supports_extended_scalar_operators():
     equal_to = config_utils.parse_limit_cli_entry("adg_strategy_pnl_rebased == 0.0")
 
     assert greater_equal == {
-        "metric": "adg_strategy_pnl_rebased",
+        "metric": "adg_strategy_eq",
         "penalize_if": "less_than",
         "value": 0.001,
     }
     assert equal_to == {
-        "metric": "adg_strategy_pnl_rebased",
+        "metric": "adg_strategy_eq",
         "penalize_if": "not_equal",
         "value": 0,
     }
@@ -612,7 +630,7 @@ def test_format_config_emits_coalesced_summary_without_leaf_noise(caplog):
 
 def test_load_example_config_avoids_leaf_add_remove_log_churn(caplog):
     with caplog.at_level(logging.INFO):
-        load_config("configs/examples/default_trailing_grid_long_npos10.json", verbose=True)
+        load_config("configs/examples/default_trailing_grid_long_npos7.json", verbose=True)
 
     messages = [rec.message for rec in caplog.records]
     assert not any("Removed unused key" in msg for msg in messages)
@@ -629,7 +647,7 @@ def test_update_config_with_args_updates_coin_sources():
     vars(args)["live.approved_coins"] = ["BTC", "ETH"]
     update_config_with_args(config, args, verbose=False)
     assert config["live"]["approved_coins"]["long"] == ["BTC", "ETH"]
-    assert config["_coins_sources"]["approved_coins"]["long"] == ["BTC", "ETH"]
+    assert config["_coins_sources"]["approved_coins"] == ["BTC", "ETH"]
     log_entry = config["_transform_log"][-1]
     assert log_entry["step"] == "update_config_with_args"
     diff = log_entry["details"]["diffs"][0]
@@ -644,10 +662,30 @@ def test_update_config_with_args_replaces_path_coin_source():
     vars(args)["live.ignored_coins"] = ["DOGE"]
     update_config_with_args(config, args, verbose=False)
     assert config["live"]["ignored_coins"]["long"] == ["DOGE"]
-    assert config["_coins_sources"]["ignored_coins"]["long"] == ["DOGE"]
+    assert config["_coins_sources"]["ignored_coins"] == ["DOGE"]
     entry = config["_transform_log"][-1]
     assert entry["step"] == "update_config_with_args"
     assert entry["details"]["diffs"][0]["path"] == "live.ignored_coins"
+
+
+def test_update_config_with_args_preserves_cli_coin_file_source_for_live_reload(tmp_path):
+    approved_file = tmp_path / "approved.hjson"
+    approved_file.write_text('["BTC","ETH"]', encoding="utf-8")
+
+    config = get_template_config()
+    config["_coins_sources"] = {}
+    args = SimpleNamespace()
+    vars(args)["live.approved_coins"] = [str(approved_file)]
+
+    update_config_with_args(config, args, verbose=False)
+
+    assert config["live"]["approved_coins"]["long"] == ["BTC", "ETH"]
+    assert config["_coins_sources"]["approved_coins"] == [str(approved_file)]
+
+    approved_file.write_text('["BTC","XRP"]', encoding="utf-8")
+    refreshed = normalize_coins_source(config["_coins_sources"]["approved_coins"])
+
+    assert set(refreshed["long"]) == {"BTC", "XRP"}
 
 
 def test_load_config_preserves_raw_and_effective_snapshots(tmp_path):
@@ -762,6 +800,37 @@ def test_backtest_cli_start_date_override_creates_missing_backtest_section(start
     assert source_config["backtest"]["start_date"] == "2025-10-11"
     assert source_config["bot"]["long"]["hsl_ema_span_minutes"] == pytest.approx(1440.0)
     assert "backtest.start_date" in source_config["_transform_log"][-1]["details"]["keys"]
+
+
+def test_backtest_cli_candle_interval_short_flag_parses_as_int():
+    args, _allowed_config_keys = _parse_backtest_args(
+        [
+            "configs/hype.json",
+            "-cim",
+            "2",
+        ]
+    )
+
+    assert getattr(args, "backtest.candle_interval_minutes") == 2
+    assert isinstance(getattr(args, "backtest.candle_interval_minutes"), int)
+
+
+def test_backtest_cli_max_warmup_override_updates_consumed_live_field():
+    args, allowed_config_keys = _parse_backtest_args(
+        [
+            "configs/hype.json",
+            "--live.max_warmup_minutes",
+            "1",
+        ]
+    )
+    config = get_template_config()
+
+    update_config_with_args(config, args, verbose=False, allowed_keys=allowed_config_keys)
+
+    assert "backtest.max_warmup_minutes" not in allowed_config_keys
+    assert "max_warmup_minutes" not in config["backtest"]
+    assert config["live"]["max_warmup_minutes"] == pytest.approx(1.0)
+    assert compute_backtest_warmup_minutes(config) == 1
 
 
 def test_update_config_with_args_ignores_non_config_parser_args():
@@ -901,8 +970,6 @@ def test_optimize_help_all_shows_hidden_bounds_flags():
     assert "--hedge-mode Y/N, -hm Y/N" in help_text
     assert "--market-order-near-touch-threshold FLOAT, -montt FLOAT" in help_text
     assert "--max-realized-loss-pct FLOAT, -mrlp FLOAT" in help_text
-    assert "--bot.long.entry_grid_inflation_enabled Y/N" in help_text
-    assert "--bot.short.entry_grid_inflation_enabled Y/N" in help_text
     assert "--bot.long.hsl_enabled Y/N" in help_text
     assert "--bot.short.hsl_enabled Y/N" in help_text
     assert "--bot.long.hsl_orange_tier_mode VALUE" in help_text
@@ -996,6 +1063,26 @@ def test_dotted_pnls_lookback_override_accepts_all_for_non_live_commands(command
     assert getattr(parsed, "live.pnls_max_lookback_days") == "all"
 
 
+@pytest.mark.parametrize("command", ["backtest", "optimize"])
+def test_dotted_max_warmup_override_parses_for_non_live_commands(command):
+    config = project_template_config_for_cli(get_template_config(), command)
+    parser = argparse.ArgumentParser(prog=command)
+    group_map = {
+        title: parser.add_argument_group(title) for title in CLI_HELP_GROUPS.get(command, [])
+    }
+    add_config_arguments(
+        parser,
+        config,
+        command=command,
+        help_all=False,
+        group_map=group_map,
+    )
+
+    parsed = parser.parse_args(["--live.max_warmup_minutes", "720"])
+
+    assert getattr(parsed, "live.max_warmup_minutes") == pytest.approx(720.0)
+
+
 def test_optimize_fixed_bot_runtime_overrides_parse():
     config = project_template_config_for_cli(get_template_config(), "optimize")
     parser = argparse.ArgumentParser(prog="optimize")
@@ -1012,8 +1099,6 @@ def test_optimize_fixed_bot_runtime_overrides_parse():
 
     parsed = parser.parse_args(
         [
-            "--bot.long.entry_grid_inflation_enabled",
-            "n",
             "--bot.short.hsl_enabled",
             "y",
             "--bot.long.hsl_orange_tier_mode",
@@ -1023,7 +1108,6 @@ def test_optimize_fixed_bot_runtime_overrides_parse():
         ]
     )
 
-    assert getattr(parsed, "bot.long.entry_grid_inflation_enabled") is False
     assert getattr(parsed, "bot.short.hsl_enabled") is True
     assert getattr(parsed, "bot.long.hsl_orange_tier_mode") == "tp_only"
     assert getattr(parsed, "bot.short.hsl_panic_close_order_type") == "market"
@@ -1080,6 +1164,7 @@ def test_project_template_config_for_cli_backtest_keeps_inherited_live_runtime_f
 
     assert "market_orders_allowed" in config["live"]
     assert "market_order_near_touch_threshold" in config["live"]
+    assert "max_warmup_minutes" in config["live"]
     assert "pnls_max_lookback_days" in config["live"]
     assert "user" not in config["live"]
 
@@ -1089,6 +1174,7 @@ def test_project_template_config_for_cli_optimize_keeps_inherited_live_runtime_f
 
     assert "market_orders_allowed" in config["live"]
     assert "market_order_near_touch_threshold" in config["live"]
+    assert "max_warmup_minutes" in config["live"]
     assert "pnls_max_lookback_days" in config["live"]
     assert "user" not in config["live"]
 

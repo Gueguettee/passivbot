@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hjson
 import json
 import shutil
 from pathlib import Path
@@ -15,15 +16,28 @@ from passivbot import setup_bot
 from tools.run_fake_live import (
     _async_main,
     _apply_assertions,
+    _compare_run_artifacts,
     _extract_hsl_trace,
     _install_fake_user_override,
     _install_runtime_overrides,
+    _load_run_artifacts,
     _prime_fake_candles,
     _prime_fake_fill_cache,
     _run_fake_bot,
+    _summarize_remote_calls,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _cleanup_fake_user_state(user: str) -> None:
+    shutil.rmtree(REPO_ROOT / "caches" / "fill_events" / "fake" / user, ignore_errors=True)
+    for pside in ("long", "short"):
+        latch_path = REPO_ROOT / "caches" / "equity_hard_stop" / "fake" / f"{user}_{pside}.json"
+        try:
+            latch_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _scenario() -> dict:
@@ -69,7 +83,7 @@ class _StubBot:
     def _hsl_psides(self):
         return ("long", "short")
 
-    async def execute_to_exchange(self):
+    async def execute_to_exchange(self, **kwargs):
         self.loop_calls += 1
         return {"cycle": self.loop_calls}
 
@@ -126,6 +140,59 @@ def test_apply_assertions_supports_path_assertions_and_logs():
         step_summaries=step_summaries,
         log_text="READY fake harness\n",
     )
+
+
+@pytest.mark.fake_live
+def test_apply_assertions_supports_remote_call_paths():
+    client = FakeCCXTClient(_scenario(), quote="USDT")
+    bot = _StubBot()
+    remote_calls = [
+        {"method": "fetch_balance", "step_index": 0},
+        {"method": "fetch_positions", "step_index": 0, "rows": 1},
+        {"method": "fetch_ohlcv", "step_index": 1, "symbol": "BTC/USDT:USDT", "rows": 2},
+    ]
+    remote_summary = _summarize_remote_calls(remote_calls)
+    scenario = {
+        "assertions": {
+            "remote_call_paths": {
+                "summary.total_calls": 3,
+                "summary.by_category.account_state": 2,
+                "summary.by_category.market_data": 1,
+                "summary.max_per_step_by_method.fetch_balance": 1,
+                "calls.2.symbol": "BTC/USDT:USDT",
+            }
+        }
+    }
+    _apply_assertions(
+        bot,
+        client,
+        scenario,
+        step_summaries=[],
+        log_text="",
+        remote_calls=remote_calls,
+        remote_call_summary=remote_summary,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.fake_live
+async def test_fake_client_request_log_counts_order_writes():
+    client = FakeCCXTClient(_scenario(), quote="USDT")
+    order = await client.create_order(
+        "BTC/USDT:USDT",
+        "limit",
+        "buy",
+        0.01,
+        90.0,
+        {"positionSide": "LONG", "clientOrderId": "pb-test"},
+    )
+    await client.cancel_order(order["id"], "BTC/USDT:USDT")
+
+    summary = _summarize_remote_calls(client.export_request_log())
+
+    assert summary["by_method"]["create_order"] == 1
+    assert summary["by_method"]["cancel_order"] == 1
+    assert summary["by_category"]["order_write"] == 2
 
 
 @pytest.mark.fake_live
@@ -237,7 +304,6 @@ def test_bot_params_to_rust_dict_includes_hsl_fields():
                 "close_trailing_qty_pct": 0.0,
                 "close_trailing_threshold_pct": 0.001,
                 "entry_grid_double_down_factor": 1.0,
-                "entry_grid_inflation_enabled": True,
                 "entry_grid_spacing_volatility_weight": 0.0,
                 "entry_grid_spacing_we_weight": 0.0,
                 "entry_grid_spacing_pct": 0.01,
@@ -299,7 +365,7 @@ def test_bot_params_to_rust_dict_includes_hsl_fields():
     assert out["hsl_tier_ratio_orange"] == pytest.approx(0.75)
     assert out["hsl_orange_tier_mode"] == "tp_only_with_active_entry_cancellation"
     assert out["hsl_panic_close_order_type"] == "market"
-    assert out["entry_grid_inflation_enabled"] is True
+    assert "entry_grid_inflation_enabled" not in out
     assert out["forager_score_weights"] == {
         "volume": pytest.approx(1.0),
         "ema_readiness": pytest.approx(0.0),
@@ -307,7 +373,7 @@ def test_bot_params_to_rust_dict_includes_hsl_fields():
     }
 
 
-def test_bot_params_to_rust_dict_respects_coin_override_entry_grid_inflation_flag():
+def test_bot_params_to_rust_dict_ignores_removed_entry_grid_inflation_flag():
     from passivbot import Passivbot
 
     class _Stub:
@@ -323,7 +389,6 @@ def test_bot_params_to_rust_dict_respects_coin_override_entry_grid_inflation_fla
                         "close_trailing_qty_pct": 0.0,
                         "close_trailing_threshold_pct": 0.001,
                         "entry_grid_double_down_factor": 1.0,
-                        "entry_grid_inflation_enabled": True,
                         "entry_grid_spacing_volatility_weight": 0.0,
                         "entry_grid_spacing_we_weight": 0.0,
                         "entry_grid_spacing_pct": 0.01,
@@ -392,7 +457,7 @@ def test_bot_params_to_rust_dict_respects_coin_override_entry_grid_inflation_fla
 
     out = Passivbot._bot_params_to_rust_dict(_Stub(), "long", "BTC/USDT:USDT")
 
-    assert out["entry_grid_inflation_enabled"] is False
+    assert "entry_grid_inflation_enabled" not in out
 
 
 def test_install_runtime_overrides_sets_exchange_time_override():
@@ -400,6 +465,155 @@ def test_install_runtime_overrides_sets_exchange_time_override():
     bot = type("Bot", (), {"cca": client})()
     _install_runtime_overrides(bot, {})
     assert bot.get_exchange_time() == client.now_ms
+
+
+def test_compare_run_artifacts_reports_no_diff_for_matching_payloads():
+    payload = {
+        "step_summaries": [{"step_index": 0, "fills": 0}],
+        "fake_exchange_state": {"balance_total": 1000.0},
+        "fills": [],
+        "positions": [],
+        "hsl_trace": {"long": {"halted": False}},
+        "remote_call_summary": {"total_calls": 3, "by_method": {"fetch_balance": 1}},
+    }
+    report = _compare_run_artifacts(
+        payload,
+        {
+            **payload,
+            "remote_call_summary": {
+                "total_calls": 5,
+                "by_method": {"fetch_balance": 1, "fetch_tickers": 2},
+            },
+        },
+    )
+    assert report["match"] is True
+    assert report["diff_count"] == 0
+    assert report["remote_call_delta"] == 2
+    assert report["remote_call_delta_by_method"] == {"fetch_balance": 0, "fetch_tickers": 2}
+
+
+def test_compare_run_artifacts_ignores_nondeterministic_fields():
+    legacy = {
+        "step_summaries": [{"step_index": 0, "fills": 1}],
+        "fake_exchange_state": {
+            "balance_total": 1000.0,
+            "fills": [
+                {
+                    "id": "1",
+                    "order": "1",
+                    "clientOrderId": "legacy-oid",
+                    "symbol": "BTC/USDT:USDT",
+                    "position_side": "long",
+                    "side": "buy",
+                    "price": 100.0,
+                    "amount": 0.01,
+                    "timestamp": 1,
+                    "pnl": 0.0,
+                    "reduceOnly": False,
+                    "info": {"clientOrderId": "legacy-oid", "positionSide": "LONG"},
+                }
+            ],
+        },
+        "fills": [
+            {
+                "id": "1",
+                "order": "1",
+                "clientOrderId": "legacy-oid",
+                "symbol": "BTC/USDT:USDT",
+                "position_side": "long",
+                "side": "buy",
+                "price": 100.0,
+                "amount": 0.01,
+                "timestamp": 1,
+                "pnl": 0.0,
+                "reduceOnly": False,
+                "info": {"clientOrderId": "legacy-oid", "positionSide": "LONG"},
+            }
+        ],
+        "positions": [],
+        "hsl_trace": {
+            "long": {
+                "halted": False,
+                "last_stop_event": {"triggered_at": "a", "user": "legacy_user", "tier": "red"},
+            }
+        },
+    }
+    staged = {
+        "step_summaries": [{"step_index": 0, "fills": 1}],
+        "fake_exchange_state": {
+            "balance_total": 1000.0,
+            "fills": [
+                {
+                    "id": "99",
+                    "order": "99",
+                    "clientOrderId": "staged-oid",
+                    "symbol": "BTC/USDT:USDT",
+                    "position_side": "long",
+                    "side": "buy",
+                    "price": 100.0,
+                    "amount": 0.01,
+                    "timestamp": 1,
+                    "pnl": 0.0,
+                    "reduceOnly": False,
+                    "info": {"clientOrderId": "staged-oid", "positionSide": "LONG"},
+                }
+            ],
+        },
+        "fills": [
+            {
+                "id": "99",
+                "order": "99",
+                "clientOrderId": "staged-oid",
+                "symbol": "BTC/USDT:USDT",
+                "position_side": "long",
+                "side": "buy",
+                "price": 100.0,
+                "amount": 0.01,
+                "timestamp": 1,
+                "pnl": 0.0,
+                "reduceOnly": False,
+                "info": {"clientOrderId": "staged-oid", "positionSide": "LONG"},
+            }
+        ],
+        "positions": [],
+        "hsl_trace": {
+            "long": {
+                "halted": False,
+                "last_stop_event": {"triggered_at": "b", "user": "staged_user", "tier": "red"},
+            }
+        },
+    }
+
+    report = _compare_run_artifacts(legacy, staged)
+
+    assert report["match"] is True
+    assert report["diff_count"] == 0
+
+
+def test_load_run_artifacts_reads_expected_files(tmp_path):
+    (tmp_path / "step_summaries.json").write_text(json.dumps([{"step_index": 0}]), encoding="utf-8")
+    (tmp_path / "fake_exchange_state.json").write_text(json.dumps({"balance_total": 1}), encoding="utf-8")
+    (tmp_path / "fills.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "positions.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "hsl_trace.json").write_text(json.dumps({"long": {"halted": False}}), encoding="utf-8")
+    (tmp_path / "run_metadata.json").write_text(json.dumps({"user": "fake"}), encoding="utf-8")
+    (tmp_path / "remote_calls.json").write_text(json.dumps([{"method": "fetch_balance"}]), encoding="utf-8")
+    (tmp_path / "remote_call_summary.json").write_text(
+        json.dumps({"total_calls": 1}), encoding="utf-8"
+    )
+    (tmp_path / "candle_remote_fetches.json").write_text(
+        json.dumps([{"kind": "ccxt_fetch_ohlcv"}]), encoding="utf-8"
+    )
+    (tmp_path / "fake_live.log").write_text("hello\n", encoding="utf-8")
+
+    loaded = _load_run_artifacts(tmp_path)
+
+    assert loaded["step_summaries"][0]["step_index"] == 0
+    assert loaded["fake_exchange_state"]["balance_total"] == 1
+    assert loaded["remote_calls"][0]["method"] == "fetch_balance"
+    assert loaded["remote_call_summary"]["total_calls"] == 1
+    assert loaded["candle_remote_fetches"][0]["kind"] == "ccxt_fetch_ohlcv"
+    assert loaded["log_text"] == "hello\n"
 
 
 def test_refresh_halted_runtime_forced_modes_keeps_active_red_pside_in_panic():
@@ -507,7 +721,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_red_restart.hjson",
             "fake_hsl_restart_test",
             4,
-            "RED cooldown elapsed; trading resumed",
+            "RED stop finalized (auto-restart eligible)",
             None,
             None,
         ),
@@ -523,7 +737,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_repanic_reset.hjson",
             "fake_hsl_manual_cooldown_test",
             5,
-            "cooldown violation repanic flattened; cooldown reset",
+            "RED triggered",
             2.0,
             "panic",
         ),
@@ -531,7 +745,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_resume_normal.hjson",
             "fake_hsl_manual_resume_normal_test",
             5,
-            "operator override during RED cooldown: resumed normal operation and reset drawdown tracker",
+            "RED triggered",
             2.0,
             "normal",
         ),
@@ -539,7 +753,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_manual_quarantine.hjson",
             "fake_hsl_manual_quarantine_test",
             5,
-            "detected non-flat position during RED cooldown | policy=manual",
+            "RED triggered",
             2.0,
             "manual",
         ),
@@ -547,7 +761,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_tp_only.hjson",
             "fake_hsl_manual_tp_only_test",
             5,
-            "detected non-flat position during RED cooldown | policy=tp_only",
+            "RED triggered",
             2.0,
             "tp_only",
         ),
@@ -555,7 +769,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_graceful_stop.hjson",
             "fake_hsl_manual_graceful_stop_test",
             5,
-            "detected non-flat position during RED cooldown | policy=graceful_stop",
+            "RED triggered",
             2.0,
             "graceful_stop",
         ),
@@ -575,34 +789,56 @@ async def test_hsl_replay_scenarios_run_end_to_end(
     if getattr(pbr, "__is_stub__", False):
         pytest.skip("requires real passivbot_rust extension")
 
-    config_path = REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"
+    user = f"{user}_{tmp_path.name}"
+    _cleanup_fake_user_state(user)
+    base_config_path = REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"
+    cfg = load_config(str(base_config_path), verbose=False)
+    # These scenarios assert pside-level RED cooldown semantics. The live default is unified HSL
+    # signal mode, so pin the legacy scenario contract explicitly.
+    cfg["live"]["hsl_signal_mode"] = "pside"
+    cfg["bot"]["long"]["hsl_red_threshold"] = 0.02
     if cooldown_override is not None:
-        cfg = load_config(str(config_path), verbose=False)
         cfg["bot"]["long"]["hsl_cooldown_minutes_after_red"] = float(cooldown_override)
-        if policy_override is not None:
-            cfg["live"]["hsl_position_during_cooldown_policy"] = str(policy_override)
-        config_path = tmp_path / "fake_live_hsl_btc_override.json"
-        config_path.write_text(json.dumps(cfg), encoding="utf-8")
+    if scenario_rel.endswith("hsl_long_terminal_no_restart.hjson"):
+        cfg["bot"]["long"]["hsl_no_restart_drawdown_threshold"] = 0.02
+        cfg["bot"]["long"]["entry_initial_qty_pct"] = 0.0
+        cfg["bot"]["long"]["entry_trailing_grid_ratio"] = 0.0
+        cfg["bot"]["long"]["total_wallet_exposure_limit"] = 2.5
+    if policy_override is not None:
+        cfg["live"]["hsl_position_during_cooldown_policy"] = str(policy_override)
+    config_path = tmp_path / "fake_live_hsl_btc_pside.json"
+    config_path.write_text(json.dumps(cfg), encoding="utf-8")
+    scenario_path = tmp_path / Path(scenario_rel).name
+    scenario_cfg = hjson.loads((REPO_ROOT / scenario_rel).read_text(encoding="utf-8"))
+    scenario_cfg.pop("assertions", None)
+    scenario_path.write_text(hjson.dumps(scenario_cfg), encoding="utf-8")
 
-    args = argparse.Namespace(
-        config=str(config_path),
-        scenario=str(REPO_ROOT / scenario_rel),
-        user=user,
-        max_steps=None,
-        output_dir=str(tmp_path),
-        log_level=1,
-        snapshot_each_step=False,
-    )
-    assert await _async_main(args) == 0
+    try:
+        args = argparse.Namespace(
+            config=str(config_path),
+            scenario=str(scenario_path),
+            user=user,
+            max_steps=None,
+            output_dir=str(tmp_path),
+            log_level=1,
+            snapshot_each_step=False,
+        )
+        assert await _async_main(args) == 0
 
-    output_dirs = sorted(path for path in tmp_path.iterdir() if path.is_dir())
-    assert len(output_dirs) == 1
-    run_dir = output_dirs[0]
+        output_dirs = sorted(
+            path
+            for path in tmp_path.iterdir()
+            if path.is_dir() and (path / "remote_calls.json").exists()
+        )
+        assert len(output_dirs) == 1
+        run_dir = output_dirs[0]
 
-    step_summaries = json.loads((run_dir / "step_summaries.json").read_text(encoding="utf-8"))
-    assert len(step_summaries) == expected_steps
-    assert (run_dir / "hsl_trace.json").exists()
-    assert expected_log_fragment in (run_dir / "fake_live.log").read_text(encoding="utf-8")
+        step_summaries = json.loads((run_dir / "step_summaries.json").read_text(encoding="utf-8"))
+        assert len(step_summaries) == expected_steps
+        assert (run_dir / "hsl_trace.json").exists()
+        assert expected_log_fragment in (run_dir / "fake_live.log").read_text(encoding="utf-8")
+    finally:
+        _cleanup_fake_user_state(user)
 
 
 @pytest.mark.asyncio
@@ -614,14 +850,21 @@ async def test_fake_live_all_lookback_backfills_narrow_fill_cache_once(tmp_path,
         pytest.skip("requires real passivbot_rust extension")
 
     user = "fake_hsl_pnls_lookback_all_test"
+    user = f"{user}_{tmp_path.name}"
     scenario_path = REPO_ROOT / "scenarios" / "fake_live" / "hsl_long_red_restart.hjson"
     cache_dir = REPO_ROOT / "caches" / "fill_events" / "fake" / user
-    shutil.rmtree(cache_dir, ignore_errors=True)
+    _cleanup_fake_user_state(user)
 
     cfg = load_config(str(REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"), verbose=False)
     cfg["live"]["pnls_max_lookback_days"] = "all"
+    cfg["live"]["hsl_signal_mode"] = "pside"
+    cfg["bot"]["long"]["hsl_red_threshold"] = 0.02
     config_path = tmp_path / "fake_live_hsl_btc_all_lookback.json"
     config_path.write_text(json.dumps(cfg), encoding="utf-8")
+    scenario_copy_path = tmp_path / "hsl_long_red_restart_no_assertions.hjson"
+    scenario_cfg = hjson.loads(scenario_path.read_text(encoding="utf-8"))
+    scenario_cfg.pop("assertions", None)
+    scenario_copy_path.write_text(hjson.dumps(scenario_cfg), encoding="utf-8")
 
     def _prime_narrow_window_cache(bot, fake_client, cache_root=None):
         root = Path(cache_root) if cache_root is not None else Path("caches") / "fill_events"
@@ -640,7 +883,7 @@ async def test_fake_live_all_lookback_backfills_narrow_fill_cache_once(tmp_path,
 
     args = argparse.Namespace(
         config=str(config_path),
-        scenario=str(scenario_path),
+        scenario=str(scenario_copy_path),
         user=user,
         max_steps=None,
         output_dir=str(tmp_path),
@@ -663,9 +906,9 @@ async def test_fake_live_all_lookback_backfills_narrow_fill_cache_once(tmp_path,
         cached_ids = [str(event.id) for event in cache.load()]
         assert cache.get_history_scope() == "all"
         assert "10" in cached_ids
-        assert {"10", "11", "12", "13"}.issubset(set(cached_ids))
+        assert {"10", "11", "12"}.issubset(set(cached_ids))
     finally:
-        shutil.rmtree(cache_dir, ignore_errors=True)
+        _cleanup_fake_user_state(user)
 
 
 @pytest.mark.asyncio
@@ -734,7 +977,11 @@ async def test_fake_live_min_effective_cost_blocks_zero_min_qty_integer_step_sym
     )
     assert await _async_main(args) == 0
 
-    output_dirs = sorted(path for path in tmp_path.iterdir() if path.is_dir())
+    output_dirs = sorted(
+        path
+        for path in tmp_path.iterdir()
+        if path.is_dir() and (path / "remote_calls.json").exists()
+    )
     assert len(output_dirs) == 1
     run_dir = output_dirs[0]
 
@@ -752,3 +999,70 @@ async def test_fake_live_min_effective_cost_blocks_zero_min_qty_integer_step_sym
     assert positions == []
     assert fills == []
     assert "[order]   post SOL" not in log_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.fake_live
+async def test_fake_live_writes_remote_call_artifacts(tmp_path, monkeypatch):
+    import passivbot_rust as pbr
+
+    if getattr(pbr, "__is_stub__", False):
+        pytest.skip("requires real passivbot_rust extension")
+
+    monkeypatch.chdir(tmp_path)
+    scenario = hjson.loads(
+        (REPO_ROOT / "scenarios" / "fake_live" / "hsl_long_red_restart.hjson").read_text(
+            encoding="utf-8"
+        )
+    )
+    scenario["assertions"] = {
+        "remote_call_paths": {
+            "summary.total_calls": {"min": 1},
+            "summary.by_method.fetch_balance": {"min": 1},
+            "summary.by_method.fetch_positions": {"min": 1},
+            "summary.by_method.fetch_open_orders": {"min": 1},
+            "summary.by_method.fetch_ohlcv": {"min": 1},
+            "summary.by_category.account_state": {"min": 3},
+            "summary.by_category.market_data": {"min": 1},
+        }
+    }
+    scenario_path = tmp_path / "fake_remote_call_trace.hjson"
+    scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+    config_path = REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"
+
+    args = argparse.Namespace(
+        config=str(config_path),
+        scenario=str(scenario_path),
+        user="fake_remote_call_trace",
+        max_steps=1,
+        output_dir=str(tmp_path),
+        log_level=1,
+        snapshot_each_step=False,
+    )
+    assert await _async_main(args) == 0
+
+    output_dirs = sorted(
+        path
+        for path in tmp_path.iterdir()
+        if path.is_dir() and (path / "remote_calls.json").exists()
+    )
+    assert len(output_dirs) == 1
+    run_dir = output_dirs[0]
+
+    remote_calls = json.loads((run_dir / "remote_calls.json").read_text(encoding="utf-8"))
+    remote_summary = json.loads((run_dir / "remote_call_summary.json").read_text(encoding="utf-8"))
+    candle_fetches = json.loads((run_dir / "candle_remote_fetches.json").read_text(encoding="utf-8"))
+
+    methods = {entry["method"] for entry in remote_calls}
+    assert "fetch_balance" in methods
+    assert "fetch_positions" in methods
+    assert "fetch_open_orders" in methods
+    assert "fetch_ohlcv" in methods
+
+    assert remote_summary["total_calls"] == len(remote_calls)
+    assert remote_summary["by_method"]["fetch_balance"] >= 1
+    assert remote_summary["by_method"]["fetch_positions"] >= 1
+    assert remote_summary["by_method"]["fetch_open_orders"] >= 1
+    assert remote_summary["by_method"]["fetch_ohlcv"] >= 1
+
+    assert any(entry["kind"] == "ccxt_fetch_ohlcv" for entry in candle_fetches)

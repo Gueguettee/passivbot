@@ -12,8 +12,9 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 import passivbot_rust as pbr
+from config.limits import resolve_aggregate_mode
+from config.metrics import canonicalize_metric_name, resolve_metric_value
 from config.scoring import extract_objective_specs
-from opt_utils import round_floats
 from pure_funcs import calc_hash
 from utils import json_dumps_streamlined
 from metrics_schema import flatten_metric_stats
@@ -23,12 +24,17 @@ from pareto_core import (
     compute_ideal,
     crowding_distances,
     dominates_with_violation,
+    detect_latest_pareto_dir,
     extract_objectives,
     extract_violation,
     prune_front_with_extremes,
 )
 
 STAT_FIELDS = {"mean", "min", "max", "std"}
+
+
+def _resolve_aggregate_mode(metric: str, aggregate_cfg: Optional[Dict[str, str]]) -> str:
+    return resolve_aggregate_mode(metric, aggregate_cfg)
 
 
 @dataclass(frozen=True)
@@ -50,8 +56,8 @@ def _split_metric_field(raw_key: str) -> tuple[str, str]:
 
 def _resolve_metric_name(metric: str, metric_map: Dict[str, str]) -> str:
     if metric.startswith("w_"):
-        return metric_map.get(metric, metric)
-    return metric
+        return canonicalize_metric_name(metric_map.get(metric, metric))
+    return canonicalize_metric_name(metric)
 
 
 def _resolve_limit_value(
@@ -62,29 +68,22 @@ def _resolve_limit_value(
     metric_map: Dict[str, str],
 ) -> Optional[float]:
     metric = spec.metric
-    if metric in objectives:
-        return objectives.get(metric)
+    value = resolve_metric_value(objectives, metric)
+    if value is not None:
+        return value
     resolved_metric = _resolve_metric_name(metric, metric_map)
-    if resolved_metric in objectives:
-        return objectives.get(resolved_metric)
+    value = resolve_metric_value(objectives, resolved_metric)
+    if value is not None:
+        return value
     field = spec.field
     if field == "auto":
-        if aggregated_values and resolved_metric in aggregated_values:
-            return aggregated_values.get(resolved_metric)
+        if aggregated_values:
+            value = resolve_metric_value(aggregated_values, resolved_metric)
+            if value is not None:
+                return value
         field = "mean"
     key = f"{resolved_metric.replace('.', '_')}_{field}"
-    return stats_flat.get(key)
-
-
-def _resolve_aggregate_mode(metric: str, aggregate_cfg: Optional[Dict[str, str]]) -> str:
-    """Return the aggregate mode for *metric* given an aggregate config dict."""
-    if not aggregate_cfg:
-        return "mean"
-    mode = aggregate_cfg.get(metric)
-    if mode is None and "_" in metric:
-        base = metric.rsplit("_", 1)[0]
-        mode = aggregate_cfg.get(base)
-    return str(mode or aggregate_cfg.get("default", "mean")).lower()
+    return resolve_metric_value(stats_flat, key)
 
 
 def _suite_metrics_to_stats(
@@ -214,17 +213,16 @@ class ParetoStore:
         if self.scoring_keys is None:
             self.scoring_specs = extract_objective_specs(entry)
             self.scoring_keys = [spec.metric for spec in self.scoring_specs]
-        rounded = round_floats(entry, self.sig_digits)
-        h = calc_hash(rounded)
+        h = calc_hash(entry)
         with self._lock:
             if h in self._entries:  # fast‑dedupe
                 return False
 
-            metrics_block = rounded.get("metrics", {}) or {}
+            metrics_block = entry.get("metrics", {}) or {}
             obj, _ = extract_objectives(
-                rounded, scoring_keys=self.scoring_specs or entry.get("optimize", {}).get("scoring")
+                entry, scoring_keys=self.scoring_specs or entry.get("optimize", {}).get("scoring")
             )
-            violation = extract_violation(rounded)
+            violation = extract_violation(entry)
 
             # ───────────── NEW: dedupe on the objective vector ──────────────
             existing_hash = self._objective_lookup.get(obj)
@@ -270,7 +268,7 @@ class ParetoStore:
                 self._remove_from_front(idx)
 
             # add new member
-            self._persist_entry(h, rounded, source_path=source_path)
+            self._persist_entry(h, entry, source_path=source_path)
             self._objectives[h] = obj
             self._violations[h] = violation
             self._front.append(h)
@@ -436,21 +434,6 @@ def comma_separated_values_float(x):
     return [float(z) for z in x.split(",")]
 
 
-def detect_latest_pareto_dir(root: Path = Path("optimize_results")) -> Optional[str]:
-    if not root.exists():
-        return None
-    latest: Optional[tuple[float, Path]] = None
-    for child in sorted(root.iterdir()):
-        pareto_path = child / "pareto"
-        if pareto_path.is_dir():
-            mtime = pareto_path.stat().st_mtime
-            if latest is None or mtime > latest[0]:
-                latest = (mtime, pareto_path)
-    if latest is None:
-        return None
-    return str(latest[1])
-
-
 def main():
     import argparse
     import matplotlib.pyplot as plt
@@ -481,8 +464,8 @@ def main():
         default=None,
         help=(
             "Path to a pareto/ directory produced by the optimizer or suite. When\n"
-            "omitted the script auto-detects the most recent run under\n"
-            "optimize_results/."
+            "omitted the script auto-detects the lexicographically latest run\n"
+            "under optimize_results/ whose pareto/ dir has JSON candidates."
         ),
     )
     parser.add_argument(
@@ -548,11 +531,11 @@ def main():
         auto_dir = detect_latest_pareto_dir()
         if auto_dir is None:
             parser.error(
-                "No pareto directory specified and none found under optimize_results/. "
-                "Provide a path explicitly."
+                "No pareto directory specified and no valid optimize_results/<run>/pareto "
+                "directory with at least one *.json candidate was found. Provide a path explicitly."
             )
         print(f"[info] Using latest pareto directory: {auto_dir}")
-        pareto_dir = auto_dir
+        pareto_dir = str(auto_dir)
 
     pareto_dir = pareto_dir.rstrip("/")
     entries = sorted(glob.glob(os.path.join(pareto_dir, "*.json")))
@@ -649,7 +632,10 @@ def main():
                 metric_name_map or {},
             ):
                 continue
-            values = [objectives.get(_resolve_metric_name(k, metric_name_map or {})) for k in objective_keys]
+            values = [
+                resolve_metric_value(objectives, _resolve_metric_name(k, metric_name_map or {}))
+                for k in objective_keys
+            ]
             if all(v is not None for v in values):
                 points.append((*values, h))
                 filenames[h] = os.path.split(entry_path)[-1]

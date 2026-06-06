@@ -6,7 +6,9 @@ from rust_utils import check_and_maybe_compile, verify_loaded_runtime_extension
 
 # Perform Rust compilation check before importing any modules that may load the extension
 _rust_parser = argparse.ArgumentParser(add_help=False)
-_rust_parser.add_argument("--skip-rust-compile", action="store_true", help="Skip Rust build check.")
+_rust_parser.add_argument(
+    "--skip-rust-compile", action="store_true", help="Skip Rust build check."
+)
 _rust_parser.add_argument(
     "--force-rust-compile", action="store_true", help="Force rebuild of Rust extension."
 )
@@ -72,6 +74,7 @@ from config_utils import (
     recursive_config_update,
     format_config,
     strip_config_metadata,
+    sanitize_prepared_config_for_dump,
     HSL_PSIDE_KEYS,
 )
 from analysis_visibility import filter_analysis_for_visibility
@@ -91,9 +94,32 @@ from pure_funcs import (
 )
 import pprint
 from copy import deepcopy
-from hlcv_preparation import prepare_hlcvs, prepare_hlcvs_combined
+from hlcv_preparation import (
+    prepare_hlcvs,
+    prepare_hlcvs_combined,
+    try_prepare_hlcvs_v2_local,
+)
+from hlcvs_manifest import (
+    HlcvsManifestError,
+    build_hlcvs_manifest,
+    load_numpy_artifact,
+    load_hlcvs_manifest,
+    manifest_has_required_schema,
+    verify_hlcvs_manifest,
+    write_hlcvs_manifest,
+)
+from hlcvs_override import load_hlcvs_data_override
 from ohlcv_utils import aggregate_hlcvs, align_and_aggregate_hlcvs
-from warmup_utils import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes
+from warmup_utils import (
+    compute_backtest_warmup_minutes,
+    compute_per_coin_warmup_minutes,
+)
+from backtest_universe import (
+    POSITION_SIDES,
+    effective_backtest_approved_coins_by_side,
+    effective_backtest_data_coins,
+    normalize_backtest_coin,
+)
 from pathlib import Path
 import re
 from plotting import (
@@ -109,8 +135,14 @@ import logging
 import gzip
 import traceback
 from logging_setup import configure_logging, resolve_log_level
-from suite_runner import extract_suite_config, filter_scenarios_by_label, run_backtest_suite_async
+from materialized_cache import release_materialized_payload
+from suite_runner import (
+    extract_suite_config,
+    filter_scenarios_by_label,
+    run_backtest_suite_async,
+)
 import passivbot_rust as pbr  # noqa: E402
+
 verify_loaded_runtime_extension()
 from tools.event_loop_policy import set_windows_event_loop_policy
 
@@ -119,6 +151,21 @@ PLOT_GROUP_ALL = PLOT_GROUP_SUMMARY | {"coin_fills"}
 HLCVS_CACHE_ROOT = Path("caches") / "hlcvs_data"
 HLCVS_CACHE_HASH_LEN = 16
 HLCVS_CACHE_DIR_SEP = "__"
+
+
+@dataclass(frozen=True)
+class BacktestPlotContext:
+    hlcvs: np.ndarray | None = None
+    timestamps: np.ndarray | None = None
+    hard_stop_plot_data: Any = None
+
+    @classmethod
+    def from_payload(cls, payload) -> "BacktestPlotContext":
+        return cls(
+            hlcvs=np.asarray(payload.bundle.hlcvs),
+            timestamps=np.asarray(payload.bundle.timestamps),
+            hard_stop_plot_data=payload.hard_stop_plot_data,
+        )
 
 
 def parse_disabled_plot_groups(value) -> set[str]:
@@ -149,6 +196,7 @@ def parse_disabled_plot_groups(value) -> set[str]:
                 "disable_plotting must be one of all, summary, balance, twe, pnl, hard_stop, coin_fills"
             )
     return disabled
+
 
 ANALYSIS_SHARED_PREFIXES = ("hard_stop_",)
 
@@ -189,7 +237,9 @@ def _resolve_backtest_hsl_configs(config: dict) -> tuple[dict, dict]:
             "enabled": bool(pside_cfg["hsl_enabled"]),
             "red_threshold": float(pside_cfg["hsl_red_threshold"]),
             "ema_span_minutes": float(pside_cfg["hsl_ema_span_minutes"]),
-            "cooldown_minutes_after_red": float(pside_cfg["hsl_cooldown_minutes_after_red"]),
+            "cooldown_minutes_after_red": float(
+                pside_cfg["hsl_cooldown_minutes_after_red"]
+            ),
             "no_restart_drawdown_threshold": float(
                 pside_cfg["hsl_no_restart_drawdown_threshold"]
             ),
@@ -206,7 +256,7 @@ def _resolve_backtest_hsl_configs(config: dict) -> tuple[dict, dict]:
 
 def _resolve_backtest_hsl_signal_mode(config: dict) -> str:
     return normalize_hsl_signal_mode(
-        get_optional_config_value(config, "live.hsl_signal_mode", "pside")
+        get_optional_config_value(config, "live.hsl_signal_mode", "unified")
     )
 
 
@@ -317,11 +367,18 @@ def _build_coin_metadata_entries(
     return entries
 
 
+def _as_c_contiguous_native_array(arr, dtype):
+    dtype = np.dtype(dtype)
+    out = np.asarray(arr)
+    if out.dtype == dtype and out.flags.c_contiguous:
+        return out
+    return np.ascontiguousarray(out, dtype=dtype)
+
+
 def _build_hlcvs_bundle(
     hlcvs,
     btc_usd_prices,
     timestamps,
-    config,
     exchange,
     mss,
     coins_order,
@@ -329,7 +386,7 @@ def _build_hlcvs_bundle(
     last_valid_indices,
     warmup_minutes,
     trade_start_indices,
-    requested_start_ts,
+    bundle_meta_base: dict,
     *,
     coin_indices: list[int] | None = None,
 ) -> pbr.HlcvsBundle:
@@ -341,7 +398,9 @@ def _build_hlcvs_bundle(
             )
         subset_positions = [int(idx) for idx in coin_indices]
         n_coins = int(hlcvs.shape[1])
-        if len(subset_positions) == n_coins and subset_positions == list(range(n_coins)):
+        if len(subset_positions) == n_coins and subset_positions == list(
+            range(n_coins)
+        ):
             subset_positions = None
 
     def _rss_mb() -> float | None:
@@ -373,21 +432,12 @@ def _build_hlcvs_bundle(
         hlcvs_view = hlcvs[:, subset_positions, :]
         hlcvs_arr = np.ascontiguousarray(hlcvs_view, dtype=np.float64)
     else:
-        hlcvs_arr = np.ascontiguousarray(hlcvs, dtype=np.float64)
-    btc_arr = np.ascontiguousarray(btc_usd_prices, dtype=np.float64)
+        hlcvs_arr = _as_c_contiguous_native_array(hlcvs, np.float64)
+    btc_arr = _as_c_contiguous_native_array(btc_usd_prices, np.float64)
     if timestamps is None:
         timestamps_arr = np.arange(hlcvs_arr.shape[0], dtype=np.int64)
     else:
-        timestamps_arr = np.ascontiguousarray(timestamps, dtype=np.int64)
-    meta_overrides = mss.get("__meta__", {}) if isinstance(mss, dict) else {}
-    warmup_requested = int(
-        meta_overrides.get("warmup_minutes_requested", compute_backtest_warmup_minutes(config))
-    )
-    warmup_provided = int(meta_overrides.get("warmup_minutes_provided", warmup_requested))
-    requested_ts = int(meta_overrides.get("requested_start_ts", requested_start_ts))
-    effective_start_ts = int(
-        meta_overrides.get("effective_start_ts", int(timestamps_arr[0]) if len(timestamps_arr) else 0)
-    )
+        timestamps_arr = _as_c_contiguous_native_array(timestamps, np.int64)
     coin_meta_entries = _build_coin_metadata_entries(
         coins_order,
         exchange,
@@ -397,13 +447,7 @@ def _build_hlcvs_bundle(
         warmup_minutes,
         trade_start_indices,
     )
-    bundle_meta = {
-        "requested_start_timestamp_ms": requested_ts,
-        "effective_start_timestamp_ms": effective_start_ts,
-        "warmup_minutes_requested": warmup_requested,
-        "warmup_minutes_provided": warmup_provided,
-        "coins": coin_meta_entries,
-    }
+    bundle_meta = {**bundle_meta_base, "coins": coin_meta_entries}
     rss_after = _rss_mb()
     if hasattr(logger, "trace"):
         logger.trace(
@@ -444,25 +488,44 @@ def build_backtest_payload(
     timestamps=None,
     *,
     coin_indices: list[int] | None = None,
+    metrics_only: bool = False,
 ) -> BacktestPayload:
     """
     Assemble the bundle, bot params, and metadata needed to execute a backtest.
     """
 
-    runtime_config = compile_runtime_config(config, runtime="backtest", record_step=False)
-    execution_settings = get_backtest_execution_settings(runtime_config, is_runtime_compiled=True)
+    runtime_config = compile_runtime_config(
+        config, runtime="backtest", record_step=False
+    )
+    execution_settings = get_backtest_execution_settings(
+        runtime_config, is_runtime_compiled=True
+    )
     bot_params_list, exchange_params, backtest_params = prep_backtest_args(
         runtime_config,
         mss,
         exchange,
         execution_settings=execution_settings,
         is_runtime_compiled=True,
+        metrics_only=metrics_only,
     )
     backtest_params = dict(backtest_params)
     coins_order = backtest_params.get("coins", [])
 
     # Read candle interval from config (default to 1m)
     candle_interval = config.get("backtest", {}).get("candle_interval_minutes", 1)
+    if isinstance(candle_interval, numbers.Real):
+        candle_interval_float = float(candle_interval)
+        if not candle_interval_float.is_integer():
+            raise ValueError(
+                "candle_interval_minutes must be an integer number of minutes, "
+                f"got {candle_interval!r}"
+            )
+        candle_interval = int(candle_interval_float)
+    else:
+        raise TypeError(
+            "candle_interval_minutes must be an integer number of minutes, "
+            f"got {type(candle_interval).__name__}"
+        )
     if candle_interval < 1:
         raise ValueError(f"candle_interval_minutes must be >= 1, got {candle_interval}")
     backtest_params["candle_interval_minutes"] = candle_interval
@@ -496,17 +559,14 @@ def build_backtest_payload(
             hlcvs.shape[0],
             offset_bars,
         )
-        if isinstance(mss, dict):
-            meta = mss.setdefault("__meta__", {})
-            meta["data_interval_minutes"] = int(candle_interval)
-            meta["candle_interval_offset_bars"] = int(offset_bars)
-            if timestamps is not None and len(timestamps) > 0:
-                meta["effective_start_ts"] = int(timestamps[0])
-                meta["effective_start_date"] = ts_to_date(int(timestamps[0]))
 
     # Inject first timestamp (ms) into backtest params; default to 0 if unknown
     try:
-        first_ts_ms = int(timestamps[0]) if (timestamps is not None and len(timestamps) > 0) else 0
+        first_ts_ms = (
+            int(timestamps[0])
+            if (timestamps is not None and len(timestamps) > 0)
+            else 0
+        )
     except Exception:
         first_ts_ms = 0
 
@@ -532,7 +592,9 @@ def build_backtest_payload(
         meta = mss.get(coin, {}) if isinstance(mss, dict) else {}
         # Metadata indices are based on 1m candles; adjust for aggregated interval
         first_idx_1m = int(meta.get("first_valid_index", 0)) - offset_bars
-        last_idx_1m = int(meta.get("last_valid_index", source_steps_1m - 1)) - offset_bars
+        last_idx_1m = (
+            int(meta.get("last_valid_index", source_steps_1m - 1)) - offset_bars
+        )
         if first_idx_1m < 0:
             first_idx_1m = 0
         if last_idx_1m < 0:
@@ -557,7 +619,9 @@ def build_backtest_payload(
         warm = int(meta.get("warmup_minutes", warmup_map.get(coin, default_warm)))
         warmup_minutes.append(warm)
         # trade_start_idx is in candle units, adjust warm from minutes to candle periods
-        warm_bars = int(math.ceil(warm / candle_interval)) if candle_interval > 1 else int(warm)
+        warm_bars = (
+            int(math.ceil(warm / candle_interval)) if candle_interval > 1 else int(warm)
+        )
         if first_idx > last_idx:
             trade_idx = first_idx
         else:
@@ -576,7 +640,8 @@ def build_backtest_payload(
 
     meta = mss.get("__meta__", {}) if isinstance(mss, dict) else {}
     candidate_start = meta.get(
-        "requested_start_ts", require_config_value(config, "backtest.start_date")
+        "effective_requested_start_ts",
+        meta.get("requested_start_ts", require_config_value(config, "backtest.start_date")),
     )
     try:
         if isinstance(candidate_start, str):
@@ -584,19 +649,37 @@ def build_backtest_payload(
         else:
             requested_start_ts = int(candidate_start)
     except Exception:
-        requested_start_ts = int(date_to_ts(require_config_value(config, "backtest.start_date")))
+        requested_start_ts = int(
+            date_to_ts(require_config_value(config, "backtest.start_date"))
+        )
     backtest_params["requested_start_timestamp_ms"] = requested_start_ts
-    if isinstance(meta, dict) and timestamps is not None and len(timestamps) > 0:
-        meta["effective_start_ts"] = int(timestamps[0])
-        meta["effective_start_date"] = ts_to_date(int(timestamps[0]))
-        warmup_provided = max(0, int(max(0, requested_start_ts - int(timestamps[0])) // 60_000))
-        meta["warmup_minutes_provided"] = warmup_provided
+
+    warmup_requested = int(
+        meta.get("warmup_minutes_requested", compute_backtest_warmup_minutes(config))
+    )
+    if "warmup_minutes_provided" in meta:
+        warmup_provided = int(meta["warmup_minutes_provided"])
+    elif timestamps is not None and len(timestamps) > 0:
+        warmup_provided = max(0, (requested_start_ts - int(timestamps[0])) // 60_000)
+    else:
+        warmup_provided = warmup_requested
+
+    if timestamps is not None and len(timestamps) > 0:
+        effective_start_ts = int(timestamps[0])
+    else:
+        effective_start_ts = 0
+
+    bundle_meta_base = {
+        "requested_start_timestamp_ms": requested_start_ts,
+        "effective_start_timestamp_ms": effective_start_ts,
+        "warmup_minutes_requested": warmup_requested,
+        "warmup_minutes_provided": warmup_provided,
+    }
 
     bundle = _build_hlcvs_bundle(
         hlcvs,
         btc_usd_prices,
         timestamps,
-        config,
         exchange,
         mss,
         coins_order,
@@ -604,7 +687,7 @@ def build_backtest_payload(
         last_valid_indices,
         warmup_minutes,
         trade_start_indices,
-        requested_start_ts,
+        bundle_meta_base,
         coin_indices=coin_indices,
     )
 
@@ -647,17 +730,58 @@ def execute_backtest(payload: BacktestPayload, config: dict):
             f"run_backtest_bundle returned {len(backtest_result)} values; expected 4 or 5"
         )
 
+    if payload.backtest_params.get("metrics_only", False):
+        payload.hard_stop_plot_data = {}
+        analysis = expand_analysis(analysis_usd, analysis_btc, None, equities_array, config)
+        return None, None, analysis
+
     equities_array = np.asarray(equities_array)
     payload.hard_stop_plot_data = dict(hard_stop_plot_data or {})
-    analysis = expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config)
+    analysis = expand_analysis(
+        analysis_usd, analysis_btc, fills, equities_array, config
+    )
     if bool(analysis.get("liquidated", False)):
-        final_equity_usd = float(equities_array[-1, 1]) if equities_array.size else float("nan")
+        final_equity_usd = (
+            float(equities_array[-1, 1]) if equities_array.size else float("nan")
+        )
         logging.debug(
             "Backtest liquidated early | final_equity_usd=%.6f | liquidation_threshold=%.6f",
             final_equity_usd,
-            float(get_optional_config_value(config, "backtest.liquidation_threshold", 0.05) or 0.0),
+            float(
+                get_optional_config_value(
+                    config, "backtest.liquidation_threshold", 0.05
+                )
+                or 0.0
+            ),
         )
     return fills, equities_array, analysis
+
+
+def calc_backtest_completion_ratio(equities_array, config: dict) -> float | None:
+    backtest_cfg = config.get("backtest", {}) if isinstance(config, dict) else {}
+    if not isinstance(backtest_cfg, dict):
+        return None
+    start_date = backtest_cfg.get("start_date")
+    end_date = backtest_cfg.get("end_date")
+    if start_date is None or end_date is None:
+        return None
+    equities = np.asarray(equities_array)
+    if equities.ndim != 2 or equities.shape[0] == 0 or equities.shape[1] == 0:
+        return None
+    requested_start_ts = int(date_to_ts(str(start_date)))
+    requested_end_ts = int(date_to_ts(format_end_date(str(end_date))))
+    requested_span = requested_end_ts - requested_start_ts
+    if requested_span <= 0:
+        return 1.0
+    first_equity_ts = int(equities[0, 0])
+    last_equity_ts = int(equities[-1, 0])
+    if last_equity_ts < first_equity_ts:
+        return 0.0
+    candle_interval_minutes = int(backtest_cfg.get("candle_interval_minutes", 1) or 1)
+    final_covered_ts = last_equity_ts + max(1, candle_interval_minutes) * 60_000
+    covered_end_ts = min(requested_end_ts, final_covered_ts)
+    covered_span = max(0, covered_end_ts - requested_start_ts)
+    return float(np.clip(covered_span / requested_span, 0.0, 1.0))
 
 
 def subset_backtest_payload(
@@ -700,9 +824,11 @@ def subset_backtest_payload(
                 raise ValueError(f"Coin index {idx} outside valid range.")
 
     hlcvs_np = np.asarray(payload.bundle.hlcvs)
-    subset_hlcvs = np.ascontiguousarray(hlcvs_np[:, selected_positions, :], dtype=np.float64)
-    btc_np = np.ascontiguousarray(np.asarray(payload.bundle.btc_usd), dtype=np.float64)
-    ts_np = np.ascontiguousarray(np.asarray(payload.bundle.timestamps), dtype=np.int64)
+    subset_hlcvs = np.ascontiguousarray(
+        hlcvs_np[:, selected_positions, :], dtype=np.float64
+    )
+    btc_np = _as_c_contiguous_native_array(payload.bundle.btc_usd, np.float64)
+    ts_np = _as_c_contiguous_native_array(payload.bundle.timestamps, np.int64)
 
     new_meta = deepcopy(bundle_meta)
     new_meta["coins"] = []
@@ -810,34 +936,54 @@ def process_forager_fills(
             analysis_appendix[f"loss_profit_ratio_{pside}"] = 1.0
             continue
         pnls[pside] = profit + loss
-        analysis_appendix[f"loss_profit_ratio_{pside}"] = abs(loss / profit) if profit != 0.0 else 1.0
+        analysis_appendix[f"loss_profit_ratio_{pside}"] = (
+            abs(loss / profit) if profit != 0.0 else 1.0
+        )
     pnl_sum = pnls["long"] + pnls["short"]
-    analysis_appendix["pnl_ratio_long_short"] = pnls["long"] / pnl_sum if pnl_sum != 0.0 else 0.5
+    analysis_appendix["pnl_ratio_long_short"] = (
+        pnls["long"] / pnl_sum if pnl_sum != 0.0 else 0.5
+    )
     sample_divider = max(1, int(balance_sample_divider))
     if not fdf.empty:
         timestamps_ns = fdf["timestamp"].astype("int64")
         bucket = (timestamps_ns // (sample_divider * 60_000 * 1_000_000)) * (
             sample_divider * 60_000 * 1_000_000
         )
-        usd_cash_series = fdf.groupby(bucket)["usd_cash_wallet"].last().rename("usd_cash_wallet")
+        usd_cash_series = (
+            fdf.groupby(bucket)["usd_cash_wallet"].last().rename("usd_cash_wallet")
+        )
         usd_total_balance_series = (
             fdf.groupby(bucket)["usd_total_balance"].last().rename("usd_total_balance")
         )
-        btc_cash_series = fdf.groupby(bucket)["btc_cash_wallet"].last().rename("btc_cash_wallet")
+        btc_cash_series = (
+            fdf.groupby(bucket)["btc_cash_wallet"].last().rename("btc_cash_wallet")
+        )
         btc_total_balance_series = (
             fdf.groupby(bucket)["btc_total_balance"].last().rename("btc_total_balance")
         )
         # convert to datetime index for easier alignment
         usd_cash_series.index = pd.to_datetime(usd_cash_series.index, unit="ns")
-        usd_total_balance_series.index = pd.to_datetime(usd_total_balance_series.index, unit="ns")
+        usd_total_balance_series.index = pd.to_datetime(
+            usd_total_balance_series.index, unit="ns"
+        )
         btc_cash_series.index = pd.to_datetime(btc_cash_series.index, unit="ns")
-        btc_total_balance_series.index = pd.to_datetime(btc_total_balance_series.index, unit="ns")
+        btc_total_balance_series.index = pd.to_datetime(
+            btc_total_balance_series.index, unit="ns"
+        )
     else:
         empty_dtidx = pd.DatetimeIndex([])
-        usd_cash_series = pd.Series(dtype=float, name="usd_cash_wallet", index=empty_dtidx)
-        usd_total_balance_series = pd.Series(dtype=float, name="usd_total_balance", index=empty_dtidx)
-        btc_cash_series = pd.Series(dtype=float, name="btc_cash_wallet", index=empty_dtidx)
-        btc_total_balance_series = pd.Series(dtype=float, name="btc_total_balance", index=empty_dtidx)
+        usd_cash_series = pd.Series(
+            dtype=float, name="usd_cash_wallet", index=empty_dtidx
+        )
+        usd_total_balance_series = pd.Series(
+            dtype=float, name="usd_total_balance", index=empty_dtidx
+        )
+        btc_cash_series = pd.Series(
+            dtype=float, name="btc_cash_wallet", index=empty_dtidx
+        )
+        btc_total_balance_series = pd.Series(
+            dtype=float, name="btc_total_balance", index=empty_dtidx
+        )
     equities_array = np.asarray(equities_array)
     equities_index = pd.to_datetime(equities_array[:, 0].astype(np.int64), unit="ms")
     edf = pd.Series(
@@ -850,11 +996,22 @@ def process_forager_fills(
         index=equities_index,
         name="btc_total_equity",
     )
+    if equities_array.shape[1] > 3:
+        strategy_eq_series = pd.Series(
+            equities_array[:, 3],
+            index=equities_index,
+            name="strategy_equity",
+        )
+    else:
+        strategy_eq_series = pd.Series(
+            dtype=float, name="strategy_equity", index=equities_index
+        )
     bal_eq = pd.concat(
         [
             usd_cash_series,
             usd_total_balance_series,
             edf,
+            strategy_eq_series,
             btc_cash_series,
             btc_total_balance_series,
             ebdf,
@@ -868,6 +1025,7 @@ def process_forager_fills(
                 "usd_cash_wallet",
                 "usd_total_balance",
                 "usd_total_equity",
+                "strategy_equity",
                 "btc_cash_wallet",
                 "btc_total_balance",
                 "btc_total_equity",
@@ -882,6 +1040,7 @@ def process_forager_fills(
                     "usd_cash_wallet",
                     "usd_total_balance",
                     "usd_total_equity",
+                    "strategy_equity",
                     "btc_cash_wallet",
                     "btc_total_balance",
                     "btc_total_equity",
@@ -906,13 +1065,19 @@ def process_forager_fills(
 def compare_dicts(dict1, dict2, path=""):
     for key in sorted(set(dict1.keys()) | set(dict2.keys())):
         if key not in dict1:
-            print(f"{path}{key}: Missing in first dict. Value in second dict: {dict2[key]}")
+            print(
+                f"{path}{key}: Missing in first dict. Value in second dict: {dict2[key]}"
+            )
         elif key not in dict2:
-            print(f"{path}{key}: Missing in second dict. Value in first dict: {dict1[key]}")
+            print(
+                f"{path}{key}: Missing in second dict. Value in first dict: {dict1[key]}"
+            )
         elif isinstance(dict1[key], dict) and isinstance(dict2[key], dict):
             compare_dicts(dict1[key], dict2[key], f"{path}{key}.")
         elif dict1[key] != dict2[key]:
-            print(f"{path}{key}: Values differ. First dict:  {dict1[key]} Second dict: {dict2[key]}")
+            print(
+                f"{path}{key}: Values differ. First dict:  {dict1[key]} Second dict: {dict2[key]}"
+            )
 
 
 def compare_dict_keys(dict1, dict2):
@@ -943,7 +1108,7 @@ def check_keys(dict0, dict1):
 
 def get_cache_hash(config, exchange):
     exchanges_cfg = require_config_value(config, "backtest.exchanges")
-    approved_coins = require_live_value(config, "approved_coins")
+    approved_coins = effective_backtest_approved_coins_by_side(config)
     minimum_coin_age = require_live_value(config, "minimum_coin_age_days")
     backtest_cfg = config.get("backtest", {}) or {}
     coin_sources = backtest_cfg.get("coin_sources") or {}
@@ -1012,14 +1177,18 @@ def _format_hlcvs_cache_date_label(config, timestamps=None) -> str:
             return f"{ts_to_date(start_ts)[:10]}_to_{ts_to_date(end_ts)[:10]}"
     except Exception:
         pass
-    start_date = _sanitize_hlcvs_cache_label(require_config_value(config, "backtest.start_date"))
+    start_date = _sanitize_hlcvs_cache_label(
+        require_config_value(config, "backtest.start_date")
+    )
     end_date = _sanitize_hlcvs_cache_label(
         format_end_date(require_config_value(config, "backtest.end_date"))
     )
     return f"{start_date}_to_{end_date}"
 
 
-def _build_hlcvs_cache_dir_name(config, exchange, coins, cache_hash, timestamps=None) -> str:
+def _build_hlcvs_cache_dir_name(
+    config, exchange, coins, cache_hash, timestamps=None
+) -> str:
     exchange_label = _sanitize_hlcvs_cache_label(str(exchange).lower())
     coins_label = _format_hlcvs_cache_coins_label(coins)
     date_label = _format_hlcvs_cache_date_label(config, timestamps=timestamps)
@@ -1074,6 +1243,21 @@ def load_coins_hlcvs_from_cache(config, exchange, warmup_minutes=0):
     cache_dir = _resolve_hlcvs_cache_dir(cache_hash)
     compress_cache = bool(require_config_value(config, "backtest.compress_cache"))
     if cache_dir and os.path.exists(cache_dir):
+        manifest = load_hlcvs_manifest(cache_dir)
+        if manifest is None:
+            logging.info(
+                "[hlcvs] cache %s missing manifest; rebuilding",
+                cache_dir,
+            )
+            return None
+        elif not manifest_has_required_schema(manifest):
+            logging.info(
+                "[hlcvs] cache %s has unsupported manifest schema; rebuilding",
+                cache_dir,
+            )
+            return None
+        else:
+            verify_hlcvs_manifest(cache_dir, manifest)
         # Check warmup sufficiency: cached data must cover at least the needed warmup
         meta_path = cache_dir / "cache_meta.json"
         if meta_path.exists():
@@ -1092,55 +1276,74 @@ def load_coins_hlcvs_from_cache(config, exchange, warmup_minutes=0):
             return None
         coins = json.load(open(cache_dir / "coins.json"))
         mss = json.load(open(cache_dir / "market_specific_settings.json"))
+        def cache_artifact_path(name: str, default_name: str) -> Path:
+            if manifest_has_required_schema(manifest):
+                files = manifest.get("files", {})
+                entry = files.get(name) if isinstance(files, dict) else None
+                if not isinstance(entry, dict):
+                    raise HlcvsManifestError(
+                        f"HLCV manifest missing required file entry {name!r}"
+                    )
+                rel_path = entry.get("path") if isinstance(entry, dict) else None
+                if not rel_path:
+                    raise HlcvsManifestError(
+                        f"HLCV manifest file entry {name!r} is missing path"
+                    )
+                return cache_dir / str(rel_path)
+            return cache_dir / default_name
+
         if compress_cache:
-            fname = cache_dir / "hlcvs.npy.gz"
-            logging.info(f"{exchange} Attempting to load hlcvs data from cache {fname}...")
-            with gzip.open(fname, "rb") as f:
-                hlcvs = np.load(f)
+            fname = cache_artifact_path("hlcvs", "hlcvs.npy.gz")
+            logging.info(
+                f"{exchange} Attempting to load hlcvs data from cache {fname}..."
+            )
+            hlcvs = load_numpy_artifact(fname)
             # Load optional timestamps if present
-            ts_fname = cache_dir / "timestamps.npy.gz"
+            ts_fname = cache_artifact_path("timestamps", "timestamps.npy.gz")
             timestamps = None
             if os.path.exists(ts_fname):
                 try:
-                    with gzip.open(ts_fname, "rb") as f:
-                        timestamps = np.load(f)
+                    timestamps = load_numpy_artifact(ts_fname)
                 except Exception:
                     timestamps = None
-            btc_fname = cache_dir / "btc_usd_prices.npy.gz"
+            btc_fname = cache_artifact_path("btc_usd_prices", "btc_usd_prices.npy.gz")
             if os.path.exists(btc_fname):
                 logging.info(
                     f"{exchange} Attempting to load BTC/USD prices from cache {btc_fname}..."
                 )
-                with gzip.open(btc_fname, "rb") as f:
-                    btc_usd_prices = np.load(f)
+                btc_usd_prices = load_numpy_artifact(btc_fname)
             else:
                 logging.info(
                     f"{exchange} No BTC/USD prices in cache; cache invalid for fractional collateral"
                 )
                 return None
         else:
-            fname = cache_dir / "hlcvs.npy"
-            logging.info(f"{exchange} Attempting to load hlcvs data from cache {fname}...")
-            hlcvs = np.load(fname)
-            ts_fname = cache_dir / "timestamps.npy"
+            fname = cache_artifact_path("hlcvs", "hlcvs.npy")
+            logging.info(
+                f"{exchange} Attempting to load hlcvs data from cache {fname}..."
+            )
+            hlcvs = load_numpy_artifact(fname)
+            ts_fname = cache_artifact_path("timestamps", "timestamps.npy")
             timestamps = None
             if os.path.exists(ts_fname):
                 try:
-                    timestamps = np.load(ts_fname)
+                    timestamps = load_numpy_artifact(ts_fname)
                 except Exception:
                     timestamps = None
-            btc_fname = cache_dir / "btc_usd_prices.npy"
+            btc_fname = cache_artifact_path("btc_usd_prices", "btc_usd_prices.npy")
             if os.path.exists(btc_fname):
                 logging.info(
                     f"{exchange} Attempting to load BTC/USD prices from cache {btc_fname}..."
                 )
-                btc_usd_prices = np.load(btc_fname)
+                btc_usd_prices = load_numpy_artifact(btc_fname)
             else:
                 logging.info(
                     f"{exchange} No BTC/USD prices in cache; cache invalid for fractional collateral"
                 )
                 return None
-        results_path = oj(require_config_value(config, "backtest.base_dir"), exchange, "")
+        results_path = oj(
+            require_config_value(config, "backtest.base_dir"), exchange, ""
+        )
         return cache_dir, coins, hlcvs, mss, results_path, btc_usd_prices, timestamps
     return None
 
@@ -1154,6 +1357,7 @@ def save_coins_hlcvs_to_cache(
     btc_usd_prices,
     timestamps=None,
     warmup_minutes=0,
+    force_overwrite=False,
 ):
     cache_hash = get_cache_hash(config, exchange)
     cache_dir = _get_hlcvs_cache_dir_for_save(
@@ -1167,14 +1371,22 @@ def save_coins_hlcvs_to_cache(
     is_compressed = bool(require_config_value(config, "backtest.compress_cache"))
     warmup_minutes = int(warmup_minutes)
     meta_path = cache_dir / "cache_meta.json"
-    if meta_path.exists():
+    if meta_path.exists() and not force_overwrite:
         try:
             existing_meta = json.load(open(meta_path))
             existing_warmup = int(existing_meta.get("warmup_minutes", 0))
-            if existing_warmup >= warmup_minutes:
+            existing_manifest = load_hlcvs_manifest(cache_dir)
+            if existing_warmup >= warmup_minutes and manifest_has_required_schema(
+                existing_manifest
+            ):
+                verify_hlcvs_manifest(cache_dir, existing_manifest)
                 return cache_dir
-        except Exception:
-            pass
+        except (HlcvsManifestError, OSError, TypeError, ValueError) as exc:
+            logging.warning(
+                "[hlcvs] existing cache %s failed validation; overwriting: %s",
+                cache_dir,
+                exc,
+            )
     logging.info(f"Dumping cache...")
     json.dump(coins, open(cache_dir / "coins.json", "w"))
     json.dump(mss, open(cache_dir / "market_specific_settings.json", "w"))
@@ -1219,7 +1431,35 @@ def save_coins_hlcvs_to_cache(
         f"{line}"
     )
     logging.info(f"Seconds to dump cache: {(utc_ms() - sts) / 1000:.4f}")
-    json.dump({"warmup_minutes": warmup_minutes}, open(meta_path, "w"))
+    candidate_report = (mss.get("__meta__", {}) or {}).get("candidate_report")
+    if candidate_report is not None:
+        json.dump(
+            candidate_report,
+            open(cache_dir / "candidate_report.json", "w"),
+            indent=2,
+            sort_keys=True,
+        )
+    manifest = build_hlcvs_manifest(
+        config=config,
+        exchange=exchange,
+        cache_hash=cache_hash,
+        coins=list(coins),
+        hlcvs=hlcvs,
+        mss=mss,
+        btc_usd_prices=btc_usd_prices,
+        timestamps=timestamps,
+        warmup_minutes=warmup_minutes,
+        compressed=is_compressed,
+    )
+    write_hlcvs_manifest(cache_dir, manifest)
+    json.dump(
+        {
+            "warmup_minutes": warmup_minutes,
+            "materialization_schema_version": manifest["materialization_schema_version"],
+            "manifest_schema_version": manifest["schema_version"],
+        },
+        open(meta_path, "w"),
+    )
     return cache_dir
 
 
@@ -1257,39 +1497,163 @@ def ensure_valid_index_metadata(mss, hlcvs, coins, warmup_map=None):
         meta["trade_start_index"] = trade_start_idx
 
 
+def warn_hlcv_valid_range_coverage(config, coins, mss, timestamps):
+    if timestamps is None or len(timestamps) == 0:
+        return
+    requested_start_ts = int(
+        date_to_ts(require_config_value(config, "backtest.start_date"))
+    )
+    requested_end_ts = int(
+        date_to_ts(format_end_date(require_config_value(config, "backtest.end_date")))
+    )
+    if requested_end_ts < requested_start_ts:
+        return
+    last_ts_index = len(timestamps) - 1
+    for coin in coins:
+        meta = mss.get(coin, {})
+        first_idx = int(meta.get("first_valid_index", len(timestamps)))
+        last_idx = int(meta.get("last_valid_index", -1))
+        if first_idx > last_idx or first_idx > last_ts_index or last_idx < 0:
+            logging.warning(
+                "[hlcvs] %s has no valid local data for requested range %s -> %s",
+                coin,
+                ts_to_date(requested_start_ts),
+                ts_to_date(requested_end_ts),
+            )
+            continue
+        first_idx = max(0, min(first_idx, last_ts_index))
+        last_idx = max(0, min(last_idx, last_ts_index))
+        valid_start_ts = int(timestamps[first_idx])
+        valid_end_ts = int(timestamps[last_idx])
+        if valid_end_ts < requested_start_ts or valid_start_ts > requested_end_ts:
+            logging.warning(
+                "[hlcvs] %s valid data range %s -> %s is entirely outside requested range %s -> %s",
+                coin,
+                ts_to_date(valid_start_ts),
+                ts_to_date(valid_end_ts),
+                ts_to_date(requested_start_ts),
+                ts_to_date(requested_end_ts),
+            )
+        elif valid_end_ts < requested_end_ts:
+            missing_minutes = int((requested_end_ts - valid_end_ts) // 60_000)
+            logging.warning(
+                "[hlcvs] %s valid data ends before requested end: valid_end=%s requested_end=%s missing_minutes=%d",
+                coin,
+                ts_to_date(valid_end_ts),
+                ts_to_date(requested_end_ts),
+                missing_minutes,
+            )
+
+
+def assert_hlcv_has_tradable_coverage(coins, mss):
+    tradable = []
+    for coin in coins:
+        meta = mss[coin]
+        first_idx = int(meta["first_valid_index"])
+        last_idx = int(meta["last_valid_index"])
+        warm_minutes = int(meta["warmup_minutes"])
+        if first_idx <= last_idx and first_idx + warm_minutes <= last_idx:
+            tradable.append(coin)
+    if not tradable:
+        raise ValueError("HLCV data has no tradable candles after warmup")
+
+
 async def prepare_hlcvs_mss(config, exchange, *, force_refetch_gaps: bool = False):
     base_dir = require_config_value(config, "backtest.base_dir")
     results_path = oj(base_dir, exchange, "")
     warmup_map = compute_per_coin_warmup_minutes(config)
     default_warm = int(warmup_map.get("__default__", 0))
     backtest_warmup_minutes = compute_backtest_warmup_minutes(config)
+    override_result = load_hlcvs_data_override(config, exchange)
+    if override_result is not None:
+        cache_dir, coins, hlcvs, mss, results_path, btc_usd_prices, timestamps = override_result
+        ensure_valid_index_metadata(mss, hlcvs, coins, warmup_map)
+        warn_hlcv_valid_range_coverage(config, coins, mss, timestamps)
+        assert_hlcv_has_tradable_coverage(coins, mss)
+        return (
+            coins,
+            hlcvs,
+            mss,
+            results_path,
+            cache_dir,
+            btc_usd_prices,
+            timestamps,
+        )
     try:
         sts = utc_ms()
-        result = load_coins_hlcvs_from_cache(config, exchange, backtest_warmup_minutes)
+        result = (
+            None
+            if force_refetch_gaps
+            else load_coins_hlcvs_from_cache(config, exchange, backtest_warmup_minutes)
+        )
         if result:
             logging.info(f"Seconds to load cache: {(utc_ms() - sts) / 1000:.4f}")
-            cache_dir, coins, hlcvs, mss, results_path, btc_usd_prices, timestamps = result
+            cache_dir, coins, hlcvs, mss, results_path, btc_usd_prices, timestamps = (
+                result
+            )
             logging.info(f"Successfully loaded hlcvs data from cache")
             ensure_valid_index_metadata(mss, hlcvs, coins, warmup_map)
+            warn_hlcv_valid_range_coverage(config, coins, mss, timestamps)
+            assert_hlcv_has_tradable_coverage(coins, mss)
             # Pass through cached timestamps if they were stored; fall back to None otherwise
-            return coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices, timestamps
+            return (
+                coins,
+                hlcvs,
+                mss,
+                results_path,
+                cache_dir,
+                btc_usd_prices,
+                timestamps,
+            )
     except Exception as e:
         logging.info(f"Unable to load hlcvs data from cache: {e}. Fetching...")
+    local_v2 = None
+    if exchange != "combined":
+        backtest_cfg = config.get("backtest", {}) if isinstance(config, dict) else {}
+        has_explicit_source_dir = bool(backtest_cfg.get("ohlcv_source_dir"))
+        stock_perp_coins = [
+            coin
+            for coin in effective_backtest_data_coins(config)
+            if str(coin).startswith("xyz:")
+        ]
+        try:
+            if stock_perp_coins and has_explicit_source_dir:
+                # Source-dir stock-perp imports need the direct preparer; keep that
+                # exception explicit so default stock-perp runs still fail strict.
+                local_v2 = await prepare_hlcvs(
+                    config,
+                    exchange,
+                    force_refetch_gaps=force_refetch_gaps,
+                    skip_v2_local=True,
+                )
+            else:
+                local_v2 = await try_prepare_hlcvs_v2_local(
+                    config, exchange, force_refetch_gaps=force_refetch_gaps
+                )
+        except Exception as e:
+            raise ValueError(f"{exchange} deterministic HLCV materialization failed: {e}") from e
+    if local_v2 is not None:
+        mss, timestamps, hlcvs, btc_usd_prices = local_v2
     if exchange == "combined":
         forced_sources = config.get("backtest", {}).get("coin_sources")
-        market_settings_sources = config.get("backtest", {}).get("market_settings_sources")
+        market_settings_sources = config.get("backtest", {}).get(
+            "market_settings_sources"
+        )
         mss, timestamps, hlcvs, btc_usd_prices = await prepare_hlcvs_combined(
             config,
             forced_sources=forced_sources,
             market_settings_sources=market_settings_sources,
             force_refetch_gaps=force_refetch_gaps,
         )
-    else:
-        mss, timestamps, hlcvs, btc_usd_prices = await prepare_hlcvs(
-            config, exchange, force_refetch_gaps=force_refetch_gaps
+    elif local_v2 is None:
+        raise ValueError(
+            f"{exchange} deterministic HLCV materialization could not build usable coverage "
+            "for the requested range"
         )
     coins = sorted([coin for coin in mss.keys() if not coin.startswith("__")])
     ensure_valid_index_metadata(mss, hlcvs, coins, warmup_map)
+    warn_hlcv_valid_range_coverage(config, coins, mss, timestamps)
+    assert_hlcv_has_tradable_coverage(coins, mss)
     logging.info(f"Finished preparing hlcvs data for {exchange}. Shape: {hlcvs.shape}")
     try:
         cache_dir = save_coins_hlcvs_to_cache(
@@ -1301,11 +1665,12 @@ async def prepare_hlcvs_mss(config, exchange, *, force_refetch_gaps: bool = Fals
             btc_usd_prices,
             timestamps,
             warmup_minutes=backtest_warmup_minutes,
+            force_overwrite=force_refetch_gaps,
         )
     except Exception as e:
         logging.error(f"Failed to save hlcvs to cache: {e}")
         traceback.print_exc()
-        cache_dir = ""
+        raise
     return coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices, timestamps
 
 
@@ -1320,15 +1685,20 @@ def _coerce_config_bool(value, *, field_name):
     return bool(value)
 
 
-def get_backtest_execution_settings(config, *, is_runtime_compiled: bool = False) -> BacktestExecutionSettings:
+def get_backtest_execution_settings(
+    config, *, is_runtime_compiled: bool = False
+) -> BacktestExecutionSettings:
     if not is_runtime_compiled:
         config = compile_runtime_config(config, runtime="backtest", record_step=False)
     market_order_slippage_pct = float(
-        get_optional_config_value(config, "backtest.market_order_slippage_pct", 0.0005) or 0.0
+        get_optional_config_value(config, "backtest.market_order_slippage_pct", 0.0005)
+        or 0.0
     )
     if market_order_slippage_pct < 0.0:
         raise ValueError("backtest.market_order_slippage_pct must be >= 0.0")
-    market_orders_allowed_raw = get_optional_live_value(config, "market_orders_allowed", False)
+    market_orders_allowed_raw = get_optional_live_value(
+        config, "market_orders_allowed", False
+    )
     market_orders_allowed = _coerce_config_bool(
         market_orders_allowed_raw,
         field_name="live.market_orders_allowed",
@@ -1336,11 +1706,11 @@ def get_backtest_execution_settings(config, *, is_runtime_compiled: bool = False
     market_order_near_touch_threshold_raw = get_optional_live_value(
         config, "market_order_near_touch_threshold", 0.001
     )
-    market_order_near_touch_threshold = float(market_order_near_touch_threshold_raw or 0.0)
+    market_order_near_touch_threshold = float(
+        market_order_near_touch_threshold_raw or 0.0
+    )
     if market_order_near_touch_threshold < 0.0:
-        raise ValueError(
-            "live.market_order_near_touch_threshold must be >= 0.0"
-        )
+        raise ValueError("live.market_order_near_touch_threshold must be >= 0.0")
     pnls_max_lookback = parse_pnls_max_lookback_days(
         get_optional_live_value(config, "pnls_max_lookback_days", 30.0),
         field_name="live.pnls_max_lookback_days",
@@ -1354,7 +1724,9 @@ def get_backtest_execution_settings(config, *, is_runtime_compiled: bool = False
     )
 
 
-def log_backtest_execution_settings(execution_settings: BacktestExecutionSettings | None) -> None:
+def log_backtest_execution_settings(
+    execution_settings: BacktestExecutionSettings | None,
+) -> None:
     if execution_settings is None:
         return
     logging.info("[backtest] effective execution settings:")
@@ -1385,13 +1757,22 @@ def prep_backtest_args(
     execution_settings: BacktestExecutionSettings | None = None,
     *,
     is_runtime_compiled: bool = False,
+    metrics_only: bool = False,
 ):
     if not is_runtime_compiled:
         config = compile_runtime_config(config, runtime="backtest", record_step=False)
     if execution_settings is None:
-        execution_settings = get_backtest_execution_settings(config, is_runtime_compiled=True)
+        execution_settings = get_backtest_execution_settings(
+            config, is_runtime_compiled=True
+        )
     coins = sorted(set(require_config_value(config, f"backtest.coins.{exchange}")))
-    candle_interval = int(config.get("backtest", {}).get("candle_interval_minutes", 1) or 1)
+    approved_by_side = {
+        pside: set(side_coins)
+        for pside, side_coins in effective_backtest_approved_coins_by_side(config).items()
+    }
+    candle_interval = int(
+        config.get("backtest", {}).get("candle_interval_minutes", 1) or 1
+    )
     bot_params_list = []
     bot_params_template = deepcopy(require_config_value(config, "bot"))
     for coin in coins:
@@ -1399,15 +1780,20 @@ def prep_backtest_args(
         if coin in config.get("coin_overrides", {}):
             for pside in ["long", "short"]:
                 for key in config["coin_overrides"][coin].get("bot", {}).get(pside, {}):
-                    coin_specific_bot_params[pside][key] = config["coin_overrides"][coin]["bot"][
-                        pside
-                    ][key]
+                    coin_specific_bot_params[pside][key] = config["coin_overrides"][
+                        coin
+                    ]["bot"][pside][key]
                 coin_specific_bot_params[pside]["is_forced_active"] = (
-                    config["coin_overrides"].get("live", {}).get(f"forced_mode_{pside}", "")
+                    config["coin_overrides"]
+                    .get("live", {})
+                    .get(f"forced_mode_{pside}", "")
                     == "normal"
                 )
-        for pside in ["long", "short"]:
-            if "wallet_exposure_limit" not in config["coin_overrides"].get(coin, {}).get(
+        coin_key = normalize_backtest_coin(coin)
+        for pside in POSITION_SIDES:
+            if coin_key not in approved_by_side[pside]:
+                coin_specific_bot_params[pside]["wallet_exposure_limit"] = 0.0
+            elif "wallet_exposure_limit" not in config["coin_overrides"].get(coin, {}).get(
                 "bot", {}
             ).get(pside, {}):
                 coin_specific_bot_params[pside]["wallet_exposure_limit"] = -1.0
@@ -1420,15 +1806,21 @@ def prep_backtest_args(
                 "min_qty": mss[coin]["min_qty"],
                 "min_cost": mss[coin]["min_cost"],
                 "c_mult": mss[coin]["c_mult"],
-                "maker_fee": float(mss[coin].get("maker_fee", mss[coin].get("maker", 0.0002))),
-                "taker_fee": float(mss[coin].get("taker_fee", mss[coin].get("taker", 0.00055))),
+                "maker_fee": float(
+                    mss[coin].get("maker_fee", mss[coin].get("maker", 0.0002))
+                ),
+                "taker_fee": float(
+                    mss[coin].get("taker_fee", mss[coin].get("taker", 0.00055))
+                ),
             }
             for coin in coins
         ]
     if backtest_params is None:
         hard_stop_cfg_long, hard_stop_cfg_short = _resolve_backtest_hsl_configs(config)
         hsl_signal_mode = _resolve_backtest_hsl_signal_mode(config)
-        if not isinstance(hard_stop_cfg_long, dict) or not isinstance(hard_stop_cfg_short, dict):
+        if not isinstance(hard_stop_cfg_long, dict) or not isinstance(
+            hard_stop_cfg_short, dict
+        ):
             raise TypeError("HSL pside configs must be dicts")
 
         def _normalize_hsl_cfg(cfg: dict, path_prefix: str) -> dict:
@@ -1447,11 +1839,17 @@ def prep_backtest_args(
             orange_tier_mode = str(cfg["orange_tier_mode"])
             panic_close_order_type = str(cfg["panic_close_order_type"])
             if enabled and red_threshold <= 0.0:
-                raise ValueError(f"{path_prefix}.red_threshold must be > 0.0 when enabled")
+                raise ValueError(
+                    f"{path_prefix}.red_threshold must be > 0.0 when enabled"
+                )
             if enabled and ema_span_minutes <= 0.0:
-                raise ValueError(f"{path_prefix}.ema_span_minutes must be > 0.0 when enabled")
+                raise ValueError(
+                    f"{path_prefix}.ema_span_minutes must be > 0.0 when enabled"
+                )
             if cooldown_minutes_after_red < 0.0:
-                raise ValueError(f"{path_prefix}.cooldown_minutes_after_red must be >= 0.0")
+                raise ValueError(
+                    f"{path_prefix}.cooldown_minutes_after_red must be >= 0.0"
+                )
             if no_restart_drawdown_threshold < red_threshold:
                 logging.info(
                     "[config] clamped %s.no_restart_drawdown_threshold %.6f -> %.6f to match red_threshold",
@@ -1465,13 +1863,20 @@ def prep_backtest_args(
                     f"{path_prefix}.no_restart_drawdown_threshold must satisfy red_threshold <= no_restart_drawdown_threshold <= 1.0"
                 )
             if not (0.0 < tier_ratio_yellow < tier_ratio_orange < 1.0):
-                raise ValueError(f"{path_prefix}.tier_ratios must satisfy 0 < yellow < orange < 1")
-            if orange_tier_mode not in {"graceful_stop", "tp_only_with_active_entry_cancellation"}:
+                raise ValueError(
+                    f"{path_prefix}.tier_ratios must satisfy 0 < yellow < orange < 1"
+                )
+            if orange_tier_mode not in {
+                "graceful_stop",
+                "tp_only_with_active_entry_cancellation",
+            }:
                 raise ValueError(
                     f"{path_prefix}.orange_tier_mode must be one of {{graceful_stop, tp_only_with_active_entry_cancellation}}"
                 )
             if panic_close_order_type not in {"market", "limit"}:
-                raise ValueError(f"{path_prefix}.panic_close_order_type must be one of {{market, limit}}")
+                raise ValueError(
+                    f"{path_prefix}.panic_close_order_type must be one of {{market, limit}}"
+                )
             return {
                 "enabled": enabled,
                 "signal_mode": hsl_signal_mode,
@@ -1490,26 +1895,41 @@ def prep_backtest_args(
         hard_stop_cfg_long = _normalize_hsl_cfg(hard_stop_cfg_long, "bot.long.hsl")
         hard_stop_cfg_short = _normalize_hsl_cfg(hard_stop_cfg_short, "bot.short.hsl")
         liquidation_threshold = float(
-            get_optional_config_value(config, "backtest.liquidation_threshold", 0.05) or 0.0
+            get_optional_config_value(config, "backtest.liquidation_threshold", 0.05)
+            or 0.0
         )
         if not (0.0 <= liquidation_threshold < 1.0):
-            raise ValueError("backtest.liquidation_threshold must satisfy 0.0 <= x < 1.0")
-        btc_collateral_cap = float(require_config_value(config, "backtest.btc_collateral_cap"))
-        btc_collateral_ltv_cap = require_config_value(config, "backtest.btc_collateral_ltv_cap")
+            raise ValueError(
+                "backtest.liquidation_threshold must satisfy 0.0 <= x < 1.0"
+            )
+        btc_collateral_cap = float(
+            require_config_value(config, "backtest.btc_collateral_cap")
+        )
+        btc_collateral_ltv_cap = require_config_value(
+            config, "backtest.btc_collateral_ltv_cap"
+        )
         if btc_collateral_ltv_cap is not None:
             btc_collateral_ltv_cap = float(btc_collateral_ltv_cap)
-        maker_fee_override = get_optional_config_value(config, "backtest.maker_fee_override", None)
-        taker_fee_override = get_optional_config_value(config, "backtest.taker_fee_override", None)
+        maker_fee_override = get_optional_config_value(
+            config, "backtest.maker_fee_override", None
+        )
+        taker_fee_override = get_optional_config_value(
+            config, "backtest.taker_fee_override", None
+        )
         if maker_fee_override is None:
             maker_fee = mss[coins[0]]["maker"]
         else:
             maker_fee = float(maker_fee_override)
         if taker_fee_override is None:
-            taker_fee = mss[coins[0]].get("taker_fee", mss[coins[0]].get("taker", 0.00055))
+            taker_fee = mss[coins[0]].get(
+                "taker_fee", mss[coins[0]].get("taker", 0.00055)
+            )
         else:
             taker_fee = float(taker_fee_override)
         backtest_params = {
-            "starting_balance": require_config_value(config, "backtest.starting_balance"),
+            "starting_balance": require_config_value(
+                config, "backtest.starting_balance"
+            ),
             "maker_fee": maker_fee,
             "taker_fee": taker_fee,
             "coins": coins,
@@ -1521,7 +1941,7 @@ def prep_backtest_args(
             "warmup_minutes": [],
             "trade_start_indices": [],
             "global_warmup_bars": 0,
-            "metrics_only": False,
+            "metrics_only": bool(metrics_only),
             "filter_by_min_effective_cost": bool(
                 require_config_value(config, "backtest.filter_by_min_effective_cost")
             ),
@@ -1529,12 +1949,18 @@ def prep_backtest_args(
                 require_config_value(config, "backtest.dynamic_wel_by_tradability")
             ),
             "hedge_mode": bool(require_config_value(config, "live.hedge_mode")),
-            "max_realized_loss_pct": float(require_config_value(config, "live.max_realized_loss_pct")),
+            "max_realized_loss_pct": float(
+                require_config_value(config, "live.max_realized_loss_pct")
+            ),
             "pnls_max_lookback_days": execution_settings.pnls_max_lookback_days_backtest_value,
             "equity_hard_stop_loss": hard_stop_cfg_long,
             "market_order_slippage_pct": execution_settings.market_order_slippage_pct,
             "market_orders_allowed": execution_settings.market_orders_allowed,
             "market_order_near_touch_threshold": execution_settings.market_order_near_touch_threshold,
+            "forager_score_hysteresis_pct": float(
+                get_optional_live_value(config, "forager_score_hysteresis_pct", 0.02)
+                or 0.0
+            ),
             "liquidation_threshold": liquidation_threshold,
         }
     return bot_params_list, exchange_params, backtest_params
@@ -1545,7 +1971,9 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
     analysis_btc = dict(analysis_btc)
     keys = ["adg", "adg_w", "mdg", "mdg_w", "gain"]
     for pside in ["long", "short"]:
-        twel = float(require_config_value(config, f"bot.{pside}.total_wallet_exposure_limit"))
+        twel = float(
+            require_config_value(config, f"bot.{pside}.total_wallet_exposure_limit")
+        )
         for key in keys:
             analysis_usd[f"{key}_per_exposure_{pside}"] = (
                 (analysis_usd[key] / twel if twel > 0.0 else 0.0)
@@ -1563,7 +1991,9 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
     def _scalar_values_match(usd_val, btc_val) -> bool:
         if usd_val is None or btc_val is None:
             return False
-        if isinstance(usd_val, numbers.Integral) and isinstance(btc_val, numbers.Integral):
+        if isinstance(usd_val, numbers.Integral) and isinstance(
+            btc_val, numbers.Integral
+        ):
             return usd_val == btc_val
         if isinstance(usd_val, bool) and isinstance(btc_val, bool):
             return usd_val == btc_val
@@ -1614,6 +2044,9 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
 
     _add_metrics(analysis_usd, "usd")
     _add_metrics(analysis_btc, "btc")
+    completion_ratio = calc_backtest_completion_ratio(equities_array, config)
+    if completion_ratio is not None:
+        result["backtest_completion_ratio"] = completion_ratio
 
     return result
 
@@ -1660,13 +2093,14 @@ def post_process(
     results_path,
     exchange,
     label=None,
-    plot_hlcvs=None,
-    hard_stop_plot_data=None,
+    plot_context: BacktestPlotContext | None = None,
 ):
     sts = utc_ms()
     disabled_plot_groups = parse_disabled_plot_groups(config.get("disable_plotting"))
     equities_array = np.asarray(equities_array)
-    balance_sample_divider = get_optional_config_value(config, "backtest.balance_sample_divider", 60)
+    balance_sample_divider = get_optional_config_value(
+        config, "backtest.balance_sample_divider", 60
+    )
     try:
         balance_sample_divider = int(round(float(balance_sample_divider)))
     except (TypeError, ValueError):
@@ -1695,10 +2129,29 @@ def post_process(
     results_path = make_get_filepath(
         oj(results_path, f"{ts_to_date(utc_ms())[:19].replace(':', '_')}", "")
     )
-    json.dump(analysis, open(f"{results_path}analysis.json", "w"), indent=4, sort_keys=True)
-    config["analysis"] = analysis
-    formatted_config = format_config(config, verbose=False)
-    sanitized_config = strip_config_metadata(formatted_config)
+    json.dump(
+        analysis, open(f"{results_path}analysis.json", "w"), indent=4, sort_keys=True
+    )
+    original_config = config.get("_original_backtest_config")
+    if original_config is not None:
+        dump_config(
+            strip_config_metadata(original_config),
+            f"{results_path}config.original.json",
+        )
+    if get_optional_config_value(config, "backtest.hlcvs_data_dir"):
+        sanitized_config = strip_config_metadata(
+            config,
+            keys=(
+                "_raw",
+                "_raw_effective",
+                "_transform_log",
+                "_coins_sources",
+                "_original_backtest_config",
+                "analysis",
+            ),
+        )
+    else:
+        sanitized_config = sanitize_prepared_config_for_dump(config)
     dump_config(sanitized_config, f"{results_path}config.json")
     dump_backtest_dataset_metadata(config, exchange, results_path)
     fdf.to_csv(f"{results_path}fills.csv")
@@ -1727,7 +2180,9 @@ def post_process(
         hard_stop_figs = create_forager_hard_stop_drawdown_figure(
             bal_eq,
             config,
-            hard_stop_plot_data=hard_stop_plot_data,
+            hard_stop_plot_data=(
+                plot_context.hard_stop_plot_data if plot_context else None
+            ),
             autoplot=False,
             return_figures=True,
         )
@@ -1737,7 +2192,11 @@ def post_process(
         try:
             coins = require_config_value(config, f"backtest.coins.{exchange}")
             fills_plot_dir = oj(results_path, "fills_plots")
-            hlcvs_for_plot = plot_hlcvs if plot_hlcvs is not None else hlcvs
+            hlcvs_for_plot = (
+                plot_context.hlcvs
+                if plot_context is not None and plot_context.hlcvs is not None
+                else hlcvs
+            )
 
             def _save_coin_figure(name, fig):
                 save_figures({name: fig}, fills_plot_dir, close=True)
@@ -1746,6 +2205,7 @@ def post_process(
                 coins,
                 fdf,
                 hlcvs_for_plot,
+                timestamps=plot_context.timestamps if plot_context else None,
                 on_figure=_save_coin_figure,
                 close_after_callback=False,
             )
@@ -1762,7 +2222,7 @@ async def main():
         usage="%(prog)s [config_path] [options]",
         epilog=(
             "Examples:\n"
-            "  passivbot backtest configs/examples/default_trailing_grid_long_npos10.json -s XMR -sd 2025 --suite n\n"
+            "  passivbot backtest configs/examples/default_trailing_grid_long_npos7.json -s XMR -sd 2025 --suite n\n"
             "  passivbot backtest -e bybit -s BTC,ETH -sd 2024-01 -ed 2024-06\n"
             "\n"
             "Use --help-all to show every config override flag."
@@ -1902,15 +2362,20 @@ async def main():
     initial_log_level = resolve_log_level(cli_log_level, None, fallback=1)
     configure_logging(debug=initial_log_level)
     source_config, base_config_path, raw_snapshot = load_input_config(args.config_path)
-    update_config_with_args(source_config, args, verbose=True, allowed_keys=allowed_config_keys)
+    update_config_with_args(
+        source_config, args, verbose=True, allowed_keys=allowed_config_keys
+    )
     config = prepare_config(
         source_config,
         base_config_path=base_config_path,
         verbose=False,
+        log_config_transforms=True,
         raw_snapshot=raw_snapshot,
     )
     config_logging_value = get_optional_config_value(config, "logging.level", None)
-    effective_log_level = resolve_log_level(cli_log_level, config_logging_value, fallback=1)
+    effective_log_level = resolve_log_level(
+        cli_log_level, config_logging_value, fallback=1
+    )
     if effective_log_level != initial_log_level:
         configure_logging(debug=effective_log_level)
     logging_section = config.get("logging")
@@ -1946,21 +2411,29 @@ async def main():
             # Legacy format - extract from suite wrapper
             suite_override = override_backtest["suite"]
         else:
-            raise ValueError(f"Suite config {args.suite_config} does not define backtest.scenarios.")
+            raise ValueError(
+                f"Suite config {args.suite_config} does not define backtest.scenarios."
+            )
 
     suite_cfg = extract_suite_config(config, suite_override)
 
     # Handle --scenarios filter (implies --suite y)
     scenario_filter = getattr(args, "scenarios", None)
     if scenario_filter:
-        labels = [label.strip() for label in scenario_filter.split(",") if label.strip()]
-        suite_cfg["scenarios"] = filter_scenarios_by_label(suite_cfg.get("scenarios", []), labels)
+        labels = [
+            label.strip() for label in scenario_filter.split(",") if label.strip()
+        ]
+        suite_cfg["scenarios"] = filter_scenarios_by_label(
+            suite_cfg.get("scenarios", []), labels
+        )
         suite_cfg["enabled"] = True  # --scenarios implies suite mode
         logging.info("Filtered to %d scenario(s): %s", len(labels), ", ".join(labels))
 
     # --suite CLI arg overrides config (applied after --scenarios so explicit --suite n wins)
     if args.suite is not None:
-        recursive_config_update(config, "backtest.suite_enabled", bool(args.suite), verbose=True)
+        recursive_config_update(
+            config, "backtest.suite_enabled", bool(args.suite), verbose=True
+        )
         suite_cfg["enabled"] = bool(args.suite)
 
     # Log disable_plotting if set (not a config key, just a runtime flag)
@@ -1968,7 +2441,10 @@ async def main():
         logging.info("changed disable_plotting False -> %s", args.disable_plotting)
 
     if suite_cfg.get("enabled"):
-        logging.info("Running backtest suite (%d scenarios)...", len(suite_cfg.get("scenarios", [])))
+        logging.info(
+            "Running backtest suite (%d scenarios)...",
+            len(suite_cfg.get("scenarios", [])),
+        )
         summary = await run_backtest_suite_async(
             config,
             suite_cfg,
@@ -1985,9 +2461,13 @@ async def main():
     for ex in backtest_exchanges:
         await load_markets(ex)
     await format_approved_ignored_coins(config, backtest_exchanges)
-    config["disable_plotting"] = args.disable_plotting if args.disable_plotting is not None else False
+    config["disable_plotting"] = (
+        args.disable_plotting if args.disable_plotting is not None else False
+    )
     config["backtest"]["cache_dir"] = {}
     config["backtest"]["coins"] = {}
+    if get_optional_config_value(config, "backtest.hlcvs_data_dir"):
+        config["_original_backtest_config"] = deepcopy(config)
     force_refetch_gaps = getattr(args, "force_refetch_gaps", False)
 
     # New behavior: derive data strategy from exchange count
@@ -1998,56 +2478,30 @@ async def main():
     if use_combined:
         exchange = "combined"
         coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices, timestamps = (
-            await prepare_hlcvs_mss(config, exchange, force_refetch_gaps=force_refetch_gaps)
-        )
-        exchange_preference = defaultdict(list)
-        for coin in coins:
-            exchange_preference[mss[coin]["exchange"]].append(coin)
-        for ex in exchange_preference:
-            logging.info(f"chose {ex} for {','.join(exchange_preference[ex])}")
-        config["backtest"]["coins"][exchange] = coins
-        config["backtest"]["cache_dir"][exchange] = str(cache_dir)
-
-        fills, equities_array, analysis, payload = run_backtest(
-            hlcvs, mss, config, exchange, btc_usd_prices, timestamps, return_payload=True
-        )
-        post_process(
-            config,
-            hlcvs,
-            fills,
-            equities_array,
-            btc_usd_prices,
-            analysis,
-            results_path,
-            exchange,
-            plot_hlcvs=np.asarray(payload.bundle.hlcvs),
-            hard_stop_plot_data=payload.hard_stop_plot_data,
-        )
-    else:
-        # Single exchange mode
-        configs = {exchange: deepcopy(config) for exchange in backtest_exchanges}
-        tasks = {}
-        for exchange in backtest_exchanges:
-            tasks[exchange] = asyncio.create_task(
-                prepare_hlcvs_mss(configs[exchange], exchange, force_refetch_gaps=force_refetch_gaps)
+            await prepare_hlcvs_mss(
+                config, exchange, force_refetch_gaps=force_refetch_gaps
             )
-        for exchange in tasks:
-            coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices, timestamps = await tasks[
-                exchange
-            ]
-            configs[exchange]["backtest"]["coins"][exchange] = coins
-            configs[exchange]["backtest"]["cache_dir"][exchange] = str(cache_dir)
+        )
+        try:
+            exchange_preference = defaultdict(list)
+            for coin in coins:
+                exchange_preference[mss[coin]["exchange"]].append(coin)
+            for ex in exchange_preference:
+                logging.info(f"chose {ex} for {','.join(exchange_preference[ex])}")
+            config["backtest"]["coins"][exchange] = coins
+            config["backtest"]["cache_dir"][exchange] = str(cache_dir)
+
             fills, equities_array, analysis, payload = run_backtest(
                 hlcvs,
                 mss,
-                configs[exchange],
+                config,
                 exchange,
                 btc_usd_prices,
                 timestamps,
                 return_payload=True,
             )
             post_process(
-                configs[exchange],
+                config,
                 hlcvs,
                 fills,
                 equities_array,
@@ -2055,9 +2509,49 @@ async def main():
                 analysis,
                 results_path,
                 exchange,
-                plot_hlcvs=np.asarray(payload.bundle.hlcvs),
-                hard_stop_plot_data=payload.hard_stop_plot_data,
+                plot_context=BacktestPlotContext.from_payload(payload),
             )
+        finally:
+            release_materialized_payload(hlcvs)
+    else:
+        # Single exchange mode
+        configs = {exchange: deepcopy(config) for exchange in backtest_exchanges}
+        tasks = {}
+        for exchange in backtest_exchanges:
+            tasks[exchange] = asyncio.create_task(
+                prepare_hlcvs_mss(
+                    configs[exchange], exchange, force_refetch_gaps=force_refetch_gaps
+                )
+            )
+        for exchange in tasks:
+            coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices, timestamps = (
+                await tasks[exchange]
+            )
+            try:
+                configs[exchange]["backtest"]["coins"][exchange] = coins
+                configs[exchange]["backtest"]["cache_dir"][exchange] = str(cache_dir)
+                fills, equities_array, analysis, payload = run_backtest(
+                    hlcvs,
+                    mss,
+                    configs[exchange],
+                    exchange,
+                    btc_usd_prices,
+                    timestamps,
+                    return_payload=True,
+                )
+                post_process(
+                    configs[exchange],
+                    hlcvs,
+                    fills,
+                    equities_array,
+                    btc_usd_prices,
+                    analysis,
+                    results_path,
+                    exchange,
+                    plot_context=BacktestPlotContext.from_payload(payload),
+                )
+            finally:
+                release_materialized_payload(hlcvs)
 
 
 if __name__ == "__main__":

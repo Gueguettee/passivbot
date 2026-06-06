@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Backtest-only performance hint: allow next-only vs full-grid expansion on a per-symbol basis.
+/// Order-expansion hint: allow next-only vs full-grid expansion on a per-symbol basis.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryPeekHints {
@@ -18,13 +18,22 @@ pub struct EntryPeekHints {
     pub expand_close_short: HashSet<usize>,
 }
 
+/// Stateless forager hysteresis input derived from current open entry orders.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForagerHysteresisState {
+    pub score_hysteresis_pct: f64,
+    pub incumbent_long: HashSet<usize>,
+    pub incumbent_short: HashSet<usize>,
+}
+
 mod core {
     use crate::closes::{
         calc_closes_long, calc_closes_short, calc_next_close_long, calc_next_close_short,
     };
     use crate::coin_selection::{
-        select_forager_candidates, ForagerCandidate, ForagerPositionSide, ForagerSelectionConfig,
-        ForagerSelectionError,
+        select_forager_candidates_with_diagnostics, ForagerCandidate, ForagerPositionSide,
+        ForagerSelectionConfig, ForagerSelectionError, ForagerSelectionResult,
     };
     use crate::constants::{LONG, SHORT};
     use crate::entries::{
@@ -130,6 +139,54 @@ mod core {
         pub max_realized_loss_pct: f64,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct MinEffectiveCostBlock {
+        pub symbol_idx: usize,
+        pub pside: PositionSide,
+        pub balance: f64,
+        pub effective_limit: f64,
+        pub entry_initial_qty_pct: f64,
+        pub projected_initial_cost: f64,
+        pub effective_min_cost: f64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ForagerScoredCandidateDiagnostic {
+        pub symbol_idx: usize,
+        pub rank: usize,
+        pub score: f64,
+        pub volume_component: f64,
+        pub ema_readiness_component: f64,
+        pub volatility_component: f64,
+        pub selected: bool,
+        pub incumbent: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ForagerHysteresisEventDiagnostic {
+        pub incumbent_symbol_idx: usize,
+        pub incumbent_score: f64,
+        pub challenger_symbol_idx: usize,
+        pub challenger_score: f64,
+        pub score_gap: f64,
+        pub kept_incumbent: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ForagerSelectionDiagnostic {
+        pub pside: PositionSide,
+        pub slots_to_fill: usize,
+        pub score_hysteresis_pct: f64,
+        pub selected_symbol_indices: Vec<usize>,
+        pub incumbent_symbol_indices: Vec<usize>,
+        pub top_scores: Vec<ForagerScoredCandidateDiagnostic>,
+        pub hysteresis_events: Vec<ForagerHysteresisEventDiagnostic>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case", deny_unknown_fields)]
     pub enum OrchestratorError {
@@ -158,6 +215,10 @@ mod core {
         pub loss_gate_blocks: Vec<LossGateBlock>,
         #[serde(default)]
         pub symbol_states: Vec<SymbolStateDiagnostic>,
+        #[serde(default)]
+        pub min_effective_cost_blocks: Vec<MinEffectiveCostBlock>,
+        #[serde(default)]
+        pub forager_selections: Vec<ForagerSelectionDiagnostic>,
     }
 
     #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -295,8 +356,12 @@ mod core {
         pub balance_raw: f64,
         pub global: OrchestratorGlobal,
         pub symbols: Vec<SymbolInput>,
-        /// Backtest-only performance hint: allow next-only vs full-grid expansion.
+        /// Optional order-expansion hint. Live uses this to avoid full flat entry grids; backtest
+        /// normally leaves it absent and uses `next_candle` lookahead instead.
         pub peek_hints: Option<super::EntryPeekHints>,
+        /// Optional forager hysteresis input reconstructed from current open entry orders.
+        #[serde(default)]
+        pub forager_hysteresis: Option<super::ForagerHysteresisState>,
     }
 
     fn default_balance_raw() -> f64 {
@@ -416,6 +481,17 @@ mod core {
         bp.total_wallet_exposure_limit > 0.0 && bp.n_positions > 0
     }
 
+    fn symbol_side_input(s: &SymbolInput, pside: PositionSide) -> &SymbolSideInput {
+        match pside {
+            PositionSide::Long => &s.long,
+            PositionSide::Short => &s.short,
+        }
+    }
+
+    fn symbol_side_eligible(s: &SymbolInput, pside: PositionSide) -> bool {
+        s.tradable && symbol_side_input(s, pside).bot_params.wallet_exposure_limit != 0.0
+    }
+
     fn ema_lookup(map: &EmaBySpan, span: f64) -> Option<f64> {
         if !span.is_finite() {
             return None;
@@ -485,7 +561,61 @@ mod core {
                     symbol_idx: Some(index),
                 }
             }
+            ForagerSelectionError::InvalidConfig { field, .. } => {
+                OrchestratorError::NonFiniteInput {
+                    field,
+                    symbol_idx: None,
+                }
+            }
         }
+    }
+
+    fn record_forager_selection_diagnostic(
+        diagnostics: &mut OrchestratorDiagnostics,
+        pside: PositionSide,
+        cfg: &ForagerSelectionConfig,
+        result: &ForagerSelectionResult,
+    ) {
+        const TOP_SCORE_LIMIT: usize = 12;
+        let mut incumbent_symbol_indices: Vec<usize> =
+            cfg.incumbent_indices.iter().copied().collect();
+        incumbent_symbol_indices.sort_unstable();
+        diagnostics
+            .forager_selections
+            .push(ForagerSelectionDiagnostic {
+                pside,
+                slots_to_fill: cfg.slots_to_fill,
+                score_hysteresis_pct: cfg.score_hysteresis_pct,
+                selected_symbol_indices: result.selected_indices.clone(),
+                incumbent_symbol_indices,
+                top_scores: result
+                    .scored
+                    .iter()
+                    .take(TOP_SCORE_LIMIT)
+                    .map(|item| ForagerScoredCandidateDiagnostic {
+                        symbol_idx: item.index,
+                        rank: item.rank,
+                        score: item.score,
+                        volume_component: item.volume_component,
+                        ema_readiness_component: item.ema_readiness_component,
+                        volatility_component: item.volatility_component,
+                        selected: item.selected,
+                        incumbent: item.incumbent,
+                    })
+                    .collect(),
+                hysteresis_events: result
+                    .hysteresis_events
+                    .iter()
+                    .map(|event| ForagerHysteresisEventDiagnostic {
+                        incumbent_symbol_idx: event.incumbent_index,
+                        incumbent_score: event.incumbent_score,
+                        challenger_symbol_idx: event.challenger_index,
+                        challenger_score: event.challenger_score,
+                        score_gap: event.score_gap,
+                        kept_incumbent: event.kept_incumbent,
+                    })
+                    .collect(),
+            });
     }
 
     fn require_forager_input(
@@ -511,22 +641,71 @@ mod core {
         if !filter_enabled {
             return true;
         }
+        if let Some((_effective_limit, req)) =
+            min_effective_cost_projection(balance, filter_enabled, effective_min_cost, bot)
+        {
+            req >= effective_min_cost
+        } else {
+            false
+        }
+    }
+
+    fn min_effective_cost_projection(
+        balance: f64,
+        filter_enabled: bool,
+        effective_min_cost: f64,
+        bot: &BotParams,
+    ) -> Option<(f64, f64)> {
+        if !filter_enabled {
+            return None;
+        }
         if !(balance.is_finite()
             && balance > 0.0
             && effective_min_cost.is_finite()
             && effective_min_cost > 0.0)
         {
-            return false;
+            return None;
         }
         let base_limit = bot.wallet_exposure_limit;
         let allowance_pct = bot.risk_we_excess_allowance_pct;
         let allowance_multiplier = 1.0 + allowance_pct.max(0.0);
         let effective_limit = base_limit * allowance_multiplier;
         if !(effective_limit.is_finite() && effective_limit > 0.0) {
-            return false;
+            return None;
         }
         let req = balance * effective_limit * bot.entry_initial_qty_pct;
-        req >= effective_min_cost
+        if !(req.is_finite() && req > 0.0) {
+            return None;
+        }
+        Some((effective_limit, req))
+    }
+
+    fn maybe_record_min_effective_cost_block(
+        diagnostics: &mut OrchestratorDiagnostics,
+        symbol_idx: usize,
+        pside: PositionSide,
+        balance: f64,
+        effective_min_cost: f64,
+        filter_enabled: bool,
+        bot: &BotParams,
+    ) {
+        if let Some((effective_limit, projected_initial_cost)) =
+            min_effective_cost_projection(balance, filter_enabled, effective_min_cost, bot)
+        {
+            if projected_initial_cost + 1e-12 < effective_min_cost {
+                diagnostics
+                    .min_effective_cost_blocks
+                    .push(MinEffectiveCostBlock {
+                        symbol_idx,
+                        pside,
+                        balance,
+                        effective_limit,
+                        entry_initial_qty_pct: bot.entry_initial_qty_pct,
+                        projected_initial_cost,
+                        effective_min_cost,
+                    });
+            }
+        }
     }
 
     fn market_price_for_order_side(ob: &OrderBook, qty: f64) -> f64 {
@@ -972,11 +1151,9 @@ mod core {
     ) {
         out.clear();
         for s in symbols {
-            let mode = match pside {
-                PositionSide::Long => s.long.mode,
-                PositionSide::Short => s.short.mode,
-            };
-            if mode == Some(TradingMode::Normal) {
+            if symbol_side_eligible(s, pside)
+                && symbol_side_input(s, pside).mode == Some(TradingMode::Normal)
+            {
                 out.push(s.symbol_idx);
             }
         }
@@ -1007,17 +1184,22 @@ mod core {
         active_flags: Option<&[bool]>,
         cfg: &ForagerSelectionConfig,
         out: &mut Vec<ForagerCandidate>,
+        diagnostics: &mut OrchestratorDiagnostics,
     ) -> Result<(), OrchestratorError> {
-        let volume_required = cfg.volume_drop_pct > 0.0 || cfg.weights.volume != 0.0;
-        let volatility_required = cfg.weights.volatility != 0.0;
-        let ema_readiness_required = cfg.weights.ema_readiness != 0.0;
+        let normalized_weights =
+            cfg.weights
+                .canonicalize()
+                .map_err(|_| OrchestratorError::NonFiniteInput {
+                    field: "forager_score_weights",
+                    symbol_idx: None,
+                })?;
+        let volume_required = cfg.volume_drop_pct > 0.0 || normalized_weights.volume != 0.0;
+        let volatility_required = normalized_weights.volatility != 0.0;
+        let ema_readiness_required = normalized_weights.ema_readiness != 0.0;
         out.clear();
         out.reserve(symbols.len());
         for s in symbols {
-            let side = match pside {
-                PositionSide::Long => &s.long,
-                PositionSide::Short => &s.short,
-            };
+            let side = symbol_side_input(s, pside);
             // For selection of coins to occupy available slots for initial entries:
             // - We rank across all coins (including those with positions), matching legacy.
             // - We exclude modes which categorically block initial entries when `psize == 0.0`.
@@ -1027,17 +1209,34 @@ mod core {
                 .and_then(|flags| flags.get(s.symbol_idx))
                 .copied()
                 .unwrap_or(false);
-            let enabled = s.tradable
+            let min_cost_ok = effective_min_cost_is_low_enough(
+                balance,
+                filter_enabled,
+                s.effective_min_cost,
+                &side.bot_params,
+            );
+            let enabled = symbol_side_eligible(s, pside)
                 && !already_active
                 && one_way_allows_initial_slot(symbols, s.symbol_idx, pside, hedge_mode)
                 && can_open_initial
-                && effective_min_cost_is_low_enough(
-                    balance,
-                    filter_enabled,
-                    s.effective_min_cost,
-                    &side.bot_params,
-                );
+                && min_cost_ok;
             if !enabled {
+                if symbol_side_eligible(s, pside)
+                    && !already_active
+                    && one_way_allows_initial_slot(symbols, s.symbol_idx, pside, hedge_mode)
+                    && can_open_initial
+                    && !min_cost_ok
+                {
+                    maybe_record_min_effective_cost_block(
+                        diagnostics,
+                        s.symbol_idx,
+                        pside,
+                        balance,
+                        s.effective_min_cost,
+                        filter_enabled,
+                        &side.bot_params,
+                    );
+                }
                 out.push(ForagerCandidate {
                     index: s.symbol_idx,
                     enabled: false,
@@ -1582,8 +1781,16 @@ mod core {
             &mut workspace.forced_short,
         );
 
-        let eligible_long = input.symbols.iter().filter(|s| s.tradable).count();
-        let eligible_short = eligible_long;
+        let eligible_long = input
+            .symbols
+            .iter()
+            .filter(|s| symbol_side_eligible(s, PositionSide::Long))
+            .count();
+        let eligible_short = input
+            .symbols
+            .iter()
+            .filter(|s| symbol_side_eligible(s, PositionSide::Short))
+            .count();
 
         let enp_long = compute_effective_n_positions(
             input.global.global_bot_params.long.n_positions,
@@ -1646,6 +1853,16 @@ mod core {
                         .clone(),
                     require_forager: true,
                     position_side: ForagerPositionSide::Long,
+                    score_hysteresis_pct: input
+                        .forager_hysteresis
+                        .as_ref()
+                        .map(|h| h.score_hysteresis_pct)
+                        .unwrap_or(0.0),
+                    incumbent_indices: input
+                        .forager_hysteresis
+                        .as_ref()
+                        .map(|h| h.incumbent_long.clone())
+                        .unwrap_or_default(),
                 };
                 build_forager_candidates_into(
                     &input.symbols,
@@ -1656,10 +1873,18 @@ mod core {
                     Some(actives_long),
                     &cfg,
                     &mut workspace.features,
+                    &mut diagnostics,
                 )?;
-                for idx in select_forager_candidates(&workspace.features, &cfg)
-                    .map_err(map_forager_selection_error)?
-                {
+                let selection =
+                    select_forager_candidates_with_diagnostics(&workspace.features, &cfg)
+                        .map_err(map_forager_selection_error)?;
+                record_forager_selection_diagnostic(
+                    &mut diagnostics,
+                    PositionSide::Long,
+                    &cfg,
+                    &selection,
+                );
+                for idx in selection.selected_indices {
                     if actives_long_count >= enp_long {
                         break;
                     }
@@ -1712,6 +1937,16 @@ mod core {
                         .clone(),
                     require_forager: true,
                     position_side: ForagerPositionSide::Short,
+                    score_hysteresis_pct: input
+                        .forager_hysteresis
+                        .as_ref()
+                        .map(|h| h.score_hysteresis_pct)
+                        .unwrap_or(0.0),
+                    incumbent_indices: input
+                        .forager_hysteresis
+                        .as_ref()
+                        .map(|h| h.incumbent_short.clone())
+                        .unwrap_or_default(),
                 };
                 build_forager_candidates_into(
                     &input.symbols,
@@ -1722,10 +1957,18 @@ mod core {
                     Some(actives_short),
                     &cfg,
                     &mut workspace.features,
+                    &mut diagnostics,
                 )?;
-                for idx in select_forager_candidates(&workspace.features, &cfg)
-                    .map_err(map_forager_selection_error)?
-                {
+                let selection =
+                    select_forager_candidates_with_diagnostics(&workspace.features, &cfg)
+                        .map_err(map_forager_selection_error)?;
+                record_forager_selection_diagnostic(
+                    &mut diagnostics,
+                    PositionSide::Short,
+                    &cfg,
+                    &selection,
+                );
+                for idx in selection.selected_indices {
                     if actives_short_count >= enp_short {
                         break;
                     }
@@ -1769,8 +2012,10 @@ mod core {
                 } else {
                     // No position on either side - decide based on eligibility and EMA band distance
                     let long_enabled = enabled_long
+                        && symbol_side_eligible(s, PositionSide::Long)
                         && should_generate_entries(effective_mode(s.long.mode, false), false, true);
                     let short_enabled = enabled_short
+                        && symbol_side_eligible(s, PositionSide::Short)
                         && should_generate_entries(
                             effective_mode(s.short.mode, false),
                             false,
@@ -1856,7 +2101,8 @@ mod core {
                     mode
                 };
 
-                let allow_initial = actives_long[s.symbol_idx]
+                let allow_initial = symbol_side_eligible(s, PositionSide::Long)
+                    && actives_long[s.symbol_idx]
                     && !workspace.one_way_block_initial_long[s.symbol_idx]
                     && effective_min_cost_is_low_enough(
                         input.balance,
@@ -2128,7 +2374,8 @@ mod core {
                     mode
                 };
 
-                let allow_initial = actives_short[s.symbol_idx]
+                let allow_initial = symbol_side_eligible(s, PositionSide::Short)
+                    && actives_short[s.symbol_idx]
                     && !workspace.one_way_block_initial_short[s.symbol_idx]
                     && effective_min_cost_is_low_enough(
                         input.balance,
@@ -2645,7 +2892,7 @@ mod core {
             }
             gate_entries_by_twel_deterministic(
                 PositionSide::Long,
-                input_balance_raw(input),
+                input.balance,
                 input
                     .global
                     .global_bot_params
@@ -2679,7 +2926,7 @@ mod core {
             }
             gate_entries_by_twel_deterministic(
                 PositionSide::Short,
-                input_balance_raw(input),
+                input.balance,
                 input
                     .global
                     .global_bot_params
@@ -2808,7 +3055,8 @@ mod core {
                     .as_ref()
                     .map(|state| state.mode)
                     .unwrap_or_else(|| effective_mode(s.short.mode, s.short.position.size != 0.0));
-                let long_allow_initial = workspace.actives_long[s.symbol_idx]
+                let long_allow_initial = symbol_side_eligible(s, PositionSide::Long)
+                    && workspace.actives_long[s.symbol_idx]
                     && !workspace.one_way_block_initial_long[s.symbol_idx]
                     && effective_min_cost_is_low_enough(
                         input.balance,
@@ -2816,7 +3064,24 @@ mod core {
                         s.effective_min_cost,
                         &s.long.bot_params,
                     );
-                let short_allow_initial = workspace.actives_short[s.symbol_idx]
+                if symbol_side_eligible(s, PositionSide::Long)
+                    && workspace.actives_long[s.symbol_idx]
+                    && !workspace.one_way_block_initial_long[s.symbol_idx]
+                    && s.long.position.size == 0.0
+                    && !long_allow_initial
+                {
+                    maybe_record_min_effective_cost_block(
+                        &mut diagnostics,
+                        s.symbol_idx,
+                        PositionSide::Long,
+                        input.balance,
+                        s.effective_min_cost,
+                        input.global.filter_by_min_effective_cost,
+                        &s.long.bot_params,
+                    );
+                }
+                let short_allow_initial = symbol_side_eligible(s, PositionSide::Short)
+                    && workspace.actives_short[s.symbol_idx]
                     && !workspace.one_way_block_initial_short[s.symbol_idx]
                     && effective_min_cost_is_low_enough(
                         input.balance,
@@ -2824,18 +3089,36 @@ mod core {
                         s.effective_min_cost,
                         &s.short.bot_params,
                     );
+                if symbol_side_eligible(s, PositionSide::Short)
+                    && workspace.actives_short[s.symbol_idx]
+                    && !workspace.one_way_block_initial_short[s.symbol_idx]
+                    && s.short.position.size == 0.0
+                    && !short_allow_initial
+                {
+                    maybe_record_min_effective_cost_block(
+                        &mut diagnostics,
+                        s.symbol_idx,
+                        PositionSide::Short,
+                        input.balance,
+                        s.effective_min_cost,
+                        input.global.filter_by_min_effective_cost,
+                        &s.short.bot_params,
+                    );
+                }
                 SymbolStateDiagnostic {
                     symbol_idx: s.symbol_idx,
                     long: SymbolSideStateDiagnostic {
                         input_mode: s.long.mode,
                         effective_mode: long_mode,
-                        active: workspace.actives_long[s.symbol_idx],
+                        active: symbol_side_eligible(s, PositionSide::Long)
+                            && workspace.actives_long[s.symbol_idx],
                         allow_initial: long_allow_initial,
                     },
                     short: SymbolSideStateDiagnostic {
                         input_mode: s.short.mode,
                         effective_mode: short_mode,
-                        active: workspace.actives_short[s.symbol_idx],
+                        active: symbol_side_eligible(s, PositionSide::Short)
+                            && workspace.actives_short[s.symbol_idx],
                         allow_initial: short_allow_initial,
                     },
                 }
@@ -2851,6 +3134,7 @@ mod core {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::orchestrator::EntryPeekHints;
         use std::collections::HashSet;
 
         fn make_basic_symbol(idx: usize) -> SymbolInput {
@@ -2944,6 +3228,51 @@ mod core {
             assert!(should_use_market_execution(&order, &global, &order_book));
             let executable = to_executable_order(order, &global, &order_book);
             assert_eq!(executable.execution_type, ExecutionType::Market);
+        }
+
+        #[test]
+        fn min_effective_cost_block_diagnostic_emitted_for_forager_candidates() {
+            let mut sym = make_basic_symbol(0);
+            sym.effective_min_cost = 10.1;
+            sym.long.bot_params.wallet_exposure_limit = 1.5;
+            sym.long.bot_params.entry_initial_qty_pct = 0.0192;
+
+            let input = OrchestratorInput {
+                balance: 51.154957,
+                balance_raw: 51.154957,
+                global: OrchestratorGlobal {
+                    filter_by_min_effective_cost: true,
+                    market_orders_allowed: false,
+                    market_order_near_touch_threshold: 0.001,
+                    panic_close_market: false,
+                    unstuck_allowance_long: 0.0,
+                    unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
+                    sort_global: true,
+                    global_bot_params: {
+                        let mut pair = BotParamsPair::default();
+                        pair.long.n_positions = 1;
+                        pair.long.total_wallet_exposure_limit = 1.5;
+                        pair
+                    },
+                    hedge_mode: true,
+                },
+                symbols: vec![sym],
+                peek_hints: None,
+                forager_hysteresis: None,
+            };
+
+            let out = compute_ideal_orders(&input).unwrap();
+            assert_eq!(out.orders.len(), 0);
+            assert_eq!(out.diagnostics.min_effective_cost_blocks.len(), 1);
+            let block = &out.diagnostics.min_effective_cost_blocks[0];
+            assert_eq!(block.symbol_idx, 0);
+            assert_eq!(block.pside, PositionSide::Long);
+            assert!((block.effective_limit - 1.5).abs() < 1e-12);
+            assert!((block.projected_initial_cost - 1.4732627616).abs() < 1e-9);
+            assert!((block.effective_min_cost - 10.1).abs() < 1e-12);
         }
 
         #[test]
@@ -3068,6 +3397,7 @@ mod core {
                 },
                 symbols: vec![sym.clone()],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
 
             let out = compute_ideal_orders(&input).unwrap();
@@ -3095,6 +3425,88 @@ mod core {
                 .filter(|o| o.pside == PositionSide::Long && !is_close_order_type(o.order_type))
                 .count();
             assert!(n_entries_fill > 1);
+        }
+
+        #[test]
+        fn live_peek_hints_keep_flat_entries_next_only_until_position_exists() {
+            let mut sym = make_basic_symbol(0);
+            sym.long.bot_params.entry_grid_spacing_pct = 0.01;
+            sym.long.bot_params.entry_grid_double_down_factor = 1.2;
+            sym.long.bot_params.entry_initial_qty_pct = 0.01;
+            sym.long.bot_params.wallet_exposure_limit = 100.0;
+
+            let mut global = make_basic_global();
+            global.global_bot_params.long.total_wallet_exposure_limit = 1000.0;
+            global.global_bot_params.long.n_positions = 1;
+
+            let input_flat = OrchestratorInput {
+                balance: 1000.0,
+                balance_raw: 1000.0,
+                global: global.clone(),
+                symbols: vec![sym.clone()],
+                peek_hints: Some(EntryPeekHints::default()),
+                forager_hysteresis: None,
+            };
+            let out_flat = compute_ideal_orders(&input_flat).unwrap();
+            let n_entries_flat = out_flat
+                .orders
+                .iter()
+                .filter(|o| o.pside == PositionSide::Long && !is_close_order_type(o.order_type))
+                .count();
+            assert_eq!(n_entries_flat, 1);
+
+            sym.long.position = Position {
+                size: 100.0,
+                price: 100.0,
+            };
+            let input_positioned = OrchestratorInput {
+                symbols: vec![sym],
+                peek_hints: Some(EntryPeekHints {
+                    expand_grid_long: HashSet::from([0]),
+                    expand_close_long: HashSet::from([0]),
+                    ..Default::default()
+                }),
+                ..input_flat
+            };
+            let out_positioned = compute_ideal_orders(&input_positioned).unwrap();
+            let n_entries_positioned = out_positioned
+                .orders
+                .iter()
+                .filter(|o| o.pside == PositionSide::Long && !is_close_order_type(o.order_type))
+                .count();
+            assert!(n_entries_positioned > 1);
+        }
+
+        #[test]
+        fn non_tradable_forced_normal_flat_symbol_does_not_require_emas() {
+            let mut sym = make_basic_symbol(0);
+            sym.tradable = false;
+            sym.emas = EmaBundle::default();
+            sym.long.mode = Some(TradingMode::Normal);
+            sym.long.position = Position::default();
+            sym.long.bot_params.n_positions = 1;
+            sym.long.bot_params.total_wallet_exposure_limit = 1.0;
+            sym.long.bot_params.wallet_exposure_limit = 1.0;
+            sym.long.bot_params.entry_initial_qty_pct = 1.0;
+
+            let mut global = make_basic_global();
+            global.global_bot_params.long.n_positions = 1;
+            global.global_bot_params.long.total_wallet_exposure_limit = 1.0;
+
+            let input = OrchestratorInput {
+                balance: 1000.0,
+                balance_raw: 1000.0,
+                global,
+                symbols: vec![sym],
+                peek_hints: None,
+                forager_hysteresis: None,
+            };
+
+            let out = compute_ideal_orders(&input).unwrap();
+            assert!(out.orders.is_empty());
+            assert_eq!(out.diagnostics.symbol_states.len(), 1);
+            assert!(!out.diagnostics.symbol_states[0].long.active);
+            assert!(!out.diagnostics.symbol_states[0].long.allow_initial);
         }
 
         #[test]
@@ -3155,6 +3567,7 @@ mod core {
                 },
                 symbols: vec![sym],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
             let out = compute_ideal_orders(&input).unwrap();
             // With no position and GracefulStop, we should not emit any entries.
@@ -3190,6 +3603,7 @@ mod core {
                 },
                 symbols: vec![sym],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
 
             let out = compute_ideal_orders(&input).unwrap();
@@ -3234,6 +3648,7 @@ mod core {
                 },
                 symbols: vec![sym],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
 
             let out = compute_ideal_orders(&input).unwrap();
@@ -3290,6 +3705,7 @@ mod core {
                 },
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
 
             let out = compute_ideal_orders(&input).unwrap();
@@ -3343,6 +3759,7 @@ mod core {
                 },
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
 
             let out = compute_ideal_orders(&input).unwrap();
@@ -3395,6 +3812,7 @@ mod core {
                 },
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
 
             let out = compute_ideal_orders(&input).unwrap();
@@ -3405,6 +3823,53 @@ mod core {
                 .map(|o| o.symbol_idx)
                 .collect();
             assert_eq!(long_entry_symbol_idxs, vec![1]);
+        }
+
+        #[test]
+        fn zero_forager_weights_fall_back_to_ema_readiness_ranking() {
+            let sym0 = make_basic_symbol(0);
+            let mut sym1 = make_basic_symbol(1);
+
+            sym1.emas.m1.close = vec![(10.0, 90.0), (14.142135623730951, 90.0), (20.0, 90.0)];
+
+            let mut global_bp = BotParamsPair::default();
+            global_bp.long.total_wallet_exposure_limit = 1.0;
+            global_bp.long.n_positions = 1;
+            global_bp.long.forager_volume_drop_pct = 0.0;
+            global_bp.long.forager_score_weights.volume = 0.0;
+            global_bp.long.forager_score_weights.ema_readiness = 0.0;
+            global_bp.long.forager_score_weights.volatility = 0.0;
+
+            let input = OrchestratorInput {
+                balance: 1000.0,
+                balance_raw: 1000.0,
+                global: OrchestratorGlobal {
+                    filter_by_min_effective_cost: false,
+                    market_orders_allowed: false,
+                    market_order_near_touch_threshold: 0.001,
+                    panic_close_market: false,
+                    unstuck_allowance_long: 0.0,
+                    unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
+                    sort_global: true,
+                    global_bot_params: global_bp,
+                    hedge_mode: true,
+                },
+                symbols: vec![sym0, sym1],
+                peek_hints: None,
+                forager_hysteresis: None,
+            };
+
+            let out = compute_ideal_orders(&input).unwrap();
+            let long_entry_symbol_idxs: Vec<usize> = out
+                .orders
+                .iter()
+                .filter(|o| o.pside == PositionSide::Long && !is_close_order_type(o.order_type))
+                .map(|o| o.symbol_idx)
+                .collect();
+            assert_eq!(long_entry_symbol_idxs, vec![0]);
         }
 
         #[test]
@@ -3441,6 +3906,7 @@ mod core {
                 },
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
 
             let err = compute_ideal_orders(&input).unwrap_err();
@@ -3552,6 +4018,7 @@ mod core {
                 },
                 symbols: syms,
                 peek_hints: None,
+                forager_hysteresis: None,
             };
 
             let out = compute_ideal_orders(&input).unwrap();
@@ -3564,6 +4031,63 @@ mod core {
             assert_eq!(entry_syms.len(), 2, "should only fill remaining 2 slots");
             assert!(entry_syms.contains(&2));
             assert!(entry_syms.contains(&3));
+        }
+
+        #[test]
+        fn side_zero_wel_excludes_only_that_side_from_active_slots() {
+            let mut syms: Vec<SymbolInput> = (0..4).map(make_basic_symbol).collect();
+            syms[3].long.bot_params.wallet_exposure_limit = 0.0;
+
+            let mut global_bp = BotParamsPair::default();
+            global_bp.long.total_wallet_exposure_limit = 1000.0;
+            global_bp.long.n_positions = 4;
+            global_bp.long.filter_volume_ema_span = 10.0;
+            global_bp.long.filter_volatility_ema_span = 10.0;
+            global_bp.short.total_wallet_exposure_limit = 1000.0;
+            global_bp.short.n_positions = 4;
+            global_bp.short.filter_volume_ema_span = 10.0;
+            global_bp.short.filter_volatility_ema_span = 10.0;
+
+            let input = OrchestratorInput {
+                balance: 1_000_000.0,
+                balance_raw: 1_000_000.0,
+                global: OrchestratorGlobal {
+                    filter_by_min_effective_cost: false,
+                    market_orders_allowed: false,
+                    market_order_near_touch_threshold: 0.001,
+                    panic_close_market: false,
+                    unstuck_allowance_long: 0.0,
+                    unstuck_allowance_short: 0.0,
+                    max_realized_loss_pct: 1.0,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: 0.0,
+                    sort_global: true,
+                    global_bot_params: global_bp,
+                    hedge_mode: true,
+                },
+                symbols: syms,
+                peek_hints: None,
+                forager_hysteresis: None,
+            };
+
+            let out = compute_ideal_orders(&input).unwrap();
+            let long_active = out
+                .diagnostics
+                .symbol_states
+                .iter()
+                .filter(|state| state.long.active)
+                .count();
+            let short_active = out
+                .diagnostics
+                .symbol_states
+                .iter()
+                .filter(|state| state.short.active)
+                .count();
+
+            assert_eq!(long_active, 3);
+            assert_eq!(short_active, 4);
+            assert!(!out.diagnostics.symbol_states[3].long.active);
+            assert!(out.diagnostics.symbol_states[3].short.active);
         }
 
         #[test]
@@ -3768,6 +4292,7 @@ mod core {
                 },
                 symbols: vec![sym.clone()],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
             let out_open = compute_ideal_orders(&input_open).unwrap();
             assert!(
@@ -3838,6 +4363,7 @@ mod core {
                 },
                 symbols: vec![sym],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
             let out = compute_ideal_orders(&input).unwrap();
             assert!(
@@ -3896,6 +4422,7 @@ mod core {
                     },
                     symbols: vec![sym],
                     peek_hints: None,
+                    forager_hysteresis: None,
                 };
                 let out = compute_ideal_orders(&input).unwrap();
                 assert!(
@@ -3958,6 +4485,7 @@ mod core {
                 },
                 symbols: vec![sym],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
             let out = compute_ideal_orders(&input).unwrap();
             assert!(
@@ -3971,11 +4499,11 @@ mod core {
         }
 
         #[test]
-        fn twel_entry_gate_uses_balance_raw_not_snapped() {
+        fn twel_entry_gate_uses_snapped_balance_not_raw() {
             // Scenario: no position, TWEL = 0.01 ($10 budget), entry qty*price = $20.
             // With snapped balance = 1000: budget = $10, entry $20 gets trimmed/gated.
-            // With raw balance = 500: budget = $5, entry $20 gets trimmed even more.
-            // Verify the gating uses raw by checking the resulting entry qty.
+            // With raw balance = 500: budget would be only $5 if raw balance were used.
+            // Verify entry gating uses the snapped balance by checking the resulting entry cost.
             let mut sym = make_basic_symbol(0);
             sym.order_book = OrderBook {
                 bid: 100.0,
@@ -4013,6 +4541,7 @@ mod core {
                 },
                 symbols: vec![sym],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
             let out = compute_ideal_orders(&input).unwrap();
             let entry_orders: Vec<_> = out
@@ -4027,15 +4556,21 @@ mod core {
                     )
                 })
                 .collect();
-            if !entry_orders.is_empty() {
-                // If entries exist, their total cost must fit within raw balance budget ($5)
-                let total_cost: f64 = entry_orders.iter().map(|o| o.qty * o.price).sum();
-                assert!(
-                    total_cost <= 500.0 * 0.01 + 1e-6,
-                    "Entry cost {:.4} should be gated by raw balance budget (500*0.01=5), not snapped (1000*0.01=10)",
-                    total_cost
-                );
-            }
+            assert!(
+                !entry_orders.is_empty(),
+                "snapped balance budget should permit a partial entry"
+            );
+            let total_cost: f64 = entry_orders.iter().map(|o| o.qty * o.price).sum();
+            assert!(
+                total_cost > 500.0 * 0.01 + 1e-6,
+                "entry cost {:.4} should exceed the raw balance budget (500*0.01=5)",
+                total_cost
+            );
+            assert!(
+                total_cost <= 1000.0 * 0.01 + 1e-6,
+                "entry cost {:.4} should fit within the snapped balance budget (1000*0.01=10)",
+                total_cost
+            );
         }
 
         #[test]
@@ -4074,6 +4609,7 @@ mod core {
                 },
                 symbols: vec![sym],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
             let out = compute_ideal_orders(&input).unwrap();
             assert_eq!(out.orders.len(), 1);
@@ -4120,6 +4656,7 @@ mod core {
                 },
                 symbols: vec![sym],
                 peek_hints: None,
+                forager_hysteresis: None,
             };
             let out = compute_ideal_orders(&input).unwrap();
             assert_eq!(out.orders.len(), 1);

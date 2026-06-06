@@ -175,6 +175,41 @@ def test_resolve_algorithm_auto_selects_nsga3_for_many_objectives():
     assert pymoo_backend._resolve_pymoo_algorithm_name(config, n_obj=8) == "nsga3"
 
 
+def test_resolve_population_plan_uses_auto_nsga2_population_when_null():
+    plan = pymoo_backend._resolve_pymoo_population_plan(
+        config={
+            "optimize": {
+                "backend": "pymoo",
+                "population_size": None,
+                "pymoo": {"algorithm": "auto"},
+            }
+        },
+        n_obj=3,
+    )
+
+    assert plan["algorithm_name"] == "nsga2"
+    assert plan["requested_population_size"] is None
+    assert plan["actual_population_size"] == pymoo_backend.DEFAULT_NSGA2_POPULATION_SIZE
+    assert plan["ref_dirs"] is None
+
+
+def test_resolve_population_plan_keeps_explicit_nsga2_population_size():
+    plan = pymoo_backend._resolve_pymoo_population_plan(
+        config={
+            "optimize": {
+                "backend": "pymoo",
+                "population_size": 64,
+                "pymoo": {"algorithm": "auto"},
+            }
+        },
+        n_obj=3,
+    )
+
+    assert plan["algorithm_name"] == "nsga2"
+    assert plan["requested_population_size"] == 64
+    assert plan["actual_population_size"] == 64
+
+
 def test_resolve_population_plan_uses_auto_nsga3_population_when_null():
     plan = pymoo_backend._resolve_pymoo_population_plan(
         config={
@@ -201,6 +236,34 @@ def test_resolve_population_plan_uses_auto_nsga3_population_when_null():
     assert plan["actual_population_size"] == 330
     assert plan["n_partitions"] == 4
     assert len(plan["ref_dirs"]) == 330
+
+
+def test_resolve_population_plan_uses_next_auto_nsga3_resolution_for_nine_objectives():
+    plan = pymoo_backend._resolve_pymoo_population_plan(
+        config={
+            "optimize": {
+                "backend": "pymoo",
+                "population_size": None,
+                "pymoo": {
+                    "algorithm": "auto",
+                    "algorithms": {
+                        "nsga3": {
+                            "ref_dirs": {
+                                "method": "das_dennis",
+                                "n_partitions": "auto",
+                            }
+                        }
+                    },
+                },
+            }
+        },
+        n_obj=9,
+    )
+
+    assert plan["requested_population_size"] is None
+    assert plan["actual_population_size"] == 495
+    assert plan["n_partitions"] == 4
+    assert len(plan["ref_dirs"]) == 495
 
 
 def test_build_algorithm_falls_back_to_nsga2_for_single_objective():
