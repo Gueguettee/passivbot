@@ -29,18 +29,13 @@ services:
     container_name: passivbot-live
     restart: unless-stopped
     environment:
-      PB_USER: ${PB_USER:-}
-      PB_CONFIG_PATH: ${PB_CONFIG_PATH:-/data/configs/live.json}
-      PB_API_KEYS_PATH: ${PB_API_KEYS_PATH:-/data/api-keys.json}
-      PB_LOG_DIR: ${PB_LOG_DIR:-/data/logs}
-      PB_MONITOR_ROOT: ${PB_MONITOR_ROOT:-/data/monitor}
+      PB_USER: ${PB_USER:-binance_01}
+      PB_CONFIG_PATH: ${PB_CONFIG_PATH:-/app/configs/original/hype_dio_masterclas_binance_opti/hype_dio_masterclas_binance_opti.json}
+      SKIP_CCXT_ASSERT: "1"
     volumes:
-      - ./configs/:/data/configs/:ro
-      - ./api-keys.json:/data/api-keys.json:ro
-      - ./logs/:/data/logs/
-      - ./monitor/:/data/monitor/
+      - ./configs/:/app/configs/
+      - ./api-keys.json:/app/api-keys.json
     working_dir: /app
-    command: ["python", "src/main.py", "configs/original/hype_dio_masterclass.json"]
 
   passivbot-live-hl:
     profiles:
@@ -53,7 +48,7 @@ services:
     restart: unless-stopped
     environment:
       PB_USER: ${PB_USER:-hyperliquid_01}
-      PB_CONFIG_PATH: ${PB_CONFIG_PATH:-/app/configs/original/hype_dio_masterclass.json}
+      PB_CONFIG_PATH: ${PB_CONFIG_PATH:-/app/configs/original/hype_dio_masterclass/hype_dio_masterclass.json}
       SKIP_CCXT_ASSERT: "1"
     volumes:
       - ./configs/:/app/configs/

@@ -45,11 +45,11 @@ done
 
 if [ "$EXCHANGE" == "hyperliquid" ]; then
     CONTAINER_NAME="passivbot-live-hl"
-    LIVE_CONFIG="configs/original/hype_dio_masterclass.json"
+    LIVE_CONFIG="configs/original/hype_dio_masterclass/hype_dio_masterclass.json"
     DOCKER_PROFILE="live-hl"
 else
     CONTAINER_NAME="passivbot-live"
-    LIVE_CONFIG="configs/original/hype_dio_masterclass.json"
+    LIVE_CONFIG="configs/original/hype_dio_masterclas_binance_opti/hype_dio_masterclas_binance_opti.json"
     DOCKER_PROFILE="live"
 fi
 
