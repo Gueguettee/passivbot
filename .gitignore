@@ -406,3 +406,9 @@ optimization_results_9best
 api-keys.json
 
 meta_optimize_results
+
+# The venv "[Ss]cripts" rule above also matches this repo's top-level scripts/ dir.
+# Re-include it so project tooling under scripts/ stays tracked (e.g. the stock-perp
+# candle downloader), while leaving venv */Scripts/ bin dirs ignored.
+!/scripts/
+!/scripts/*.py
