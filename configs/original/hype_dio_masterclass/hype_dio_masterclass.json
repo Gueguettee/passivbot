@@ -13,7 +13,7 @@
         "coins": {"binance": ["HYPE"]},
         "combine_ohlcvs": true,
         "compress_cache": true,
-        "end_date": "2026-04-16",
+        "end_date": "2026-06-07",
         "exchanges": ["binance"],
         "filter_by_min_effective_cost": false,
         "gap_tolerance_ohlcvs_minutes": 120,
