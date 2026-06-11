@@ -347,7 +347,6 @@ config/
 !src/config/
 !src/config/**/*.py
 historical_data/
-results*
 
 # Config files
 api-keys.json

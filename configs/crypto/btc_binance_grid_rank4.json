@@ -1,0 +1,1959 @@
+{
+    "backtest": {
+        "aggregate": {
+            "default": "mean"
+        },
+        "balance_sample_divider": 60,
+        "base_dir": "backtests/btc_binance_grid",
+        "btc_collateral_cap": 0.0,
+        "btc_collateral_ltv_cap": null,
+        "candle_interval_minutes": 1,
+        "coin_sources": {
+            "BTC": "binance"
+        },
+        "coins": {
+            "binance": [
+                "BTC"
+            ]
+        },
+        "compress_cache": true,
+        "dynamic_wel_by_tradability": true,
+        "end_date": "now",
+        "exchanges": [
+            "binance"
+        ],
+        "filter_by_min_effective_cost": false,
+        "gap_tolerance_ohlcvs_minutes": 120,
+        "hlcvs_data_dir": null,
+        "hlcvs_data_override_mode": "intersection",
+        "liquidation_threshold": 0.05,
+        "maker_fee_override": null,
+        "market_order_slippage_pct": 0.0005,
+        "market_settings_sources": {},
+        "ohlcv_source_dir": null,
+        "scenarios": [],
+        "start_date": "2019-09-08",
+        "starting_balance": 1000,
+        "suite_enabled": false,
+        "taker_fee_override": null,
+        "visible_metrics": null,
+        "volume_normalization": true
+    },
+    "bot": {
+        "long": {
+            "close_grid_markup_end": 0.015885,
+            "close_grid_markup_start": 0.018645,
+            "close_grid_qty_pct": 0.57632,
+            "close_trailing_grid_ratio": 0.18047,
+            "close_trailing_qty_pct": 0.88604,
+            "close_trailing_retracement_pct": 0.0027564,
+            "close_trailing_threshold_pct": -0.043655,
+            "ema_span_0": 1746.0,
+            "ema_span_1": 753.22,
+            "entry_grid_double_down_factor": 1.8246,
+            "entry_grid_spacing_pct": 0.0016516,
+            "entry_grid_spacing_volatility_weight": 52.733,
+            "entry_grid_spacing_we_weight": 0.04283,
+            "entry_initial_ema_dist": 0.06722,
+            "entry_initial_qty_pct": 0.042929,
+            "entry_trailing_double_down_factor": 2.6328,
+            "entry_trailing_grid_ratio": -0.63401,
+            "entry_trailing_retracement_pct": 0.3445,
+            "entry_trailing_retracement_volatility_weight": 4.9,
+            "entry_trailing_retracement_we_weight": 3.126,
+            "entry_trailing_threshold_pct": 0.10216,
+            "entry_trailing_threshold_volatility_weight": 3.6,
+            "entry_trailing_threshold_we_weight": 2.857,
+            "entry_volatility_ema_span_hours": 539.47,
+            "forager_score_weights": {
+                "ema_readiness": 0.1887412848879407,
+                "volatility": 0.5595046957133746,
+                "volume": 0.25175401939868475
+            },
+            "forager_volatility_ema_span": 896.29,
+            "forager_volume_drop_pct": 0.87214,
+            "forager_volume_ema_span": 806.21,
+            "hsl_cooldown_minutes_after_red": 2011.0,
+            "hsl_ema_span_minutes": 261.0,
+            "hsl_enabled": false,
+            "hsl_no_restart_drawdown_threshold": 1,
+            "hsl_orange_tier_mode": "tp_only_with_active_entry_cancellation",
+            "hsl_panic_close_order_type": "market",
+            "hsl_red_threshold": 0.026,
+            "hsl_tier_ratios": {
+                "orange": 0.75,
+                "yellow": 0.5
+            },
+            "n_positions": 1.0,
+            "risk_twel_enforcer_threshold": 0.978,
+            "risk_we_excess_allowance_pct": 0.18,
+            "risk_wel_enforcer_threshold": 0.996,
+            "total_wallet_exposure_limit": 1.371,
+            "unstuck_close_pct": 0.033122,
+            "unstuck_ema_dist": 0.032929,
+            "unstuck_loss_allowance_pct": 0.011158,
+            "unstuck_threshold": 0.75698
+        },
+        "short": {
+            "close_grid_markup_end": 0.001,
+            "close_grid_markup_start": 0.001,
+            "close_grid_qty_pct": 0.05,
+            "close_trailing_grid_ratio": -1.0,
+            "close_trailing_qty_pct": 0.05,
+            "close_trailing_retracement_pct": 0.001,
+            "close_trailing_threshold_pct": 0.001,
+            "ema_span_0": 200.0,
+            "ema_span_1": 200.0,
+            "entry_grid_double_down_factor": 0.5,
+            "entry_grid_spacing_pct": 0.01,
+            "entry_grid_spacing_volatility_weight": 1.0,
+            "entry_grid_spacing_we_weight": 0.0,
+            "entry_initial_ema_dist": -0.01,
+            "entry_initial_qty_pct": 0.01,
+            "entry_trailing_double_down_factor": 0.01,
+            "entry_trailing_grid_ratio": -0.8,
+            "entry_trailing_retracement_pct": 0.001,
+            "entry_trailing_retracement_volatility_weight": 1.0,
+            "entry_trailing_retracement_we_weight": 0.0,
+            "entry_trailing_threshold_pct": 0.001,
+            "entry_trailing_threshold_volatility_weight": 1.0,
+            "entry_trailing_threshold_we_weight": 0.0,
+            "entry_volatility_ema_span_hours": 672.0,
+            "forager_score_weights": {
+                "ema_readiness": 1.0,
+                "volatility": 0.0,
+                "volume": 0.0
+            },
+            "forager_volatility_ema_span": 10.0,
+            "forager_volume_drop_pct": 0.0,
+            "forager_volume_ema_span": 10.0,
+            "hsl_cooldown_minutes_after_red": 1.0,
+            "hsl_ema_span_minutes": 1.0,
+            "hsl_enabled": false,
+            "hsl_no_restart_drawdown_threshold": 1,
+            "hsl_orange_tier_mode": "tp_only_with_active_entry_cancellation",
+            "hsl_panic_close_order_type": "limit",
+            "hsl_red_threshold": 0.01,
+            "hsl_tier_ratios": {
+                "orange": 0.75,
+                "yellow": 0.5
+            },
+            "n_positions": 7.0,
+            "risk_twel_enforcer_threshold": 0.95,
+            "risk_we_excess_allowance_pct": 0.0,
+            "risk_wel_enforcer_threshold": 0.95,
+            "total_wallet_exposure_limit": 0.0,
+            "unstuck_close_pct": 0.005,
+            "unstuck_ema_dist": -0.2,
+            "unstuck_loss_allowance_pct": 1e-05,
+            "unstuck_threshold": 0.4
+        }
+    },
+    "coin_overrides": {},
+    "config_version": "v7.12.0",
+    "live": {
+        "approved_coins": {
+            "long": [
+                "BTC"
+            ],
+            "short": []
+        },
+        "auto_gs": true,
+        "balance_hysteresis_snap_pct": 0.02,
+        "balance_override": null,
+        "base_config_path": "meta_optimize_results/btc_binance_grid/2026-06-10_131017/fold_results/fold_1/training/fold_config.json",
+        "candle_lock_timeout_seconds": 10,
+        "custom_endpoints_path": null,
+        "defer_broad_candle_warmup": true,
+        "enable_archive_candle_fetch": false,
+        "execution_delay_seconds": 2,
+        "fills_confirmation_overlap_minutes": 60,
+        "fills_recent_overlap_minutes": 10,
+        "filter_by_min_effective_cost": false,
+        "forager_score_hysteresis_pct": 0.02,
+        "forced_mode_long": "",
+        "forced_mode_short": "",
+        "hedge_mode": true,
+        "hsl_position_during_cooldown_policy": "panic",
+        "hsl_signal_mode": "unified",
+        "ignored_coins": {
+            "long": [],
+            "short": []
+        },
+        "inactive_coin_candle_ttl_minutes": 10,
+        "initial_entry_exec_max_market_dist_pct": 0.005,
+        "leverage": 5,
+        "margin_mode_preference": "cross",
+        "market_order_near_touch_threshold": 0.001,
+        "market_orders_allowed": false,
+        "market_snapshot_ticker_strategy": "auto",
+        "max_active_candle_tail_gap_minutes": 10,
+        "max_concurrent_api_requests": null,
+        "max_disk_candles_per_symbol_per_tf": 2000000,
+        "max_forager_candle_refresh_seconds": 45,
+        "max_forager_candle_staleness_minutes": null,
+        "max_memory_candles_per_symbol": 200000,
+        "max_n_cancellations_per_batch": 5,
+        "max_n_creations_per_batch": 3,
+        "max_n_restarts_per_day": 10,
+        "max_ohlcv_fetches_per_minute": 24,
+        "max_realized_loss_pct": 1,
+        "max_warmup_minutes": 0,
+        "minimum_coin_age_days": 30,
+        "order_match_tolerance_pct": 0.0002,
+        "pnls_max_lookback_days": 30.0,
+        "recv_window_ms": 5000,
+        "time_in_force": "good_till_cancelled",
+        "user": "binance_01",
+        "warmup_concurrency": 0,
+        "warmup_jitter_seconds": 30,
+        "warmup_ratio": 0.3
+    },
+    "logging": {
+        "backup_count": 5,
+        "dir": "logs",
+        "level": 1,
+        "max_bytes_mb": 10.0,
+        "memory_snapshot_interval_minutes": 30,
+        "persist_to_file": true,
+        "rotation": false,
+        "volume_refresh_info_threshold_seconds": 30
+    },
+    "metrics": {
+        "constraint_violation": 0.0,
+        "liquidated": false,
+        "objectives": {
+            "adg_usd": 0.0004044401685112664,
+            "drawdown_worst_usd": 0.048968586829643994,
+            "sharpe_ratio_usd": 0.10505788805727859
+        },
+        "stats": {
+            "adg_btc": {
+                "max": 0.002360929220237118,
+                "mean": 0.002360929220237118,
+                "min": 0.002360929220237118,
+                "std": 0.0
+            },
+            "adg_per_exposure_long_btc": {
+                "max": 0.0017220490300781312,
+                "mean": 0.0017220490300781312,
+                "min": 0.0017220490300781312,
+                "std": 0.0
+            },
+            "adg_per_exposure_long_usd": {
+                "max": 0.00029499647593819576,
+                "mean": 0.00029499647593819576,
+                "min": 0.00029499647593819576,
+                "std": 0.0
+            },
+            "adg_per_exposure_short_btc": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "adg_per_exposure_short_usd": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "adg_pnl": {
+                "max": 0.01675256195424986,
+                "mean": 0.01675256195424986,
+                "min": 0.01675256195424986,
+                "std": 0.0
+            },
+            "adg_pnl_w": {
+                "max": 0.0025934547294353357,
+                "mean": 0.0025934547294353357,
+                "min": 0.0025934547294353357,
+                "std": 0.0
+            },
+            "adg_strategy_eq": {
+                "max": 0.0004044401685112664,
+                "mean": 0.0004044401685112664,
+                "min": 0.0004044401685112664,
+                "std": 0.0
+            },
+            "adg_strategy_eq_w": {
+                "max": 5.061256468450459e-05,
+                "mean": 5.061256468450459e-05,
+                "min": 5.061256468450459e-05,
+                "std": 0.0
+            },
+            "adg_usd": {
+                "max": 0.0004044401685112664,
+                "mean": 0.0004044401685112664,
+                "min": 0.0004044401685112664,
+                "std": 0.0
+            },
+            "adg_w_btc": {
+                "max": 0.00035612560361597545,
+                "mean": 0.00035612560361597545,
+                "min": 0.00035612560361597545,
+                "std": 0.0
+            },
+            "adg_w_per_exposure_long_btc": {
+                "max": 0.0002597560930824037,
+                "mean": 0.0002597560930824037,
+                "min": 0.0002597560930824037,
+                "std": 0.0
+            },
+            "adg_w_per_exposure_long_usd": {
+                "max": 3.691653149854456e-05,
+                "mean": 3.691653149854456e-05,
+                "min": 3.691653149854456e-05,
+                "std": 0.0
+            },
+            "adg_w_per_exposure_short_btc": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "adg_w_per_exposure_short_usd": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "adg_w_usd": {
+                "max": 5.061256468450459e-05,
+                "mean": 5.061256468450459e-05,
+                "min": 5.061256468450459e-05,
+                "std": 0.0
+            },
+            "backtest_completion_ratio": {
+                "max": 1.0,
+                "mean": 1.0,
+                "min": 1.0,
+                "std": 0.0
+            },
+            "calmar_ratio_btc": {
+                "max": 0.012794852831689827,
+                "mean": 0.012794852831689827,
+                "min": 0.012794852831689827,
+                "std": 0.0
+            },
+            "calmar_ratio_strategy_eq": {
+                "max": 0.008259175824662174,
+                "mean": 0.008259175824662174,
+                "min": 0.008259175824662174,
+                "std": 0.0
+            },
+            "calmar_ratio_strategy_eq_w": {
+                "max": 0.0010335720910341927,
+                "mean": 0.0010335720910341927,
+                "min": 0.0010335720910341927,
+                "std": 0.0
+            },
+            "calmar_ratio_usd": {
+                "max": 0.008259175824662178,
+                "mean": 0.008259175824662178,
+                "min": 0.008259175824662178,
+                "std": 0.0
+            },
+            "calmar_ratio_w_btc": {
+                "max": 0.004159410314635256,
+                "mean": 0.004159410314635256,
+                "min": 0.004159410314635256,
+                "std": 0.0
+            },
+            "calmar_ratio_w_usd": {
+                "max": 0.001033572091034193,
+                "mean": 0.001033572091034193,
+                "min": 0.001033572091034193,
+                "std": 0.0
+            },
+            "drawdown_worst_btc": {
+                "max": 0.1845217957012881,
+                "mean": 0.1845217957012881,
+                "min": 0.1845217957012881,
+                "std": 0.0
+            },
+            "drawdown_worst_ema_strategy_eq": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_ema_strategy_eq_long": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_ema_strategy_eq_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_mean_1pct_btc": {
+                "max": 0.1845217957012881,
+                "mean": 0.1845217957012881,
+                "min": 0.1845217957012881,
+                "std": 0.0
+            },
+            "drawdown_worst_mean_1pct_ema_strategy_eq": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_mean_1pct_ema_strategy_eq_long": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_mean_1pct_ema_strategy_eq_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_mean_1pct_strategy_eq": {
+                "max": 0.026557482072643846,
+                "mean": 0.026557482072643846,
+                "min": 0.026557482072643846,
+                "std": 0.0
+            },
+            "drawdown_worst_mean_1pct_strategy_eq_long": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_mean_1pct_strategy_eq_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_mean_1pct_usd": {
+                "max": 0.026557482072643867,
+                "mean": 0.026557482072643867,
+                "min": 0.026557482072643867,
+                "std": 0.0
+            },
+            "drawdown_worst_strategy_eq": {
+                "max": 0.048968586829644015,
+                "mean": 0.048968586829644015,
+                "min": 0.048968586829644015,
+                "std": 0.0
+            },
+            "drawdown_worst_strategy_eq_long": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_strategy_eq_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "drawdown_worst_usd": {
+                "max": 0.048968586829643994,
+                "mean": 0.048968586829643994,
+                "min": 0.048968586829643994,
+                "std": 0.0
+            },
+            "entry_initial_balance_pct_long": {
+                "max": 0.06944967762,
+                "mean": 0.06944967762,
+                "min": 0.06944967762,
+                "std": 0.0
+            },
+            "entry_initial_balance_pct_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "entry_interval_hours_max": {
+                "max": 1955.7166666666667,
+                "mean": 1955.7166666666667,
+                "min": 1955.7166666666667,
+                "std": 0.0
+            },
+            "entry_interval_hours_mean": {
+                "max": 180.13589743589745,
+                "mean": 180.13589743589745,
+                "min": 180.13589743589745,
+                "std": 0.0
+            },
+            "entry_interval_hours_median": {
+                "max": 1.4833333333333334,
+                "mean": 1.4833333333333334,
+                "min": 1.4833333333333334,
+                "std": 0.0
+            },
+            "entry_interval_hours_p95": {
+                "max": 1495.7500000000002,
+                "mean": 1495.7500000000002,
+                "min": 1495.7500000000002,
+                "std": 0.0
+            },
+            "entry_interval_hours_p99": {
+                "max": 1855.0863333333327,
+                "mean": 1855.0863333333327,
+                "min": 1855.0863333333327,
+                "std": 0.0
+            },
+            "equity_balance_diff_neg_max_btc": {
+                "max": 0.18066403035050044,
+                "mean": 0.18066403035050044,
+                "min": 0.18066403035050044,
+                "std": 0.0
+            },
+            "equity_balance_diff_neg_max_usd": {
+                "max": 0.03659643660223123,
+                "mean": 0.03659643660223123,
+                "min": 0.03659643660223123,
+                "std": 0.0
+            },
+            "equity_balance_diff_neg_mean_btc": {
+                "max": 0.1632655069786783,
+                "mean": 0.1632655069786783,
+                "min": 0.1632655069786783,
+                "std": 0.0
+            },
+            "equity_balance_diff_neg_mean_usd": {
+                "max": 0.004947546864673315,
+                "mean": 0.004947546864673315,
+                "min": 0.004947546864673315,
+                "std": 0.0
+            },
+            "equity_balance_diff_pos_max_btc": {
+                "max": 0.666092073428574,
+                "mean": 0.666092073428574,
+                "min": 0.666092073428574,
+                "std": 0.0
+            },
+            "equity_balance_diff_pos_max_usd": {
+                "max": 0.0934718009848387,
+                "mean": 0.0934718009848387,
+                "min": 0.0934718009848387,
+                "std": 0.0
+            },
+            "equity_balance_diff_pos_mean_btc": {
+                "max": 0.2846671135176609,
+                "mean": 0.2846671135176609,
+                "min": 0.2846671135176609,
+                "std": 0.0
+            },
+            "equity_balance_diff_pos_mean_usd": {
+                "max": 0.03196701075592882,
+                "mean": 0.03196701075592882,
+                "min": 0.03196701075592882,
+                "std": 0.0
+            },
+            "equity_choppiness_btc": {
+                "max": 1.4474417554064138,
+                "mean": 1.4474417554064138,
+                "min": 1.4474417554064138,
+                "std": 0.0
+            },
+            "equity_choppiness_usd": {
+                "max": 1.0764371586957524,
+                "mean": 1.0764371586957524,
+                "min": 1.0764371586957524,
+                "std": 0.0
+            },
+            "equity_choppiness_w_btc": {
+                "max": 0.24474417554064137,
+                "mean": 0.24474417554064137,
+                "min": 0.24474417554064137,
+                "std": 0.0
+            },
+            "equity_choppiness_w_usd": {
+                "max": 0.26286498242947065,
+                "mean": 0.26286498242947065,
+                "min": 0.26286498242947065,
+                "std": 0.0
+            },
+            "equity_jerkiness_btc": {
+                "max": 0.0053860684953277475,
+                "mean": 0.0053860684953277475,
+                "min": 0.0053860684953277475,
+                "std": 0.0
+            },
+            "equity_jerkiness_usd": {
+                "max": 0.0007132545629269102,
+                "mean": 0.0007132545629269102,
+                "min": 0.0007132545629269102,
+                "std": 0.0
+            },
+            "equity_jerkiness_w_btc": {
+                "max": 0.0006708791361194963,
+                "mean": 0.0006708791361194963,
+                "min": 0.0006708791361194963,
+                "std": 0.0
+            },
+            "equity_jerkiness_w_usd": {
+                "max": 0.00010311918699216634,
+                "mean": 0.00010311918699216634,
+                "min": 0.00010311918699216634,
+                "std": 0.0
+            },
+            "expected_shortfall_1pct_btc": {
+                "max": 0.046303661949546535,
+                "mean": 0.046303661949546535,
+                "min": 0.046303661949546535,
+                "std": 0.0
+            },
+            "expected_shortfall_1pct_strategy_eq": {
+                "max": 0.008014045294493073,
+                "mean": 0.008014045294493073,
+                "min": 0.008014045294493073,
+                "std": 0.0
+            },
+            "expected_shortfall_1pct_usd": {
+                "max": 0.00801404529449305,
+                "mean": 0.00801404529449305,
+                "min": 0.00801404529449305,
+                "std": 0.0
+            },
+            "exponential_fit_error_btc": {
+                "max": 0.03841670556783964,
+                "mean": 0.03841670556783964,
+                "min": 0.03841670556783964,
+                "std": 0.0
+            },
+            "exponential_fit_error_usd": {
+                "max": 0.0015476495138743395,
+                "mean": 0.0015476495138743395,
+                "min": 0.0015476495138743395,
+                "std": 0.0
+            },
+            "exponential_fit_error_w_btc": {
+                "max": 0.004601419867900337,
+                "mean": 0.004601419867900337,
+                "min": 0.004601419867900337,
+                "std": 0.0
+            },
+            "exponential_fit_error_w_usd": {
+                "max": 0.00016020991754786556,
+                "mean": 0.00016020991754786556,
+                "min": 0.00016020991754786556,
+                "std": 0.0
+            },
+            "exposure_mean_ratio_btc": {
+                "max": 3.467009537467005,
+                "mean": 3.467009537467005,
+                "min": 3.467009537467005,
+                "std": 0.0
+            },
+            "exposure_mean_ratio_usd": {
+                "max": 0.5939178140302295,
+                "mean": 0.5939178140302295,
+                "min": 0.5939178140302295,
+                "std": 0.0
+            },
+            "exposure_mean_ratio_w_btc": {
+                "max": 0.5431179778184603,
+                "mean": 0.5431179778184603,
+                "min": 0.5431179778184603,
+                "std": 0.0
+            },
+            "exposure_mean_ratio_w_usd": {
+                "max": 0.07603121558102406,
+                "mean": 0.07603121558102406,
+                "min": 0.07603121558102406,
+                "std": 0.0
+            },
+            "exposure_ratio_btc": {
+                "max": 0.0036144266771990755,
+                "mean": 0.0036144266771990755,
+                "min": 0.0036144266771990755,
+                "std": 0.0
+            },
+            "exposure_ratio_usd": {
+                "max": 0.0006191711813584966,
+                "mean": 0.0006191711813584966,
+                "min": 0.0006191711813584966,
+                "std": 0.0
+            },
+            "exposure_ratio_w_btc": {
+                "max": 0.0005614819751368974,
+                "mean": 0.0005614819751368974,
+                "min": 0.0005614819751368974,
+                "std": 0.0
+            },
+            "exposure_ratio_w_usd": {
+                "max": 7.886341342012132e-05,
+                "mean": 7.886341342012132e-05,
+                "min": 7.886341342012132e-05,
+                "std": 0.0
+            },
+            "gain_btc": {
+                "max": 3.615354448206351,
+                "mean": 3.615354448206351,
+                "min": 3.615354448206351,
+                "std": 0.0
+            },
+            "gain_per_exposure_long_btc": {
+                "max": 2.6370200205735603,
+                "mean": 2.6370200205735603,
+                "min": 2.6370200205735603,
+                "std": 0.0
+            },
+            "gain_per_exposure_long_usd": {
+                "max": 0.9092228366156098,
+                "mean": 0.9092228366156098,
+                "min": 0.9092228366156098,
+                "std": 0.0
+            },
+            "gain_per_exposure_short_btc": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "gain_per_exposure_short_usd": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "gain_strategy_eq": {
+                "max": 1.246544509,
+                "mean": 1.246544509,
+                "min": 1.246544509,
+                "std": 0.0
+            },
+            "gain_usd": {
+                "max": 1.246544509000001,
+                "mean": 1.246544509000001,
+                "min": 1.246544509000001,
+                "std": 0.0
+            },
+            "hard_stop_duration_minutes_max": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_duration_minutes_mean": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_flatten_time_minutes_mean": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_halt_to_restart_equity_loss_pct": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_panic_close_loss_max": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_panic_close_loss_sum": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_post_restart_retrigger_pct": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_restarts": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_restarts_long": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_restarts_per_year": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_restarts_per_year_long": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_restarts_per_year_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_restarts_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_time_in_orange_pct": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_time_in_red_pct": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_time_in_yellow_pct": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_trigger_drawdown_mean": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_triggers": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_triggers_long": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_triggers_per_year": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "hard_stop_triggers_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "high_exposure_days_max_long": {
+                "max": 0.17847222222222223,
+                "mean": 0.17847222222222223,
+                "min": 0.17847222222222223,
+                "std": 0.0
+            },
+            "high_exposure_days_max_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "high_exposure_days_mean_long": {
+                "max": 0.01529320987654321,
+                "mean": 0.01529320987654321,
+                "min": 0.01529320987654321,
+                "std": 0.0
+            },
+            "high_exposure_days_mean_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "high_exposure_hours_max_long": {
+                "max": 4.283333333333333,
+                "mean": 4.283333333333333,
+                "min": 4.283333333333333,
+                "std": 0.0
+            },
+            "high_exposure_hours_max_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "high_exposure_hours_mean_long": {
+                "max": 0.36703703703703705,
+                "mean": 0.36703703703703705,
+                "min": 0.36703703703703705,
+                "std": 0.0
+            },
+            "high_exposure_hours_mean_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "liquidated": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "long_short_profit_ratio": {
+                "max": 1.0,
+                "mean": 1.0,
+                "min": 1.0,
+                "std": 0.0
+            },
+            "loss_profit_ratio": {
+                "max": 0.0018409621779944608,
+                "mean": 0.0018409621779944608,
+                "min": 0.0018409621779944608,
+                "std": 0.0
+            },
+            "loss_profit_ratio_long": {
+                "max": 0.0018409621779944608,
+                "mean": 0.0018409621779944608,
+                "min": 0.0018409621779944608,
+                "std": 0.0
+            },
+            "loss_profit_ratio_short": {
+                "max": 1.0,
+                "mean": 1.0,
+                "min": 1.0,
+                "std": 0.0
+            },
+            "loss_profit_ratio_w": {
+                "max": 0.0001840962177994461,
+                "mean": 0.0001840962177994461,
+                "min": 0.0001840962177994461,
+                "std": 0.0
+            },
+            "mdg_btc": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_per_exposure_long_btc": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_per_exposure_long_usd": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_per_exposure_short_btc": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_per_exposure_short_usd": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_pnl": {
+                "max": 0.014165785398352277,
+                "mean": 0.014165785398352277,
+                "min": 0.014165785398352277,
+                "std": 0.0
+            },
+            "mdg_pnl_w": {
+                "max": 0.0023629891521176603,
+                "mean": 0.0023629891521176603,
+                "min": 0.0023629891521176603,
+                "std": 0.0
+            },
+            "mdg_strategy_eq": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_strategy_eq_w": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_usd": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_w_btc": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_w_per_exposure_long_btc": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_w_per_exposure_long_usd": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_w_per_exposure_short_btc": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_w_per_exposure_short_usd": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "mdg_w_usd": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "omega_ratio_btc": {
+                "max": 8.701060481631812,
+                "mean": 8.701060481631812,
+                "min": 8.701060481631812,
+                "std": 0.0
+            },
+            "omega_ratio_strategy_eq": {
+                "max": 30.24478708008531,
+                "mean": 30.24478708008531,
+                "min": 30.24478708008531,
+                "std": 0.0
+            },
+            "omega_ratio_strategy_eq_w": {
+                "max": 3.4928000171418034,
+                "mean": 3.4928000171418034,
+                "min": 3.4928000171418034,
+                "std": 0.0
+            },
+            "omega_ratio_usd": {
+                "max": 30.244787080086116,
+                "mean": 30.244787080086116,
+                "min": 30.244787080086116,
+                "std": 0.0
+            },
+            "omega_ratio_w_btc": {
+                "max": 100.87010604816318,
+                "mean": 100.87010604816318,
+                "min": 100.87010604816318,
+                "std": 0.0
+            },
+            "omega_ratio_w_usd": {
+                "max": 3.4928000171419002,
+                "mean": 3.4928000171419002,
+                "min": 3.4928000171419002,
+                "std": 0.0
+            },
+            "paper_loss_mean_ratio_btc": {
+                "max": 0.014460673683789461,
+                "mean": 0.014460673683789461,
+                "min": 0.014460673683789461,
+                "std": 0.0
+            },
+            "paper_loss_mean_ratio_usd": {
+                "max": 0.08174559626692317,
+                "mean": 0.08174559626692317,
+                "min": 0.08174559626692317,
+                "std": 0.0
+            },
+            "paper_loss_mean_ratio_w_btc": {
+                "max": 0.002227325593841671,
+                "mean": 0.002227325593841671,
+                "min": 0.002227325593841671,
+                "std": 0.0
+            },
+            "paper_loss_mean_ratio_w_usd": {
+                "max": 0.009837767070044304,
+                "mean": 0.009837767070044304,
+                "min": 0.009837767070044304,
+                "std": 0.0
+            },
+            "paper_loss_ratio_btc": {
+                "max": 0.013068064603987609,
+                "mean": 0.013068064603987609,
+                "min": 0.013068064603987609,
+                "std": 0.0
+            },
+            "paper_loss_ratio_usd": {
+                "max": 0.011051353794555185,
+                "mean": 0.011051353794555185,
+                "min": 0.011051353794555185,
+                "std": 0.0
+            },
+            "paper_loss_ratio_w_btc": {
+                "max": 0.0020880159437499284,
+                "mean": 0.0020880159437499284,
+                "min": 0.0020880159437499284,
+                "std": 0.0
+            },
+            "paper_loss_ratio_w_usd": {
+                "max": 0.001383103062060356,
+                "mean": 0.001383103062060356,
+                "min": 0.001383103062060356,
+                "std": 0.0
+            },
+            "peak_recovery_days_equity_btc": {
+                "max": 142.96458333333334,
+                "mean": 142.96458333333334,
+                "min": 142.96458333333334,
+                "std": 0.0
+            },
+            "peak_recovery_days_equity_usd": {
+                "max": 81.48611111111111,
+                "mean": 81.48611111111111,
+                "min": 81.48611111111111,
+                "std": 0.0
+            },
+            "peak_recovery_days_pnl": {
+                "max": 238.95347222222222,
+                "mean": 238.95347222222222,
+                "min": 238.95347222222222,
+                "std": 0.0
+            },
+            "peak_recovery_days_strategy_eq": {
+                "max": 238.95486111111111,
+                "mean": 238.95486111111111,
+                "min": 238.95486111111111,
+                "std": 0.0
+            },
+            "peak_recovery_days_strategy_eq_long": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "peak_recovery_days_strategy_eq_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "peak_recovery_hours_equity_btc": {
+                "max": 3431.15,
+                "mean": 3431.15,
+                "min": 3431.15,
+                "std": 0.0
+            },
+            "peak_recovery_hours_equity_usd": {
+                "max": 1955.6666666666667,
+                "mean": 1955.6666666666667,
+                "min": 1955.6666666666667,
+                "std": 0.0
+            },
+            "peak_recovery_hours_pnl": {
+                "max": 5734.883333333333,
+                "mean": 5734.883333333333,
+                "min": 5734.883333333333,
+                "std": 0.0
+            },
+            "peak_recovery_hours_strategy_eq": {
+                "max": 5734.916666666667,
+                "mean": 5734.916666666667,
+                "min": 5734.916666666667,
+                "std": 0.0
+            },
+            "peak_recovery_hours_strategy_eq_long": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "peak_recovery_hours_strategy_eq_short": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "pnl_ratio_long_short": {
+                "max": 1.0,
+                "mean": 1.0,
+                "min": 1.0,
+                "std": 0.0
+            },
+            "position_held_days_max": {
+                "max": 0.17847222222222223,
+                "mean": 0.17847222222222223,
+                "min": 0.17847222222222223,
+                "std": 0.0
+            },
+            "position_held_days_mean": {
+                "max": 0.01529320987654321,
+                "mean": 0.01529320987654321,
+                "min": 0.01529320987654321,
+                "std": 0.0
+            },
+            "position_held_days_median": {
+                "max": 0.002777777777777778,
+                "mean": 0.002777777777777778,
+                "min": 0.002777777777777778,
+                "std": 0.0
+            },
+            "position_held_hours_max": {
+                "max": 4.283333333333333,
+                "mean": 4.283333333333333,
+                "min": 4.283333333333333,
+                "std": 0.0
+            },
+            "position_held_hours_mean": {
+                "max": 0.36703703703703705,
+                "mean": 0.36703703703703705,
+                "min": 0.36703703703703705,
+                "std": 0.0
+            },
+            "position_held_hours_median": {
+                "max": 0.06666666666666667,
+                "mean": 0.06666666666666667,
+                "min": 0.06666666666666667,
+                "std": 0.0
+            },
+            "position_unchanged_days_max": {
+                "max": 0.17500000000000002,
+                "mean": 0.17500000000000002,
+                "min": 0.17500000000000002,
+                "std": 0.0
+            },
+            "position_unchanged_hours_max": {
+                "max": 4.2,
+                "mean": 4.2,
+                "min": 4.2,
+                "std": 0.0
+            },
+            "positions_held_per_day": {
+                "max": 0.0825690177599841,
+                "mean": 0.0825690177599841,
+                "min": 0.0825690177599841,
+                "std": 0.0
+            },
+            "positions_held_per_day_w": {
+                "max": 0.009357824818419624,
+                "mean": 0.009357824818419624,
+                "min": 0.009357824818419624,
+                "std": 0.0
+            },
+            "sharpe_ratio_btc": {
+                "max": 0.08586945446293451,
+                "mean": 0.08586945446293451,
+                "min": 0.08586945446293451,
+                "std": 0.0
+            },
+            "sharpe_ratio_pnl": {
+                "max": 1.590908325408054,
+                "mean": 1.590908325408054,
+                "min": 1.590908325408054,
+                "std": 0.0
+            },
+            "sharpe_ratio_pnl_w": {
+                "max": 0.28180312418167625,
+                "mean": 0.28180312418167625,
+                "min": 0.28180312418167625,
+                "std": 0.0
+            },
+            "sharpe_ratio_strategy_eq": {
+                "max": 0.10505788805727874,
+                "mean": 0.10505788805727874,
+                "min": 0.10505788805727874,
+                "std": 0.0
+            },
+            "sharpe_ratio_strategy_eq_w": {
+                "max": 0.013503107806875617,
+                "mean": 0.013503107806875617,
+                "min": 0.013503107806875617,
+                "std": 0.0
+            },
+            "sharpe_ratio_usd": {
+                "max": 0.10505788805727859,
+                "mean": 0.10505788805727859,
+                "min": 0.10505788805727859,
+                "std": 0.0
+            },
+            "sharpe_ratio_w_btc": {
+                "max": 0.0166241322356852,
+                "mean": 0.0166241322356852,
+                "min": 0.0166241322356852,
+                "std": 0.0
+            },
+            "sharpe_ratio_w_usd": {
+                "max": 0.013503107806875598,
+                "mean": 0.013503107806875598,
+                "min": 0.013503107806875598,
+                "std": 0.0
+            },
+            "sortino_ratio_btc": {
+                "max": 0.017866369853640856,
+                "mean": 0.017866369853640856,
+                "min": 0.017866369853640856,
+                "std": 0.0
+            },
+            "sortino_ratio_pnl": {
+                "max": 139.59410247002035,
+                "mean": 139.59410247002035,
+                "min": 139.59410247002035,
+                "std": 0.0
+            },
+            "sortino_ratio_pnl_w": {
+                "max": 21.610484786794874,
+                "mean": 21.610484786794874,
+                "min": 21.610484786794874,
+                "std": 0.0
+            },
+            "sortino_ratio_strategy_eq": {
+                "max": 0.02205306158356528,
+                "mean": 0.02205306158356528,
+                "min": 0.02205306158356528,
+                "std": 0.0
+            },
+            "sortino_ratio_strategy_eq_w": {
+                "max": 0.0024831623863795027,
+                "mean": 0.0024831623863795027,
+                "min": 0.0024831623863795027,
+                "std": 0.0
+            },
+            "sortino_ratio_usd": {
+                "max": 0.022053061583565393,
+                "mean": 0.022053061583565393,
+                "min": 0.022053061583565393,
+                "std": 0.0
+            },
+            "sortino_ratio_w_btc": {
+                "max": 0.0017866369853640855,
+                "mean": 0.0017866369853640855,
+                "min": 0.0017866369853640855,
+                "std": 0.0
+            },
+            "sortino_ratio_w_usd": {
+                "max": 0.0024831623863795153,
+                "mean": 0.0024831623863795153,
+                "min": 0.0024831623863795153,
+                "std": 0.0
+            },
+            "sterling_ratio_btc": {
+                "max": 0.012794852831689827,
+                "mean": 0.012794852831689827,
+                "min": 0.012794852831689827,
+                "std": 0.0
+            },
+            "sterling_ratio_strategy_eq": {
+                "max": 0.015228859701570483,
+                "mean": 0.015228859701570483,
+                "min": 0.015228859701570483,
+                "std": 0.0
+            },
+            "sterling_ratio_strategy_eq_w": {
+                "max": 0.0017861889412444855,
+                "mean": 0.0017861889412444855,
+                "min": 0.0017861889412444855,
+                "std": 0.0
+            },
+            "sterling_ratio_usd": {
+                "max": 0.015228859701570471,
+                "mean": 0.015228859701570471,
+                "min": 0.015228859701570471,
+                "std": 0.0
+            },
+            "sterling_ratio_w_btc": {
+                "max": 0.004670387606913959,
+                "mean": 0.004670387606913959,
+                "min": 0.004670387606913959,
+                "std": 0.0
+            },
+            "sterling_ratio_w_usd": {
+                "max": 0.0017861889412444844,
+                "mean": 0.0017861889412444844,
+                "min": 0.0017861889412444844,
+                "std": 0.0
+            },
+            "strategy_eq_recovery_days_max": {
+                "max": 238.95486111111111,
+                "mean": 238.95486111111111,
+                "min": 238.95486111111111,
+                "std": 0.0
+            },
+            "strategy_eq_recovery_days_mean": {
+                "max": 68.62501448530841,
+                "mean": 68.62501448530841,
+                "min": 68.62501448530841,
+                "std": 0.0
+            },
+            "strategy_eq_recovery_days_mean_worst_1pct": {
+                "max": 236.23055555555555,
+                "mean": 236.23055555555555,
+                "min": 236.23055555555555,
+                "std": 0.0
+            },
+            "strategy_eq_recovery_days_mean_worst_5pct": {
+                "max": 225.33055555555555,
+                "mean": 225.33055555555555,
+                "min": 225.33055555555555,
+                "std": 0.0
+            },
+            "strategy_eq_recovery_days_median": {
+                "max": 44.953472222222224,
+                "mean": 44.953472222222224,
+                "min": 44.953472222222224,
+                "std": 0.0
+            },
+            "strategy_eq_recovery_days_p95": {
+                "max": 211.70493055555556,
+                "mean": 211.70493055555556,
+                "min": 211.70493055555556,
+                "std": 0.0
+            },
+            "strategy_eq_recovery_days_p99": {
+                "max": 233.504875,
+                "mean": 233.504875,
+                "min": 233.504875,
+                "std": 0.0
+            },
+            "total_wallet_exposure_max": {
+                "max": 0.6531960476970226,
+                "mean": 0.6531960476970226,
+                "min": 0.6531960476970226,
+                "std": 0.0
+            },
+            "total_wallet_exposure_mean": {
+                "max": 0.0006809699237118371,
+                "mean": 0.0006809699237118371,
+                "min": 0.0006809699237118371,
+                "std": 0.0
+            },
+            "total_wallet_exposure_median": {
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "std": 0.0
+            },
+            "trade_loss_max": {
+                "max": 0.00017664776743459777,
+                "mean": 0.00017664776743459777,
+                "min": 0.00017664776743459777,
+                "std": 0.0
+            },
+            "trade_loss_mean": {
+                "max": 8.263415455867812e-05,
+                "mean": 8.263415455867812e-05,
+                "min": 8.263415455867812e-05,
+                "std": 0.0
+            },
+            "trade_loss_median": {
+                "max": 4.9020005041218136e-05,
+                "mean": 4.9020005041218136e-05,
+                "min": 4.9020005041218136e-05,
+                "std": 0.0
+            },
+            "volume_pct_per_day_avg": {
+                "max": 2.2008780074317222,
+                "mean": 2.2008780074317222,
+                "min": 2.2008780074317222,
+                "std": 0.0
+            },
+            "volume_pct_per_day_avg_w": {
+                "max": 0.33988908637385123,
+                "mean": 0.33988908637385123,
+                "min": 0.33988908637385123,
+                "std": 0.0
+            },
+            "win_rate": {
+                "max": 0.8888888888888888,
+                "mean": 0.8888888888888888,
+                "min": 0.8888888888888888,
+                "std": 0.0
+            },
+            "win_rate_w": {
+                "max": 0.18888888888888888,
+                "mean": 0.18888888888888888,
+                "min": 0.18888888888888888,
+                "std": 0.0
+            }
+        }
+    },
+    "monitor": {
+        "checkpoint_interval_minutes": 10.0,
+        "compress_rotated_segments": true,
+        "emit_completed_candles": true,
+        "enabled": true,
+        "event_rotation_mb": 128.0,
+        "event_rotation_minutes": 60.0,
+        "include_raw_fill_payloads": false,
+        "max_total_bytes": 1073741824,
+        "price_tick_min_interval_ms": 500,
+        "retain_candles": true,
+        "retain_days": 7.0,
+        "retain_fills": true,
+        "retain_price_ticks": true,
+        "root_dir": "monitor",
+        "snapshot_interval_seconds": 1.0
+    },
+    "optimize": {
+        "backend": "pymoo",
+        "bounds": {
+            "long_close_grid_markup_end": [
+                0.001,
+                0.02
+            ],
+            "long_close_grid_markup_start": [
+                0.001,
+                0.02
+            ],
+            "long_close_grid_qty_pct": [
+                0.05,
+                1
+            ],
+            "long_close_trailing_grid_ratio": [
+                0,
+                1
+            ],
+            "long_close_trailing_qty_pct": [
+                0.05,
+                1
+            ],
+            "long_close_trailing_retracement_pct": [
+                0.001,
+                0.499
+            ],
+            "long_close_trailing_threshold_pct": [
+                -0.2448,
+                0.2529
+            ],
+            "long_ema_span_0": [
+                20,
+                4000
+            ],
+            "long_ema_span_1": [
+                20,
+                4000
+            ],
+            "long_entry_grid_double_down_factor": [
+                0.5,
+                2.5
+            ],
+            "long_entry_grid_spacing_pct": [
+                0.001,
+                0.05
+            ],
+            "long_entry_grid_spacing_volatility_weight": [
+                0,
+                200
+            ],
+            "long_entry_grid_spacing_we_weight": [
+                0,
+                3
+            ],
+            "long_entry_initial_ema_dist": [
+                -0.1962,
+                0.2043
+            ],
+            "long_entry_initial_qty_pct": [
+                0.005,
+                0.05
+            ],
+            "long_entry_trailing_double_down_factor": [
+                0.05,
+                5
+            ],
+            "long_entry_trailing_grid_ratio": [
+                -1,
+                1
+            ],
+            "long_entry_trailing_retracement_pct": [
+                0,
+                0.399
+            ],
+            "long_entry_trailing_retracement_volatility_weight": [
+                1,
+                40,
+                0.1
+            ],
+            "long_entry_trailing_retracement_we_weight": [
+                0,
+                5,
+                0.001
+            ],
+            "long_entry_trailing_threshold_pct": [
+                -0.1962,
+                0.1983
+            ],
+            "long_entry_trailing_threshold_volatility_weight": [
+                1,
+                40,
+                0.1
+            ],
+            "long_entry_trailing_threshold_we_weight": [
+                0,
+                5,
+                0.001
+            ],
+            "long_entry_volatility_ema_span_hours": [
+                6,
+                711
+            ],
+            "long_forager_score_weights_ema_readiness": [
+                0,
+                1
+            ],
+            "long_forager_score_weights_volatility": [
+                0,
+                1
+            ],
+            "long_forager_score_weights_volume": [
+                0,
+                1
+            ],
+            "long_forager_volatility_ema_span": [
+                5,
+                1015
+            ],
+            "long_forager_volume_drop_pct": [
+                0.1,
+                1
+            ],
+            "long_forager_volume_ema_span": [
+                1,
+                1015
+            ],
+            "long_hsl_cooldown_minutes_after_red": [
+                1,
+                2880,
+                10
+            ],
+            "long_hsl_ema_span_minutes": [
+                1,
+                2880,
+                10
+            ],
+            "long_hsl_red_threshold": [
+                0.01,
+                0.12,
+                0.001
+            ],
+            "long_n_positions": [
+                1,
+                1
+            ],
+            "long_risk_twel_enforcer_threshold": [
+                0.95,
+                1.01,
+                0.001
+            ],
+            "long_risk_we_excess_allowance_pct": [
+                0,
+                0.3,
+                0.01
+            ],
+            "long_risk_wel_enforcer_threshold": [
+                0.95,
+                1.01,
+                0.001
+            ],
+            "long_total_wallet_exposure_limit": [
+                0,
+                1.5
+            ],
+            "long_unstuck_close_pct": [
+                0.001,
+                0.302
+            ],
+            "long_unstuck_ema_dist": [
+                -0.19,
+                0.101
+            ],
+            "long_unstuck_loss_allowance_pct": [
+                0.001,
+                0.098
+            ],
+            "long_unstuck_threshold": [
+                0.1,
+                1
+            ],
+            "short_close_grid_markup_end": [
+                0.001,
+                0.03
+            ],
+            "short_close_grid_markup_start": [
+                0.001,
+                0.03
+            ],
+            "short_close_grid_qty_pct": [
+                0.05,
+                1,
+                0.01
+            ],
+            "short_close_trailing_grid_ratio": [
+                -1,
+                1,
+                0.01
+            ],
+            "short_close_trailing_qty_pct": [
+                0.05,
+                1
+            ],
+            "short_close_trailing_retracement_pct": [
+                0.001,
+                0.015,
+                1e-05
+            ],
+            "short_close_trailing_threshold_pct": [
+                0.001,
+                0.015,
+                1e-05
+            ],
+            "short_ema_span_0": [
+                200,
+                1440,
+                5
+            ],
+            "short_ema_span_1": [
+                200,
+                1440,
+                5
+            ],
+            "short_entry_grid_double_down_factor": [
+                0.5,
+                1.5,
+                0.01
+            ],
+            "short_entry_grid_spacing_pct": [
+                0.01,
+                0.04,
+                1e-05
+            ],
+            "short_entry_grid_spacing_volatility_weight": [
+                1,
+                40,
+                0.1
+            ],
+            "short_entry_grid_spacing_we_weight": [
+                0,
+                5,
+                0.0001
+            ],
+            "short_entry_initial_ema_dist": [
+                -0.01,
+                0.01,
+                0.0001
+            ],
+            "short_entry_initial_qty_pct": [
+                0.01,
+                0.03,
+                0.0001
+            ],
+            "short_entry_trailing_double_down_factor": [
+                0.01,
+                3
+            ],
+            "short_entry_trailing_grid_ratio": [
+                -0.8,
+                -0.2,
+                0.01
+            ],
+            "short_entry_trailing_retracement_pct": [
+                0.001,
+                0.015,
+                1e-05
+            ],
+            "short_entry_trailing_retracement_volatility_weight": [
+                1,
+                40,
+                0.1
+            ],
+            "short_entry_trailing_retracement_we_weight": [
+                0,
+                5,
+                0.001
+            ],
+            "short_entry_trailing_threshold_pct": [
+                0.001,
+                0.015,
+                1e-05
+            ],
+            "short_entry_trailing_threshold_volatility_weight": [
+                1,
+                40,
+                0.1
+            ],
+            "short_entry_trailing_threshold_we_weight": [
+                0,
+                5,
+                0.001
+            ],
+            "short_entry_volatility_ema_span_hours": [
+                672,
+                2016,
+                1
+            ],
+            "short_forager_score_weights_ema_readiness": [
+                0,
+                1
+            ],
+            "short_forager_score_weights_volatility": [
+                0,
+                1
+            ],
+            "short_forager_score_weights_volume": [
+                0,
+                1
+            ],
+            "short_forager_volatility_ema_span": [
+                10,
+                1440
+            ],
+            "short_forager_volume_drop_pct": [
+                0,
+                1
+            ],
+            "short_forager_volume_ema_span": [
+                10,
+                1440
+            ],
+            "short_hsl_cooldown_minutes_after_red": [
+                1,
+                2880,
+                10
+            ],
+            "short_hsl_ema_span_minutes": [
+                1,
+                2880,
+                10
+            ],
+            "short_hsl_red_threshold": [
+                0.01,
+                0.12,
+                0.001
+            ],
+            "short_n_positions": [
+                7,
+                20,
+                1
+            ],
+            "short_risk_twel_enforcer_threshold": [
+                0.95,
+                1.01,
+                0.001
+            ],
+            "short_risk_we_excess_allowance_pct": [
+                0,
+                0.3,
+                0.01
+            ],
+            "short_risk_wel_enforcer_threshold": [
+                0.95,
+                1.01,
+                0.001
+            ],
+            "short_total_wallet_exposure_limit": [
+                0,
+                0
+            ],
+            "short_unstuck_close_pct": [
+                0.005,
+                0.12,
+                0.001
+            ],
+            "short_unstuck_ema_dist": [
+                -0.2,
+                0.005,
+                0.0001
+            ],
+            "short_unstuck_loss_allowance_pct": [
+                1e-05,
+                0.025,
+                1e-05
+            ],
+            "short_unstuck_threshold": [
+                0.4,
+                0.9,
+                0.001
+            ]
+        },
+        "compress_results_file": true,
+        "crossover_eta": 20,
+        "crossover_probability": 0.6,
+        "enable_overrides": [],
+        "fixed_params": [],
+        "fixed_runtime_overrides": {
+            "bot.long.hsl_no_restart_drawdown_threshold": 1,
+            "bot.short.hsl_no_restart_drawdown_threshold": 1
+        },
+        "iters": 20000,
+        "limits": [
+            {
+                "metric": "drawdown_worst_usd",
+                "penalize_if": "greater_than",
+                "value": 0.3
+            }
+        ],
+        "mutation_eta": 20,
+        "mutation_indpb": 0.0135135135,
+        "mutation_probability": 0.4,
+        "n_cpus": 2,
+        "offspring_multiplier": 1,
+        "pareto_max_size": 1000,
+        "population_size": 200,
+        "pymoo": {
+            "algorithm": "auto",
+            "algorithms": {
+                "nsga2": {},
+                "nsga3": {
+                    "ref_dirs": {
+                        "method": "das_dennis",
+                        "n_partitions": "auto"
+                    }
+                }
+            },
+            "shared": {
+                "crossover_eta": 20.0,
+                "crossover_prob_var": 0.6,
+                "eliminate_duplicates": true,
+                "mutation_eta": 20.0,
+                "mutation_prob_var": "auto"
+            }
+        },
+        "round_to_n_significant_digits": 5,
+        "scoring": [
+            {
+                "goal": "max",
+                "metric": "adg_usd"
+            },
+            {
+                "goal": "max",
+                "metric": "sharpe_ratio_usd"
+            },
+            {
+                "goal": "min",
+                "metric": "drawdown_worst_usd"
+            }
+        ],
+        "write_all_results": true
+    },
+    "results_dir": "optimize_results/2026-06-10T18_02_03_binance_545days_BTC_0ecfc49d/",
+    "results_filename": "optimize_results/2026-06-10T18_02_03_binance_545days_BTC_0ecfc49d/all_results.bin"
+}

@@ -1,0 +1,271 @@
+{
+    "backtest": {
+        "balance_sample_divider": 60,
+        "base_dir": "backtests/btc_binance_grid",
+        "btc_collateral_cap": 0.0,
+        "btc_collateral_ltv_cap": null,
+        "coin_sources": {
+            "BTC": "binance"
+        },
+        "coins": {
+            "binance": [
+                "BTC"
+            ]
+        },
+        "combine_ohlcvs": true,
+        "compress_cache": true,
+        "end_date": "now",
+        "exchanges": [
+            "binance"
+        ],
+        "filter_by_min_effective_cost": false,
+        "gap_tolerance_ohlcvs_minutes": 120,
+        "maker_fee_override": null,
+        "max_warmup_minutes": 0,
+        "start_date": "2019-09-08",
+        "starting_balance": 1000,
+        "suite": {
+            "aggregate": {
+                "default": "mean"
+            },
+            "base_label": "base",
+            "enabled": false,
+            "include_base_scenario": true,
+            "scenarios": []
+        }
+    },
+    "bot": {
+        "long": {
+            "close_grid_markup_end": 0.0011276,
+            "close_grid_markup_start": 0.012385,
+            "close_grid_qty_pct": 0.64011,
+            "close_trailing_grid_ratio": 1.5496e-06,
+            "close_trailing_qty_pct": 0.67923,
+            "close_trailing_retracement_pct": 0.0018443,
+            "close_trailing_threshold_pct": -0.055018,
+            "ema_span_0": 1293.7,
+            "ema_span_1": 2473.1,
+            "enforce_exposure_limit": true,
+            "entry_grid_double_down_factor": 1.7762,
+            "entry_grid_spacing_pct": 0.023915,
+            "entry_grid_spacing_volatility_weight": 7.1483e-06,
+            "entry_grid_spacing_we_weight": 0.47063,
+            "entry_initial_ema_dist": -0.058966,
+            "entry_initial_qty_pct": 0.024077,
+            "entry_trailing_double_down_factor": 1.0949,
+            "entry_trailing_grid_ratio": 0.04887,
+            "entry_trailing_retracement_pct": 0.015647,
+            "entry_trailing_retracement_volatility_weight": 0.0,
+            "entry_trailing_retracement_we_weight": 0.0,
+            "entry_trailing_threshold_pct": 0.035535,
+            "entry_trailing_threshold_volatility_weight": 0.0,
+            "entry_trailing_threshold_we_weight": 0.0,
+            "entry_volatility_ema_span_hours": 122.68,
+            "forager_score_weights": {
+                "ema_readiness": 0.0,
+                "volatility": 1.0,
+                "volume": 0.0
+            },
+            "forager_volatility_ema_span": 88.369,
+            "forager_volume_drop_pct": 0.14745,
+            "forager_volume_ema_span": 298.18,
+            "n_positions": 1,
+            "risk_twel_enforcer_threshold": 1.0,
+            "risk_we_excess_allowance_pct": 0.0,
+            "risk_wel_enforcer_threshold": 1.0,
+            "total_wallet_exposure_limit": 1.5,
+            "unstuck_close_pct": 0.10056,
+            "unstuck_ema_dist": 0.029561,
+            "unstuck_loss_allowance_pct": 0.08642,
+            "unstuck_threshold": 0.44394
+        }
+    },
+    "coin_overrides": {},
+    "live": {
+        "approved_coins": {
+            "long": [
+                "BTC"
+            ],
+            "short": []
+        },
+        "auto_gs": true,
+        "balance_hysteresis_snap_pct": 0.02,
+        "balance_override": null,
+        "candle_lock_timeout_seconds": 10,
+        "empty_means_all_approved": false,
+        "execution_delay_seconds": 2,
+        "filter_by_min_effective_cost": false,
+        "forced_mode_long": "",
+        "forced_mode_short": "",
+        "hedge_mode": true,
+        "ignored_coins": {
+            "long": [],
+            "short": []
+        },
+        "inactive_coin_candle_ttl_minutes": 10,
+        "leverage": 5,
+        "market_orders_allowed": false,
+        "max_concurrent_api_requests": null,
+        "max_disk_candles_per_symbol_per_tf": 2000000,
+        "max_memory_candles_per_symbol": 200000,
+        "max_n_cancellations_per_batch": 5,
+        "max_n_creations_per_batch": 3,
+        "max_n_restarts_per_day": 10,
+        "max_warmup_minutes": 0,
+        "minimum_coin_age_days": 30,
+        "order_match_tolerance_pct": 0.0002,
+        "pnls_manager_shadow_mode": false,
+        "pnls_max_lookback_days": 30,
+        "price_distance_threshold": 0.002,
+        "recv_window_ms": 5000,
+        "time_in_force": "good_till_cancelled",
+        "user": "binance_01",
+        "warmup_jitter_seconds": 30,
+        "warmup_ratio": 0.3
+    },
+    "logging": {
+        "level": 1,
+        "memory_snapshot_interval_minutes": 30,
+        "volume_refresh_info_threshold_seconds": 30
+    },
+    "optimize": {
+        "bounds": {
+            "long_close_grid_markup_end": [
+                0.001,
+                0.02
+            ],
+            "long_close_grid_markup_start": [
+                0.001,
+                0.02
+            ],
+            "long_close_grid_qty_pct": [
+                0.05,
+                1
+            ],
+            "long_close_trailing_grid_ratio": [
+                0,
+                1
+            ],
+            "long_close_trailing_qty_pct": [
+                0.05,
+                1
+            ],
+            "long_close_trailing_retracement_pct": [
+                0.001,
+                0.499
+            ],
+            "long_close_trailing_threshold_pct": [
+                -0.2448,
+                0.2529
+            ],
+            "long_ema_span_0": [
+                20,
+                4000
+            ],
+            "long_ema_span_1": [
+                20,
+                4000
+            ],
+            "long_entry_grid_double_down_factor": [
+                0.5,
+                2.5
+            ],
+            "long_entry_grid_spacing_pct": [
+                0.001,
+                0.05
+            ],
+            "long_entry_grid_spacing_volatility_weight": [
+                0,
+                200
+            ],
+            "long_entry_grid_spacing_we_weight": [
+                0.0,
+                3.0
+            ],
+            "long_entry_initial_ema_dist": [
+                -0.1962,
+                0.2043
+            ],
+            "long_entry_initial_qty_pct": [
+                0.005,
+                0.05
+            ],
+            "long_entry_trailing_double_down_factor": [
+                0.05,
+                5
+            ],
+            "long_entry_trailing_grid_ratio": [
+                -1,
+                1
+            ],
+            "long_entry_trailing_retracement_pct": [
+                0,
+                0.399
+            ],
+            "long_entry_trailing_threshold_pct": [
+                -0.1962,
+                0.1983
+            ],
+            "long_entry_volatility_ema_span_hours": [
+                6,
+                711
+            ],
+            "long_forager_volatility_ema_span": [
+                5,
+                1015
+            ],
+            "long_forager_volume_drop_pct": [
+                0.1,
+                1
+            ],
+            "long_forager_volume_ema_span": [
+                1,
+                1015
+            ],
+            "long_n_positions": [
+                1,
+                1
+            ],
+            "long_total_wallet_exposure_limit": [
+                0,
+                1.5
+            ],
+            "long_unstuck_close_pct": [
+                0.001,
+                0.302
+            ],
+            "long_unstuck_ema_dist": [
+                -0.19,
+                0.101
+            ],
+            "long_unstuck_loss_allowance_pct": [
+                0.001,
+                0.098
+            ],
+            "long_unstuck_threshold": [
+                0.1,
+                1
+            ]
+        },
+        "compress_results_file": true,
+        "crossover_probability": 0.6,
+        "enable_overrides": [],
+        "iters": 200000,
+        "limits": [
+            {
+                "metric": "drawdown_worst_usd",
+                "penalize_if": "greater_than",
+                "value": 0.3
+            }
+        ],
+        "mutation_probability": 0.4,
+        "n_cpus": 8,
+        "population_size": 500,
+        "round_to_n_significant_digits": 5,
+        "scoring": [
+            "adg_usd",
+            "sharpe_ratio_usd",
+            "drawdown_worst_usd"
+        ]
+    }
+}
