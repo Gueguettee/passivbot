@@ -4,11 +4,35 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Fixed live `[pos]` logging so short position size increases are labeled as
+  `added` and short size decreases as `reduced`, matching exposure magnitude
+  instead of signed numeric ordering.
+- Fixed live ignored-coin handling so ignored symbols are sent to the Rust
+  orchestrator as `graceful_stop`, preventing new initial entries after a
+  previously open ignored position becomes fully flat.
+- Canonicalized live fill-event accounting: cached fills now store gross `pnl`,
+  signed quote-currency `fee_paid`, fee-quality metadata, and a
+  `gross_pnl_quote_fee_best_effort_v2` cache contract. Non-quote fees are
+  converted when a fresh ticker is available, otherwise estimated from reported
+  fee rates or `live.fee_pct_fallback`; every fill is sanity-checked against
+  `live.fee_pct_sanity_abs_max`.
+- Fee-policy warnings now deduplicate repeated overlapping-refresh examples
+  and include the original rejected fee ratio/source when sanity replacement
+  uses `live.fee_pct_fallback`.
+- Live realized-loss gates, unstuck allowances, fill health summaries, and
+  backtest rolling realized-PnL risk windows now use net realized PnL
+  (`pnl + fee_paid`) consistently. KuCoin positions-history net cycle PnL is
+  converted back to gross close-fill PnL before reconciliation, and
+  legacy/missing-contract caches are repaired when safe or quarantined and
+  rebuilt automatically from exchange fills on startup.
 - Added `passivbot tool ohlcvs-doctor` to audit v2 OHLCV chunk caches and
   rebuild `caches/ohlcvs/catalog.sqlite` metadata from copied `data/` chunks.
 - Fixed live bots so non-shutdown `asyncio.CancelledError` failures from CCXT
   account-state or candle fetches are logged, counted, and routed through the
   existing restart/backoff path instead of silently exiting without countdown.
+- Fixed live orchestrator order calculation so live bots no longer require
+  `backtest.market_order_slippage_pct`; backtest-only market slippage remains
+  confined to backtest simulation.
 - Backtest and optimizer runs now automatically clean stale `caches/ohlcvs/materialized/`
   scratch payloads while preserving materialized directories locked by active processes.
 - `live.custom_endpoints_path` is now part of the canonical config schema, so normalized
