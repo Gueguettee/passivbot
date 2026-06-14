@@ -1,0 +1,10 @@
+data/
+*.log
+__pycache__/
+*.pyc
+.env
+aws.env
+*.pem
+*.key
+id_rsa*
+id_ed25519*

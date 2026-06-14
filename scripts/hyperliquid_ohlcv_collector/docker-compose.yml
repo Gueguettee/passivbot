@@ -1,0 +1,50 @@
+services:
+  collector:
+    build: .
+    container_name: hyperliquid-ohlcv-collector
+    restart: unless-stopped
+    mem_limit: 1g
+    memswap_limit: 1g
+    network_mode: host
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+      # Host AWS credentials (read-only) so requester-pays Hydromancer reads work
+      # WITHOUT an aws.env file. Defaults to the Windows user profile's ~/.aws;
+      # override AWS_DIR (e.g. `AWS_DIR=$HOME/.aws`) on Linux/macOS.
+      - type: bind
+        source: ${AWS_DIR:-${USERPROFILE}/.aws}
+        target: /root/.aws
+        read_only: true
+    # aws.env is an OPTIONAL alternative to the ~/.aws mount above for explicit
+    # creds; the free API-tail-only mode (see README) needs neither.
+    env_file:
+      - path: aws.env
+        required: false
+    environment:
+      - DATA_DIR=/data
+      # OHLCV shards land here in passivbot source-dir layout; point
+      # backtest.ohlcv_source_dir at <collector_dir>/data/ohlcv_source.
+      - OHLCV_SOURCE_DIR=/data/ohlcv_source
+      - PB_EXCHANGE_DIR=hyperliquid
+      - SYMBOLS=HYPE
+      - HL_DEX=hyperliquid
+      - EARLIEST_DATE=2024-11-29
+      - POLL_INTERVAL=43200
+      - ENABLE_HYDROMANCER_CANDLES=1
+      - ENABLE_HYDROMANCER_L2=1
+      - ENABLE_HYPERLIQUID_ARCHIVE_L2=1
+      - ENABLE_API_TAIL=1
+      - MAX_HISTORICAL_DAYS_PER_CYCLE=30
+      - MAX_ARCHIVE_HOURS_PER_CYCLE=720
+      - HISTORICAL_END_LAG_DAYS=2
+      - KEEP_RAW_ARCHIVE_L2=1
+      - CACHE_ALL_RAW_L2=1
+      - RAW_L2_REFRESH_LOOKBACK_DAYS=45
+      - RECENT_HYDROMANCER_REPAIR_DAYS=10
+      - INITIAL_LOOKBACK_MINUTES=10080
+      - REPAIR_LOOKBACK_MINUTES=10080
+      - REQUEST_INTERVAL=0.35
+      - MAX_CONCURRENT=2
+      - VERIFY_DAYS=7

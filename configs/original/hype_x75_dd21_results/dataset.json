@@ -1,0 +1,41 @@
+{
+    "btc_usd_prices_file": "/app/caches/hlcvs_data/hyperliquid__HYPE__2025-01-04_to_2026-05-23__e3cf5ee6b1e1bcb6/btc_usd_prices.npy.gz",
+    "cache_dir_label": "hyperliquid__HYPE__2025-01-04_to_2026-05-23__e3cf5ee6b1e1bcb6",
+    "cache_hash": "e3cf5ee6b1e1bcb6",
+    "cache_meta_file": "/app/caches/hlcvs_data/hyperliquid__HYPE__2025-01-04_to_2026-05-23__e3cf5ee6b1e1bcb6/cache_meta.json",
+    "candle_interval_minutes": 1,
+    "coin_index": {
+        "HYPE": 0
+    },
+    "coins": [
+        "HYPE"
+    ],
+    "coins_file": "/app/caches/hlcvs_data/hyperliquid__HYPE__2025-01-04_to_2026-05-23__e3cf5ee6b1e1bcb6/coins.json",
+    "content_hashes": {
+        "btc_usd_prices": "8f2baa2cf71a16a99e6b07517b865cfc93c9e2b5e5a3b2e44f16a90edacfd271",
+        "coins": "443320afbd6439629634291a244c0780837725180019a7840243906475fc6ed0",
+        "hlcvs": "98a29a02a1da9d82780b3cfe28645b171bcc8f1f3c2e64a6fe6412795128c45a",
+        "market_specific_settings": "9f5f18a6dd85f2411123ee8fa96d6f92987487f2f278d1e99281ef8396c83811",
+        "timestamps": "0ae9752ead9c7b984397e3832666a3bbe00c15fcc76cbe51350ee997ae75b335"
+    },
+    "dataset_override": false,
+    "dataset_override_meta": {},
+    "dataset_override_mode": "intersection",
+    "exchange": "hyperliquid",
+    "hlcv_cache_dir": "/app/caches/hlcvs_data/hyperliquid__HYPE__2025-01-04_to_2026-05-23__e3cf5ee6b1e1bcb6",
+    "hlcvs_file": "/app/caches/hlcvs_data/hyperliquid__HYPE__2025-01-04_to_2026-05-23__e3cf5ee6b1e1bcb6/hlcvs.npy.gz",
+    "manifest_file": "/app/caches/hlcvs_data/hyperliquid__HYPE__2025-01-04_to_2026-05-23__e3cf5ee6b1e1bcb6/manifest.json",
+    "manifest_missing": false,
+    "manifest_schema_version": 1,
+    "market_specific_settings_file": "/app/caches/hlcvs_data/hyperliquid__HYPE__2025-01-04_to_2026-05-23__e3cf5ee6b1e1bcb6/market_specific_settings.json",
+    "materialization_schema_version": 1,
+    "requested_end_date": "2026-05-23",
+    "requested_start_date": "2024-11-03",
+    "side_membership": {
+        "long": [
+            "HYPE"
+        ],
+        "short": []
+    },
+    "timestamps_file": "/app/caches/hlcvs_data/hyperliquid__HYPE__2025-01-04_to_2026-05-23__e3cf5ee6b1e1bcb6/timestamps.npy.gz"
+}
