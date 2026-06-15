@@ -80,6 +80,52 @@ See `docs/ai/code_review_prompt.md` for the review/test checklist.
 
 Use `docs/ai/commands.md` for setup, test, backtest, optimizer, and Rust build commands.
 
+## Live Deployment (this fork)
+
+Live bots run as Docker containers on a remote VM (Oracle Cloud ARM), one container
+per exchange account. Code is **not** version-controlled on the box — it is an rsynced
+copy. The bot code is baked into the image at build time (`Dockerfile_live`); only
+`configs/` and `api-keys.json` are bind-mounted, so any code change requires a rebuild.
+
+`deploy.sh` (repo root) drives the whole lifecycle. It reads remote host/user/key from
+`.env` (`REMOTE_USER`, `REMOTE_HOST`, `SSH_KEY_PATH`, `REMOTE_DIR`). Run it from a shell
+where the SSH key is reachable (on Windows the key lives in WSL at
+`~/.ssh/id_rsa_oracle`, so invoke via `wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/git/passivbot && ./deploy.sh ...'`).
+
+Two live targets, selected with `--hl`:
+
+| Target      | Flag   | Container          | Account          | Config                                                  |
+| ----------- | ------ | ------------------ | ---------------- | ------------------------------------------------------- |
+| Binance     | (none) | `passivbot-live`   | `binance_01`     | `configs/original/hype_dio_masterclas_binance_opti/...` |
+| Hyperliquid | `--hl` | `passivbot-live-hl`| `hyperliquid_01` | `configs/original/hype_dio_masterclass/...`             |
+
+Commands (append `--hl` to target Hyperliquid):
+
+```bash
+./deploy.sh deploy      # rsync code -> build image -> recreate container -> tail 30s
+./deploy.sh restart     # stop then deploy
+./deploy.sh stop        # docker compose down for that profile
+./deploy.sh logs -f     # follow logs (-n NUM for tail count)
+./deploy.sh status      # container ps + resource usage + disk
+./deploy.sh connect     # ssh into the box at REMOTE_DIR
+```
+
+To relaunch **both** running configs after a code change: `./deploy.sh deploy` then
+`./deploy.sh deploy --hl`. The second build is layer-cached. The compose profiles are
+independent, so each deploy only recreates its own container.
+
+Caveats:
+
+- `sync_to_remote()` uses `rsync --delete`: remote files absent locally are removed.
+  It excludes `.git`, `venv`, caches, `meta_optimizer`, `optimize_results`, `backtests*`,
+  `.env`, `*.log`, etc. — but **not** `meta_optimize_results/`, so optimizer outputs left
+  on the box get deleted on deploy. Pull anything you want to keep before deploying.
+- Before a rebuild on the shared box, sanity-check resources (`free -h`, `swapon --show`,
+  `uptime`, `df -h /`) — it also runs the user's gueguetteBot and a polymarket bot.
+- After deploy, confirm health: `docker ps --filter name=passivbot-live` and look for a
+  `[health]` log line (`errors=0/10`, expected positions/balance) plus an `[order] wave
+  complete` line on each container.
+
 ## Documentation Hygiene
 
 1. Keep AI docs lean and task-oriented.
