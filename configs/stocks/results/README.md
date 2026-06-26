@@ -17,6 +17,7 @@ effective start ~2026-04-11 after `minimum_coin_age_days`). $1000 start.
 | `config_sp500_hl_opt_tuned` | SP500 | 1.116× | 0.207%/d | 4.0% | 0.218 |
 | `config_sp500_hl_sharpe` | SP500 | 1.034× | 0.064%/d | 1.3% | 0.244 |
 | `config_sp500_david_live` | SP500 | 1.151× | 0.216%/d | 2.2% | 0.326 |
+| **`config_sp500_david_live_new`** | SP500 | **1.188×** | **0.298%/d** | 2.4% | **0.355** |
 | `config_nvda` | NVDA | 1.191× | 0.219%/d | 26% | 0.053 |
 | `config_sp500_legacy_passive` | SP500 | **0.000×** | 0 | **100%** | 0 | ⚠️ |
 
